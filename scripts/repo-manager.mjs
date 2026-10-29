@@ -13,7 +13,7 @@ const root = resolve(import.meta.dirname, '..');
 const command = process.argv[2] || 'status';
 const commandArgs = process.argv.slice(3);
 const branch = 'main';
-const githubAccount = 'Picatrix';
+const githubAccount = 'WoodenP1ckaxe';
 const repositoryName = 'tianping-video-verification';
 const expectedOrigin = `https://github.com/${githubAccount}/${repositoryName}.git`;
 const maxFileBytes = 5 * 1024 * 1024;
@@ -273,6 +273,77 @@ function commitIfNeeded(message) {
   return true;
 }
 
+function githubToken() {
+  const credential = run('git', ['credential', 'fill'], {
+    input: 'protocol=https\nhost=github.com\n\n',
+    env: {
+      ...process.env,
+      GCM_INTERACTIVE: 'Never',
+      GIT_TERMINAL_PROMPT: '0',
+    },
+  });
+  const passwordLine = credential
+    .split(/\r?\n/)
+    .find((line) => line.startsWith('password='));
+  if (!passwordLine) throw new Error('未找到 GitHub 凭据，请先运行 github login');
+  return passwordLine.slice('password='.length);
+}
+
+async function githubRequest(token, method, path, body) {
+  const response = await fetch(`https://api.github.com${path}`, {
+    method,
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${token}`,
+      'User-Agent': 'tianping-repository-manager',
+      'X-GitHub-Api-Version': '2022-11-28',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = { message: text };
+  }
+  return { response, data };
+}
+
+async function createGitHubRepository() {
+  init();
+  const token = githubToken();
+  const user = await githubRequest(token, 'GET', '/user');
+  if (!user.response.ok) throw new Error(`GitHub 身份检查失败：${user.data?.message || user.response.status}`);
+  if (String(user.data?.login).toLowerCase() !== githubAccount.toLowerCase()) {
+    throw new Error(`当前 GitHub 登录账号为 ${user.data?.login}，预期为 ${githubAccount}`);
+  }
+
+  let repository = await githubRequest(token, 'GET', `/repos/${githubAccount}/${repositoryName}`);
+  if (repository.response.status === 404) {
+    repository = await githubRequest(token, 'POST', '/user/repos', {
+      name: repositoryName,
+      description: 'Source backup for the electronic balance verification video analysis system.',
+      private: false,
+      has_issues: true,
+      has_projects: false,
+      has_wiki: false,
+      auto_init: false,
+    });
+    if (!repository.response.ok) {
+      throw new Error(`创建 GitHub 仓库失败：${repository.data?.message || repository.response.status}`);
+    }
+  } else if (!repository.response.ok) {
+    throw new Error(`检查 GitHub 仓库失败：${repository.data?.message || repository.response.status}`);
+  }
+
+  if (repository.data?.private !== false) {
+    throw new Error('目标 GitHub 仓库不是公开仓库，已停止');
+  }
+  console.log(`GitHub 公开仓库已就绪：${repository.data.html_url}`);
+}
+
 function verifyOrigin() {
   const origin = git(['remote', 'get-url', 'origin'], { allowFailure: true });
   if (!origin) throw new Error('未配置 origin');
@@ -313,10 +384,11 @@ try {
   if (command === 'init') init();
   else if (command === 'status') status();
   else if (command === 'check') check();
+  else if (command === 'create') await createGitHubRepository();
   else if (command === 'commit') commit();
   else if (command === 'backup') backup();
   else {
-    console.error('用法：node scripts/repo-manager.mjs init|status|check|commit|backup [-m "提交说明"]');
+    console.error('用法：node scripts/repo-manager.mjs init|status|check|create|commit|backup [-m "提交说明"]');
     process.exit(2);
   }
 } catch (error) {

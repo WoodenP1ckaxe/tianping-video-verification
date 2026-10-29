@@ -39,13 +39,15 @@ docker compose up -d --build
 ```bash
 npm run check
 npm run repo:status
+npm run repo:create
 npm run repo:commit -- -m "描述本次变更"
 npm run repo:backup -- -m "描述本次变更"
 ```
 
-`repo:backup` 会在提交前运行源码校验和发布策略检查，然后提交允许发布的文件并
-推送到 GitHub。策略采用明确允许清单，检测到文档、测试、媒体、数据库、日志或
-敏感凭据时会拒绝提交或推送。
+`repo:create` 使用本机 Git Credential Manager 中的 GitHub 登录身份确认或创建
+公开仓库。`repo:backup` 会在提交前运行源码校验和发布策略检查，然后提交允许发布
+的文件并推送到 GitHub。策略采用明确允许清单，检测到文档、测试、媒体、数据库、
+日志或敏感凭据时会拒绝提交或推送。
 
 ## 能力边界
 
