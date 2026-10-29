@@ -1,0 +1,22 @@
+{
+  "name": "tianping-video-verification",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "电子天平日常校验视频分析系统",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test --test-concurrency=1",
+    "check": "node scripts/check.js",
+    "repo:status": "node scripts/repo-manager.mjs status",
+    "repo:check": "node scripts/repo-manager.mjs check",
+    "repo:commit": "node scripts/repo-manager.mjs commit",
+    "repo:backup": "node scripts/repo-manager.mjs backup",
+    "repair:sample-evidence": "node scripts/repair-sample-evidence.js",
+    "make-offline-bundle": "node scripts/make-offline-bundle.js"
+  }
+}

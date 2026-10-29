@@ -1,0 +1,40 @@
+services:
+  tianping:
+    image: tianping-system:1.0.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tianping-system
+    restart: unless-stopped
+    ports:
+      - "${TIANPING_PORT:-8080}:8080"
+    environment:
+      NODE_ENV: production
+      TZ: Asia/Shanghai
+      DATA_DIR: /app/data
+      HOST: 0.0.0.0
+      PORT: 8080
+      PDF_FONT_PATH: /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+      SECURE_COOKIE: "${SECURE_COOKIE:-false}"
+      INITIAL_PASSWORD: "${INITIAL_PASSWORD:?首次启动前必须设置 INITIAL_PASSWORD}"
+      TRUST_PROXY: "${TRUST_PROXY:-}"
+      MAX_ACTIVE_UPLOADS_PER_USER: "${MAX_ACTIVE_UPLOADS_PER_USER:-3}"
+      MAX_ACTIVE_UPLOADS_GLOBAL: "${MAX_ACTIVE_UPLOADS_GLOBAL:-10}"
+      MAX_TEMP_UPLOAD_BYTES: "${MAX_TEMP_UPLOAD_BYTES:-2147483648}"
+      UPLOAD_SESSION_TTL_MINUTES: "${UPLOAD_SESSION_TTL_MINUTES:-120}"
+      MIN_FREE_DISK_BYTES: "${MIN_FREE_DISK_BYTES:-536870912}"
+    volumes:
+      - ./data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "10"
+

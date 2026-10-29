@@ -1,0 +1,43 @@
+# Runtime data and local credentials
+data/
+data-*/
+.browser-data/
+backups/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+*.pid
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Delivery-only material; kept locally, never published to the source repository
+/docs/
+/tests/
+/verification/
+/tests/tmp/
+/verification/tmp/
+
+# Media and archives belong to customer delivery or release artifacts
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.zip
+*.7z
+*.tar
+*.tar.gz
+
+# Editor and operating-system files
+$null
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+node_modules/
+

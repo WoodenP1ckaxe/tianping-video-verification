@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "sampleName": "双量程合格样例",
+  "sourceFile": "63bb2c36627c4e7efdfa6cf7a85bddec.mp4",
+  "deviceId": "F002",
+  "personCard": {
+    "account": "U001",
+    "conf": 0.996
+  },
+  "deviceCard": {
+    "code": "F001",
+    "conf": 0.995
+  },
+  "rangeSwitch": true,
+  "expectedConclusion": "通过",
+  "displayRegion": {
+    "x": 0.1195,
+    "y": 0.6510,
+    "width": 0.7537,
+    "height": 0.1198,
+    "coordinateSpace": "normalized-video-frame"
+  },
+  "speech": {
+    "cleanliness": {"v": "是", "conf": 0.936},
+    "level": {"v": "是", "conf": 0.928},
+    "internalCal": {"v": "是", "conf": 0.916},
+    "sequenceKeywords": ["第一次", "第二次", "第三次", "第四次", "第五次", "第六次", "第七次", "第八次", "第九次"]
+  },
+  "readouts": [
+    {"point": 0, "idx": 1, "value": 100.0003, "unit": "g", "off": 45, "conf": 0.997, "stable": true, "range": 1, "recognizedText": "100.0003 g"},
+    {"point": 0, "idx": 2, "value": 100.0003, "unit": "g", "off": 70, "conf": 0.994, "stable": true, "range": 1, "recognizedText": "100.0003 g"},
+    {"point": 0, "idx": 3, "value": 100.0004, "unit": "g", "off": 95, "conf": 0.991, "stable": true, "range": 1, "recognizedText": "100.0004 g"},
+    {"point": 1, "idx": 1, "value": 20.0002, "unit": "g", "off": 145, "conf": 0.996, "stable": true, "range": 2, "recognizedText": "20000.2 mg"},
+    {"point": 1, "idx": 2, "value": 20.0002, "unit": "g", "off": 170, "conf": 0.902, "stable": true, "range": 2, "recognizedText": "20000.2 mg"},
+    {"point": 1, "idx": 3, "value": 20.0002, "unit": "g", "off": 190, "conf": 0.993, "stable": true, "range": 2, "recognizedText": "20000.2 mg"},
+    {"point": 2, "idx": 1, "value": 2.0001, "unit": "g", "off": 215, "conf": 0.995, "stable": true, "range": 2, "recognizedText": "2000.1 mg"},
+    {"point": 2, "idx": 2, "value": 2.0001, "unit": "g", "off": 240, "conf": 0.994, "stable": true, "range": 2, "recognizedText": "2000.1 mg"},
+    {"point": 2, "idx": 3, "value": 2.0001, "unit": "g", "off": 270, "conf": 0.996, "stable": true, "range": 2, "recognizedText": "2000.1 mg"}
+  ],
+  "notes": "读数偏移、显示区框选与识别值已按客户样例真实画面校正；双量程高量程 3 次、低量程两组各 3 次。"
+}
