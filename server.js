@@ -16,6 +16,7 @@ import {
   openDatabase
 } from './src/db.js';
 import { AnalysisQueue } from './src/services/queue.js';
+import { ApplicationLogger } from './src/services/logs.js';
 import { StorageService } from './src/services/storage.js';
 import { UploadService } from './src/services/uploads.js';
 
@@ -30,6 +31,19 @@ function envBoolean(name, fallback = false) {
 function envPositiveInteger(name, fallback) {
   const value = Number(process.env[name] ?? fallback);
   return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+function envDisplayRegion(value) {
+  if (!value) return null;
+  const parts = String(value).split(',').map(Number);
+  if (parts.length !== 4 || !parts.every(Number.isFinite)) return null;
+  return {
+    x: parts[0],
+    y: parts[1],
+    width: parts[2],
+    height: parts[3],
+    coordinateSpace: 'normalized-video-frame',
+  };
 }
 
 export function loadConfig(overrides = {}) {
@@ -56,6 +70,8 @@ export function loadConfig(overrides = {}) {
     trustProxy: overrides.trustProxy ?? process.env.TRUST_PROXY ?? '',
     ffprobePath: overrides.ffprobePath || process.env.FFPROBE_PATH || 'ffprobe',
     ffmpegPath: overrides.ffmpegPath || process.env.FFMPEG_PATH || 'ffmpeg',
+    displayRegion: overrides.displayRegion
+      || envDisplayRegion(process.env.DISPLAY_REGION),
     workerIntervalMs: Number(
       overrides.workerIntervalMs
       ?? process.env.ANALYSIS_INTERVAL_MS
@@ -227,15 +243,18 @@ export async function startServer(overrides = {}) {
   });
   config.dbPath = dbPath;
 
-  const storage = new StorageService({ db, config });
-  const uploads = new UploadService({ db, config });
+  const logger = new ApplicationLogger({ config });
+  const storage = new StorageService({ db, config, logger });
+  const uploads = new UploadService({ db, config, logger });
   const queue = new AnalysisQueue({
     db,
     config,
     storageService: storage,
-    intervalMs: config.workerIntervalMs
+    logger,
+    intervalMs: config.workerIntervalMs,
+    analyzer: overrides.analyzer
   });
-  const api = new ApiRouter({ db, config, uploads, storage, queue });
+  const api = new ApiRouter({ db, config, uploads, storage, queue, logger });
 
   const server = createServer(async (req, res) => {
     try {
@@ -249,7 +268,7 @@ export async function startServer(overrides = {}) {
       });
       res.end('页面或资源不存在');
     } catch (error) {
-      console.error('[server]', error);
+      logger.error('[server]', error);
       if (!res.headersSent) {
         res.writeHead(500, {
           'Content-Type': 'application/json; charset=utf-8'
@@ -280,9 +299,16 @@ export async function startServer(overrides = {}) {
   queue.start();
   uploads.cleanupExpired();
   storage.maybeDailyBackup();
+  logger.cleanup(Number(getSetting(db, 'logRetentionDays', 30)));
+  logger.info('服务启动', {
+    host: config.host,
+    port: config.port,
+    dataDir: config.dataDir
+  });
   const backupTimer = setInterval(() => {
     uploads.cleanupExpired();
     storage.maybeDailyBackup();
+    logger.cleanup(Number(getSetting(db, 'logRetentionDays', 30)));
   }, 15 * 60 * 1000);
   backupTimer.unref?.();
 
@@ -291,6 +317,7 @@ export async function startServer(overrides = {}) {
     if (closing) return;
     closing = true;
     clearInterval(backupTimer);
+    logger.info('服务停止');
     await queue.stop();
     await new Promise((resolve) => server.close(() => resolve()));
     db.close();
@@ -309,6 +336,7 @@ export async function startServer(overrides = {}) {
     queue,
     storage,
     uploads,
+    logger,
     close,
     address: server.address()
   };

@@ -30,6 +30,34 @@ const STATUS_WATERMARK = Object.freeze({
   '已作废': '已作废',
 });
 
+const TEMPLATE_FIELD_DEFAULTS = Object.freeze({
+  dept: '科室',
+  uniqueNo: '天平唯一号',
+  max: 'Max(g)',
+  d: 'd(mg)',
+  internalCalType: '内部校正方式',
+  date: '校验日期',
+  cleanliness: '清洁',
+  level: '水平调节',
+  internalCal: '内部校正是否通过',
+  remark: '备注',
+  box: '砝码盒编号',
+  time: '测量时间',
+  detail: '判定结论明细',
+});
+
+function templateField(template, key) {
+  const configured = Array.isArray(template?.fields)
+    ? template.fields.find((field) => field?.key === key)
+    : null;
+  return {
+    key,
+    label: String(configured?.label || TEMPLATE_FIELD_DEFAULTS[key] || key),
+    show: configured?.show !== false,
+    locked: configured?.locked === true,
+  };
+}
+
 let loadedFontCache = null;
 
 function align4(value) {
@@ -569,6 +597,11 @@ function safeText(value, fallback = '—') {
   return String(value);
 }
 
+function formatVideoOffset(value) {
+  const seconds = Math.max(0, Math.round(Number(value) || 0));
+  return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
 function normalizeRecordCall(recordOrOptions, deviceOrOptions, options = {}) {
   if (recordOrOptions?.record) {
     return {
@@ -638,28 +671,41 @@ function drawRecordPage(document, record, device, options = {}) {
   const labelWidth = 82;
   const valueWidth = 169;
   const rowHeight = 22;
-  const grid = [
-    [
-      ['科室', device.dept],
-      ['天平编号', device.id],
-      ['天平唯一号', device.uniqueNo],
-    ],
-    [
-      ['Max', `${device.max} g`],
-      ['d', `${device.d} mg`],
-      ['内部校正方式', device.internalCal],
-    ],
-    [
-      ['校验日期', record.date],
-      ['砝码盒编号', record.box],
-      ['记录状态', record.status],
-    ],
-    [
-      ['清洁', record.cleanliness],
-      ['水平调节', record.level],
-      ['内部校正是否通过', record.internalCal],
-    ],
-  ];
+  const template = options.template || {};
+  const fieldDefinitions = {
+    dept: device.dept,
+    uniqueNo: device.uniqueNo,
+    max: `${device.max} g`,
+    d: `${device.d} mg`,
+    internalCalType: device.internalCal,
+    date: record.date,
+    cleanliness: record.cleanliness,
+    level: record.level,
+    internalCal: record.internalCal,
+    box: record.box,
+  };
+  const visibleFields = [
+    'dept', 'uniqueNo', 'max', 'd', 'internalCalType',
+    'date', 'cleanliness', 'level', 'internalCal', 'box',
+  ].map((key) => ({
+    ...templateField(template, key),
+    value: fieldDefinitions[key],
+  })).filter((field) => field.show);
+  visibleFields.unshift({
+    key: 'id',
+    label: '天平编号',
+    show: true,
+    value: device.id,
+  });
+  const grid = [];
+  for (let index = 0; index < visibleFields.length; index += 3) {
+    const row = visibleFields.slice(index, index + 3).map((field) => [
+      field.label,
+      field.value,
+    ]);
+    grid.push(row);
+  }
+  const remarkField = templateField(template, 'remark');
   for (const row of grid) {
     let x = margin;
     for (const [label, value] of row) {
@@ -677,16 +723,56 @@ function drawRecordPage(document, record, device, options = {}) {
     }
     top += rowHeight;
   }
-  drawCellText(document, margin, top, labelWidth, rowHeight, '备注', {
-    size: 8.3,
-    fill: [0.95, 0.96, 0.97],
-    align: 'center',
-  });
-  drawCellText(document, margin + labelWidth, top, width - labelWidth, rowHeight, safeText(record.remark, '无'), {
-    size: 8.3,
-  });
-  top += rowHeight + 14;
+  const configuredPoints = Array.isArray(template.points) && template.points.length === 3
+    ? template.points
+    : device.points;
+  if (Array.isArray(configuredPoints) && configuredPoints.length === 3) {
+    drawCellText(document, margin, top, labelWidth, rowHeight, '模板标称点', {
+      size: 8.3,
+      fill: [0.95, 0.96, 0.97],
+      align: 'center',
+    });
+    drawCellText(
+      document,
+      margin + labelWidth,
+      top,
+      width - labelWidth,
+      rowHeight,
+      configuredPoints.map((point, index) => `L${index + 1}=${point}g`).join(' · '),
+      { size: 8.3 },
+    );
+    top += rowHeight;
+  }
+  if (Number(device.ranges) === 2) {
+    const transition = record.rangeTransition || {};
+    const transitionText = transition.endOffsetSeconds !== undefined
+      ? `高量程 → 低量程；过程段 ${formatVideoOffset(transition.startOffsetSeconds)} ～ ${formatVideoOffset(transition.endOffsetSeconds)}`
+      : '未识别到完整量程切换过程段';
+    drawCellText(document, margin, top, labelWidth, rowHeight, '量程切换过程', {
+      size: 8.3,
+      fill: [0.95, 0.96, 0.97],
+      align: 'center',
+    });
+    drawCellText(document, margin + labelWidth, top, width - labelWidth, rowHeight, transitionText, {
+      size: 8.3,
+    });
+    top += rowHeight;
+  }
+  if (remarkField.show) {
+    drawCellText(document, margin, top, labelWidth, rowHeight, remarkField.label, {
+      size: 8.3,
+      fill: [0.95, 0.96, 0.97],
+      align: 'center',
+    });
+    drawCellText(document, margin + labelWidth, top, width - labelWidth, rowHeight, safeText(record.remark, '无'), {
+      size: 8.3,
+    });
+    top += rowHeight;
+  }
+  top += 14;
 
+  const timeField = templateField(template, 'time');
+  const showTime = options.printTime !== false && timeField.show;
   const columns = [
     { label: '编号', width: 52, align: 'center' },
     { label: '量程', width: 48, align: 'center' },
@@ -695,7 +781,7 @@ function drawRecordPage(document, record, device, options = {}) {
     { label: '示值 I/g', width: 74, align: 'right' },
     { label: '偏差/g', width: 66, align: 'right' },
     { label: '判定', width: 43, align: 'center' },
-    { label: options.printTime === false ? '置信度' : '测量时间', width: 86, align: 'center' },
+    { label: showTime ? timeField.label : '置信度', width: 86, align: 'center' },
   ];
   const scale = width / columns.reduce((sum, column) => sum + column.width, 0);
   columns.forEach((column) => { column.width *= scale; });
@@ -720,9 +806,9 @@ function drawRecordPage(document, record, device, options = {}) {
       item.missing ? '缺次' : formatNumber(item.value, item.dec),
       item.missing ? '—' : signedNumber(item.dev, item.dec),
       item.missing || !item.stable ? '不通过' : (item.inLimit ? '在限内' : '超限'),
-      options.printTime === false
-        ? (item.conf === null ? '—' : item.conf.toFixed(3))
-        : safeText(item.time || record.startTime),
+      showTime
+        ? safeText(item.time || record.startTime)
+        : (item.conf === null ? '—' : item.conf.toFixed(3)),
     ];
     x = margin;
     values.forEach((value, index) => {
@@ -750,20 +836,23 @@ function drawRecordPage(document, record, device, options = {}) {
     fill: evaluation.pass ? [0.91, 0.97, 0.91] : [1, 0.91, 0.91],
   });
   top += 25;
-  const reasonText = evaluation.reasons.length
-    ? evaluation.reasons.map((reason) => `${reason.label}：${reason.detail}`).join('\n')
-    : judgementBasis(record, device, evaluation);
-  const reasonLines = document.wrap(reasonText, width - 16, 8);
-  const reasonHeight = Math.max(38, reasonLines.length * 11 + 12);
-  drawCellText(document, margin, top, 86, reasonHeight, '判定依据', {
-    size: 8.4,
-    fill: [0.95, 0.96, 0.97],
-    align: 'center',
-  });
-  drawCellText(document, margin + 86, top, width - 86, reasonHeight, reasonText, {
-    size: 8,
-  });
-  top += reasonHeight + 13;
+  const detailField = templateField(template, 'detail');
+  if (detailField.show) {
+    const reasonText = evaluation.reasons.length
+      ? evaluation.reasons.map((reason) => `${reason.label}：${reason.detail}`).join('\n')
+      : judgementBasis(record, device, evaluation);
+    const reasonLines = document.wrap(reasonText, width - 16, 8);
+    const reasonHeight = Math.max(38, reasonLines.length * 11 + 12);
+    drawCellText(document, margin, top, 86, reasonHeight, detailField.label, {
+      size: 8.4,
+      fill: [0.95, 0.96, 0.97],
+      align: 'center',
+    });
+    drawCellText(document, margin + 86, top, width - 86, reasonHeight, reasonText, {
+      size: 8,
+    });
+    top += reasonHeight + 13;
+  }
 
   drawCellText(document, margin, top, width / 2, 35,
     `校验人员：${options.inspectorName || record.inspector || '—'}\n提交时间：${safeText(formatDateTime(record.submittedAt), '未提交')}`, {
@@ -775,13 +864,15 @@ function drawRecordPage(document, record, device, options = {}) {
     });
   top += 48;
 
-  const footerNote = options.footerNote ||
-    '注：出现异常时应在备注栏准确记录，必要时及时报修。';
-  document.text(margin, Math.max(44, page.height - top - 26), footerNote, {
+  const footerNote = [
+    options.footerNote || '注：出现异常时应在备注栏准确记录，必要时及时报修。',
+    options.footerExtra
+  ].filter(Boolean).join('\n');
+  document.text(margin, Math.max(44, page.height - top - 34), footerNote, {
     size: 7.8,
     color: [0.32, 0.36, 0.40],
   });
-  document.text(margin, Math.max(30, page.height - top - 40),
+  document.text(margin, Math.max(28, page.height - top - 54),
     `判定式：|I−L| ≤ ${evaluation.tol}%×L；导出时间：${formatDateTime(options.exportedAt || new Date())}`, {
       size: 7.5,
       color: [0.42, 0.46, 0.50],
@@ -807,6 +898,9 @@ export function generateRecordPdf(recordOrOptions, device = null, options = {}) 
       (normalized.options.template?.printTime !== false),
     footerNote: normalized.options.footerNote ||
       normalized.options.template?.footerNote,
+    footerExtra: normalized.options.footerExtra ||
+      normalized.options.template?.footerExtra,
+    template: normalized.options.template,
   };
   const document = new PdfDocument({
     title: `天平校验记录 ${normalized.record.id}`,
@@ -849,11 +943,96 @@ export function generateBatchPdf(recordsOrOptions, devices = [], options = {}) {
       exportedAt: config.exportedAt || config.generatedAt,
       printTime: item.template?.printTime ?? config.printTime,
       footerNote: item.template?.footerNote || config.footerNote,
+      footerExtra: item.template?.footerExtra || config.footerExtra,
+      template: item.template || config.template,
       inspectorName: config.inspectorNames?.[record.inspector] || item.inspectorName,
       verifierName: config.verifierNames?.[record.verifiedBy] || item.verifierName,
     });
   }
   return document.finish();
+}
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) ? (0xEDB88320 ^ (value >>> 1)) : (value >>> 1);
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buffer) {
+  let value = 0xFFFFFFFF;
+  for (const byte of buffer) {
+    value = CRC32_TABLE[(value ^ byte) & 0xFF] ^ (value >>> 8);
+  }
+  return (value ^ 0xFFFFFFFF) >>> 0;
+}
+
+/**
+ * 将多个本地 PDF 打包为 ZIP。采用 store 模式，不引入外部压缩依赖。
+ */
+export function generateZip(files) {
+  if (!Array.isArray(files) || !files.length) throw new Error('ZIP 文件包至少需要一个文件');
+  const entries = files.map((file) => {
+    const name = String(file.name || '').replaceAll('\\', '/').replace(/^\/+/, '');
+    if (!name || name.includes('../')) throw new Error('ZIP 文件名无效');
+    const data = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data || []);
+    return { name: Buffer.from(name, 'utf8'), data, crc: crc32(data) };
+  });
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034B50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0800, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt16LE(0, 10);
+    local.writeUInt16LE(0, 12);
+    local.writeUInt32LE(entry.crc, 14);
+    local.writeUInt32LE(entry.data.length, 18);
+    local.writeUInt32LE(entry.data.length, 22);
+    local.writeUInt16LE(entry.name.length, 26);
+    local.writeUInt16LE(0, 28);
+    localParts.push(local, entry.name, entry.data);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014B50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0x0800, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(0, 12);
+    central.writeUInt16LE(0, 14);
+    central.writeUInt32LE(entry.crc, 16);
+    central.writeUInt32LE(entry.data.length, 20);
+    central.writeUInt32LE(entry.data.length, 24);
+    central.writeUInt16LE(entry.name.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(0, 38);
+    central.writeUInt32LE(offset, 42);
+    centralParts.push(central, entry.name);
+    offset += local.length + entry.name.length + entry.data.length;
+  }
+  const centralDirectory = Buffer.concat(centralParts);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054B50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralDirectory.length, 12);
+  end.writeUInt32LE(offset, 16);
+  end.writeUInt16LE(0, 20);
+  return Buffer.concat([...localParts, centralDirectory, end]);
 }
 
 export function generateWeekPdf(recordsOrOptions, devices = [], options = {}) {
@@ -915,8 +1094,9 @@ export function generateWeekPdf(recordsOrOptions, devices = [], options = {}) {
     });
     uniqueDates.forEach((date, index) => {
       const candidates = records.filter((record) => record.date === date);
-      const record = candidates[0];
-      const value = record ? safeText(getter(record, config)) : '';
+      const value = candidates.length
+        ? candidates.map((record) => safeText(getter(record, config))).join(' / ')
+        : '';
       drawCellText(document, margin + labelWidth + dateWidth * index, top, dateWidth, 32, value, {
         size: 7.4,
         align: 'center',
@@ -925,7 +1105,7 @@ export function generateWeekPdf(recordsOrOptions, devices = [], options = {}) {
     top += 32;
   }
   document.text(margin, 54,
-    `导出时间：${formatDateTime(config.exportedAt || config.generatedAt || new Date())}；作废记录不参与统计；同一天多条记录以列表中首条展示。`, {
+    `导出时间：${formatDateTime(config.exportedAt || config.generatedAt || new Date())}；作废记录不参与统计；同一天多条记录以“ / ”分隔并列展示。`, {
       size: 7.2,
       color: [0.38, 0.42, 0.46],
     });

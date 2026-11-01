@@ -10,6 +10,7 @@ import path from 'node:path';
 import {
   addMinutes,
   audit,
+  getAccounts,
   getDevice,
   getDevices,
   getRawRecord,
@@ -24,6 +25,7 @@ import {
   withTransaction
 } from '../db.js';
 import { HttpError } from '../auth.js';
+import { terminateDisplayOcr } from './display-ocr.js';
 
 function cleanError(error) {
   return {
@@ -35,6 +37,20 @@ function cleanError(error) {
       || error?.statusLabel
       || (error?.status === '待人工处理' ? '待人工处理' : '失败')
   };
+}
+
+function pendingError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  error.taskStatus = '待人工处理';
+  return error;
+}
+
+function readoutAuditSummary(readouts) {
+  return readouts.map((item) => {
+    const value = item.value === null || item.value === undefined ? '缺次' : `${item.value}${item.unit || 'g'}`;
+    return `${item.key || `I${Number(item.point) + 1}-${Number(item.idx)}`}=${value}@${Number(item.conf || 0).toFixed(3)}`;
+  }).join('；');
 }
 
 function normalizeReadouts(items, device, startedAt) {
@@ -65,7 +81,12 @@ function normalizeReadouts(items, device, startedAt) {
       conf: Number.isFinite(Number(object.conf)) ? Number(object.conf) : 0.995,
       stable: object.stable !== false,
       range,
-      screenshot: object.screenshot || ''
+      screenshot: object.screenshot || '',
+      recognizedText: object.recognizedText || '',
+      evidenceStatus: object.evidenceStatus || 'ocr-frame',
+      bbox: object.bbox || null,
+      frame: object.frame || null,
+      ocr: object.ocr || null
     };
   });
 }
@@ -98,13 +119,20 @@ function stageVideoForRecord(task, recordId, dataDir) {
   return { source: task.filePath, target };
 }
 
+function isManagedUploadedVideo(filePath, dataDir) {
+  if (!filePath || !dataDir) return false;
+  const root = `${path.resolve(dataDir, 'videos')}${path.sep}`;
+  return path.resolve(filePath).startsWith(root);
+}
+
 export class AnalysisQueue {
   constructor({
     db,
     config,
     storageService,
     logger = console,
-    intervalMs = 600
+    intervalMs = 600,
+    analyzer = null
   }) {
     this.db = db;
     this.config = config;
@@ -114,7 +142,7 @@ export class AnalysisQueue {
     this.timer = null;
     this.running = false;
     this.stopping = false;
-    this.analyzer = null;
+    this.analyzer = typeof analyzer === 'function' ? analyzer : null;
   }
 
   async loadAnalyzer() {
@@ -153,6 +181,7 @@ export class AnalysisQueue {
     this.running = false;
     clearTimeout(this.timer);
     this.timer = null;
+    await terminateDisplayOcr();
   }
 
   recoverInterruptedTasks() {
@@ -193,14 +222,22 @@ export class AnalysisQueue {
 
     try {
       const analyzeVideo = await this.loadAnalyzer();
+      const analysisTemplate = getTemplate(this.db);
+      const activeDevices = getDevices(this.db, { status: '在用' }).map((device) => (
+        analysisTemplate?.useTemplatePoints
+          ? { ...device, points: [...analysisTemplate.points] }
+          : device
+      ));
       const result = await analyzeVideo({
         filePath: task.filePath,
         sha256: task.sha,
         startedAt: task.startTime,
         uploadedBy: task.user,
-        devices: getDevices(this.db, { status: '在用' }),
+        devices: activeDevices,
+        accounts: getAccounts(this.db),
         config: this.config
       });
+      result.analysisTemplate = analysisTemplate;
       await this.completeWithResult(task.id, result, null);
     } catch (error) {
       this.failTask(task.id, cleanError(error));
@@ -249,42 +286,62 @@ export class AnalysisQueue {
       throw new HttpError(409, 'TASK_ALREADY_COMPLETED', '该任务已生成记录，不能重复生成');
     }
 
-    const personAccount = result?.personCard?.account || task.user;
+    const manual = result?.manual === true;
+    const personAccount = result?.personCard?.account || (manual ? task.user : '');
+    if (!manual && Array.isArray(result?.cardConflicts) && result.cardConflicts.length) {
+      throw pendingError(
+        'E-1001',
+        `卡面身份冲突，未生成正式记录：${result.cardConflicts.join('；')}`,
+      );
+    }
+    if (!manual && !result?.personCard?.account) {
+      throw pendingError(
+        'E-1002',
+        '未识别到唯一且有效的人员卡，未生成正式记录；请补拍清晰卡面或由管理员执行人工补录',
+      );
+    }
+    if (!manual && !result?.deviceCard?.code) {
+      throw pendingError(
+        'E-1003',
+        '未识别到唯一且有效的设备卡，未生成正式记录；请补拍清晰卡面或由管理员执行人工补录',
+      );
+    }
+    if (!personAccount) {
+      throw pendingError('E-1002', '人员卡身份为空，未生成正式记录');
+    }
     if (personAccount !== task.user) {
-      const mismatch = new Error(
-        `人员卡与登录人员不一致：视频中识别为 ${personAccount}，任务归属 ${task.user}，未生成记录`
+      throw pendingError(
+        'E-1004',
+        `人员卡与登录人员不一致：视频中识别为 ${personAccount}，任务归属 ${task.user}，未生成正式记录`,
       );
-      mismatch.code = 'E-1004';
-      mismatch.taskStatus = '待人工处理';
-      throw mismatch;
-    }
-    if (!result?.personCard?.account && !result?.manual) {
-      const missing = new Error(
-        '未识别到人员卡，未生成正式记录；请补拍清晰卡面或由管理员执行人工补录'
-      );
-      missing.code = 'E-1002';
-      missing.taskStatus = '待人工处理';
-      throw missing;
-    }
-    if (!result?.deviceCard?.code && !result?.deviceId) {
-      const missing = new Error(
-        '未识别到设备卡，未生成正式记录；请补拍清晰卡面或由管理员执行人工补录'
-      );
-      missing.code = 'E-1003';
-      missing.taskStatus = '待人工处理';
-      throw missing;
     }
 
-    const device = result.deviceId
+    const cardDevice = result?.deviceCard?.code
+      ? getDeviceByAnyCode(this.db, result.deviceCard.code)
+      : null;
+    const inferredDevice = result?.deviceId
       ? getDevice(this.db, result.deviceId)
-      : getDeviceByAnyCode(this.db, result.deviceCard.code);
-    if (!device) {
-      const unknown = new Error(
-        `设备二维码 ${result.deviceCard.code} 未登记，请复核确认人员先建立天平档案`
+      : null;
+    if (!manual && !cardDevice) {
+      throw pendingError(
+        'E-1005',
+        `设备卡 ${result?.deviceCard?.code || '（未识别）'} 未登记，请复核确认人员先建立天平档案`,
       );
-      unknown.code = 'E-1005';
-      unknown.taskStatus = '待人工处理';
-      throw unknown;
+    }
+    if (!manual && cardDevice && inferredDevice && cardDevice.id !== inferredDevice.id) {
+      throw pendingError(
+        'E-1007',
+        `设备卡与视频读数识别的天平不一致：卡面 ${cardDevice.id}，OCR ${inferredDevice.id}，未生成正式记录`,
+      );
+    }
+    let device = manual
+      ? getDevice(this.db, result.deviceId)
+      : (cardDevice || inferredDevice);
+    if (!device) {
+      throw pendingError(
+        'E-1003',
+        '未识别到已登记设备身份，未生成正式记录；请补拍设备卡或由管理员执行人工补录',
+      );
     }
     if (device.status !== '在用') {
       const stopped = new Error(`天平 ${device.id} 已停用，不能生成新记录`);
@@ -293,11 +350,15 @@ export class AnalysisQueue {
       throw stopped;
     }
 
-    const date = task.startTime.slice(0, 10);
+    const template = result.analysisTemplate || getTemplate(this.db);
+    if (template?.useTemplatePoints) {
+      device = { ...device, points: [...template.points] };
+    }
+    const effectiveStartTime = result.startTime || task.startTime;
+    const date = effectiveStartTime.slice(0, 10);
     const recordId = nextRecordId(this.db, device.id, date);
     const speech = result.speech || {};
-    const template = getTemplate(this.db);
-    const readouts = normalizeReadouts(result.readouts, device, task.startTime);
+    const readouts = normalizeReadouts(result.readouts, device, effectiveStartTime);
     const warnings = Array.isArray(result.warnings) ? [...result.warnings] : [];
     const sameDayCount = this.db.prepare(`
       SELECT COUNT(*) AS n FROM records
@@ -306,13 +367,37 @@ export class AnalysisQueue {
     if (sameDayCount > 0) {
       warnings.push(`该天平当日已有 ${sameDayCount} 条记录；本记录独立生成并独立复核，不覆盖既有记录`);
     }
-    let screenshots = Array.isArray(result.screenshots) ? result.screenshots : [];
-    screenshots = this.copyScreenshots(recordId, screenshots);
+    const sourceScreenshots = Array.isArray(result.screenshots) ? result.screenshots : [];
+    if (!manual) {
+      const sourceKeys = new Set(sourceScreenshots.map((entry) => entry?.key).filter(Boolean));
+      const missingEvidence = readouts
+        .filter((item) => item.value !== null && !sourceKeys.has(`I${item.point + 1}-${item.idx}`))
+        .map((item) => `I${item.point + 1}-${item.idx}`);
+      if (missingEvidence.length) {
+        throw pendingError(
+          'E-READING-EVIDENCE-INCOMPLETE',
+          `以下有效读数缺少识别截图，未生成正式记录：${missingEvidence.join('、')}。请检查 FFmpeg 后重试`,
+        );
+      }
+    }
+    const screenshots = this.copyScreenshots(recordId, sourceScreenshots);
     readouts.forEach((item, index) => {
       const key = `I${item.point + 1}-${item.idx}`;
       const match = screenshots.find((entry) => entry.key === key);
       if (match) item.screenshot = match.relativePath;
     });
+    if (!manual) {
+      const copiedKeys = new Set(screenshots.map((entry) => entry.key));
+      const missingCopied = readouts
+        .filter((item) => item.value !== null && !copiedKeys.has(`I${item.point + 1}-${item.idx}`))
+        .map((item) => `I${item.point + 1}-${item.idx}`);
+      if (missingCopied.length) {
+        throw pendingError(
+          'E-READING-EVIDENCE-INCOMPLETE',
+          `以下有效读数的截图复制失败，未生成正式记录：${missingCopied.join('、')}`,
+        );
+      }
+    }
 
     const stagedVideo = stageVideoForRecord(
       { ...task, device: device.id },
@@ -334,11 +419,12 @@ export class AnalysisQueue {
           id, date, device_id, inspector_id, box_id, started_at, duration_seconds,
           file_name, file_size_mb, sha256, status, cleanliness, level_result,
           internal_cal, remark, readouts_json, speech_json, person_card_json,
-          device_card_json, range_switch, checks_json, modifications_json,
+          device_card_json, range_switch, range_transition_json, checks_json, modifications_json,
           template_version, tolerance_percent, device_snapshot_json,
           template_snapshot_json, analyzed_at, task_id, created_at, updated_at
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '待提交', ?, ?, ?, '无', ?, ?, ?, ?, ?,
+          ?,
           '{}', '[]', ?, ?, ?, ?, ?, ?, ?, ?
         )
         `).run(
@@ -347,7 +433,7 @@ export class AnalysisQueue {
         device.id,
         task.user,
         device.defaultBox || null,
-        task.startTime,
+        effectiveStartTime,
         result.durationSeconds || null,
         task.file,
         task.size,
@@ -360,6 +446,7 @@ export class AnalysisQueue {
         jsonString(result.personCard || { account: task.user, conf: 1 }),
         jsonString(result.deviceCard || { code: device.id, conf: 1 }),
         result.rangeSwitch === false ? 0 : 1,
+        jsonString(result.rangeTransition || {}),
         template?.version || 'v1',
         Number(template?.tol ?? device.tol ?? 0.05),
         jsonString(device),
@@ -371,13 +458,14 @@ export class AnalysisQueue {
       );
         this.db.prepare(`
         UPDATE tasks
-        SET status = '已完成', device_id = ?, file_path = ?, finished_at = ?,
+        SET status = '已完成', device_id = ?, file_path = ?, started_at = ?, finished_at = ?,
             duration_ms = ?, record_id = ?, error_code = NULL, error_reason = NULL,
             warnings_json = ?, updated_at = ?
         WHERE id = ?
         `).run(
         device.id,
         finalPath,
+        effectiveStartTime,
         time,
         elapsed,
         recordId,
@@ -391,11 +479,24 @@ export class AnalysisQueue {
         objectId: taskId,
         before: '分析中',
         after: '已完成',
-        reason: `生成待提交记录 ${recordId}；分析引擎 ${result.engine || 'unknown'}；读数 ${readouts.filter((item) => item.value !== null).length}/9`,
+        reason: [
+          `生成待提交记录 ${recordId}`,
+          `分析引擎 ${result.engine || 'unknown'}`,
+          result.manual ? `人工补录理由 ${result.personCard?.reason || '未填写'}` : null,
+          `显示屏定位 ${result.ocr?.displayRegionSource || 'unknown'}`,
+          `拍摄时间来源 ${result.startTimeSource || 'user-confirmed'}`,
+          result.media?.creationTime ? `视频元数据 ${result.media.creationTime}` : null,
+          `人员卡 ${result.personCard?.account || personAccount}`,
+          `设备卡 ${result.deviceCard?.code || device.id}`,
+          `有效读数 ${readouts.filter((item) => item.value !== null).length}/9`,
+          `识别摘要 ${readoutAuditSummary(readouts)}`
+        ].filter(Boolean).join('；'),
         result: '成功'
         });
       });
-      if (stagedVideo.source !== finalPath && existsSync(stagedVideo.source)) {
+      if (stagedVideo.source !== finalPath
+        && isManagedUploadedVideo(stagedVideo.source, this.config.dataDir)
+        && existsSync(stagedVideo.source)) {
         unlinkSync(stagedVideo.source);
       }
     } catch (error) {
@@ -420,31 +521,31 @@ export class AnalysisQueue {
     mkdirSync(targetRoot, { recursive: true });
     const sourceFolders = new Set();
     const rootPrefix = `${path.resolve(this.config.dataDir, 'screenshots')}${path.sep}`;
-    const copied = screenshots.map((entry, index) => {
+    const copied = [];
+    screenshots.forEach((entry, index) => {
       const key = entry.key || `I${Math.floor(index / 3) + 1}-${(index % 3) + 1}`;
       const rawSource = entry.path || entry;
       const source = typeof rawSource === 'string' && !path.isAbsolute(rawSource)
         ? path.resolve(this.config.dataDir, rawSource)
         : rawSource;
+      if (typeof source !== 'string' || !existsSync(source)) return;
       const targetName = `${key}.jpg`;
       const target = path.join(targetRoot, targetName);
-      if (typeof source === 'string' && existsSync(source)) {
-        copyFileSync(source, target);
-        const absoluteSource = path.resolve(source);
-        if (absoluteSource.startsWith(rootPrefix) && absoluteSource !== target) {
-          sourceFolders.add(path.dirname(absoluteSource));
-          try {
-            unlinkSync(absoluteSource);
-          } catch {
-            // Keep a valid screenshot even if the temporary source cannot be removed.
-          }
+      copyFileSync(source, target);
+      const absoluteSource = path.resolve(source);
+      if (absoluteSource.startsWith(rootPrefix) && absoluteSource !== target) {
+        sourceFolders.add(path.dirname(absoluteSource));
+        try {
+          unlinkSync(absoluteSource);
+        } catch {
+          // Keep a valid screenshot even if the temporary source cannot be removed.
         }
       }
-      return {
+      copied.push({
         key,
         path: target,
         relativePath: path.posix.join('screenshots', recordId, targetName)
-      };
+      });
     });
     for (const folder of sourceFolders) {
       try {
@@ -553,28 +654,52 @@ export class AnalysisQueue {
     `).run(nowDateTime(), nowDateTime(), taskId);
 
     try {
+      const { captureManualEvidence } = await import('./analyzer.js');
+      const evidence = await captureManualEvidence({
+        filePath: task.filePath,
+        config: this.config,
+        devices: getDevices(this.db, { status: '在用' }),
+        readouts: payload?.readouts || [],
+        startTime: task.startTime,
+        recordId: task.id,
+      });
       const result = {
         engine: 'manual-entry',
         manual: true,
         personCard: {
           account: payload?.personCard?.account || task.user,
-          conf: Number(payload?.personCard?.conf || 1)
+          conf: Number(payload?.personCard?.conf || 1),
+          source: 'manual-admin',
+          actor: actor?.user?.id || 'unknown',
+          reason: payload?.manualReason || '管理员核实原始视频后补录'
         },
         deviceCard: {
           code: payload?.deviceCard?.code || device.id,
-          conf: Number(payload?.deviceCard?.conf || 1)
+          conf: Number(payload?.deviceCard?.conf || 1),
+          source: 'manual-admin',
+          actor: actor?.user?.id || 'unknown',
+          reason: payload?.manualReason || '管理员核实原始视频后补录'
         },
         deviceId: device.id,
-        durationSeconds: payload?.durationSeconds || null,
+        durationSeconds: payload?.durationSeconds || evidence.media.duration || null,
         rangeSwitch: payload?.rangeSwitch !== false,
-        readouts: payload?.readouts || [],
+        readouts: evidence.readouts,
         speech: payload?.speech || {
           cleanliness: { value: payload?.cleanliness || '是', conf: 1 },
           level: { value: payload?.level || '是', conf: 1 },
           internalCal: { value: payload?.internalCal || '是', conf: 1 }
         },
-        screenshots: [],
-        warnings: ['本记录通过人工补录生成，请核对原始视频后提交']
+        screenshots: evidence.screenshots,
+        rangeTransition: payload?.rangeTransition || null,
+        ocr: {
+          displayRegion: evidence.displayRegion,
+          displayRegionSource: evidence.displayRegionSource,
+          displayRegionConfidence: evidence.displayRegionConfidence
+        },
+        warnings: [
+          `本记录由管理员人工补录生成；理由：${payload?.manualReason || '管理员核实原始视频后补录'}`,
+          '已从原始视频补齐各有效读数识别帧，请核对后提交'
+        ]
       };
       return await this.completeWithResult(taskId, result, actor);
     } catch (error) {

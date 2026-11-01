@@ -46,6 +46,7 @@ const requiredFiles = [
   'LICENSE',
   'README.md',
   'docker-compose.yml',
+  'package-lock.json',
   'package.json',
   'public/index.html',
   'samples/manifests',
@@ -55,6 +56,7 @@ const requiredFiles = [
   'src/api.js',
   'src/auth.js',
   'src/db.js',
+  'src/services/display-ocr.js',
   'src/rules.js',
 ];
 

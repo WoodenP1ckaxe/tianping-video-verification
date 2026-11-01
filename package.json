@@ -19,5 +19,11 @@
     "repo:backup": "node scripts/repo-manager.mjs backup",
     "repair:sample-evidence": "node scripts/repair-sample-evidence.js",
     "make-offline-bundle": "node scripts/make-offline-bundle.js"
+  },
+  "dependencies": {
+    "@tesseract.js-data/eng": "^1.0.0",
+    "jpeg-js": "^0.4.4",
+    "jsqr": "^1.4.0",
+    "tesseract.js": "^7.0.0"
   }
 }

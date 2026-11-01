@@ -44,9 +44,10 @@ function sumFiles(files) {
 }
 
 export class StorageService {
-  constructor({ db, config }) {
+  constructor({ db, config, logger = console }) {
     this.db = db;
     this.config = config;
+    this.logger = logger;
     this.videoRoot = path.join(config.dataDir, 'videos');
     this.screenshotRoot = path.join(config.dataDir, 'screenshots');
     this.exportRoot = path.join(config.dataDir, 'exports');
@@ -95,13 +96,23 @@ export class StorageService {
     const quotaBytes = quotaGb * 1024 ** 3;
     const percent = quotaBytes ? Math.round((usedBytes / quotaBytes) * 10000) / 100 : 0;
     const threshold = Number(getSetting(this.db, 'capacityWarnPercent', 90));
-    const byDeviceRows = this.db.prepare(`
-      SELECT d.id, COUNT(*) AS count, SUM(t.size_bytes) AS size_bytes
-      FROM tasks t
-      JOIN devices d ON d.id = t.device_id
-      GROUP BY d.id
-      ORDER BY size_bytes DESC
-    `).all();
+    const taskFiles = new Map(
+      this.db.prepare(`
+        SELECT device_id, file_path FROM tasks
+        WHERE device_id IS NOT NULL AND file_path IS NOT NULL
+      `).all().map((row) => [path.resolve(row.file_path), row.device_id])
+    );
+    const deviceUsage = new Map();
+    for (const file of videos) {
+      const deviceId = taskFiles.get(path.resolve(file.path));
+      if (!deviceId) continue;
+      const current = deviceUsage.get(deviceId) || { id: deviceId, count: 0, size_bytes: 0 };
+      current.count += 1;
+      current.size_bytes += file.size;
+      deviceUsage.set(deviceId, current);
+    }
+    const byDeviceRows = [...deviceUsage.values()]
+      .sort((left, right) => right.size_bytes - left.size_bytes);
     const dailyBytes = this.dailyVideoBytes();
     const remainingBytes = Math.max(0, quotaBytes - usedBytes);
     const retainDays = dailyBytes > 0
@@ -290,7 +301,8 @@ export class StorageService {
   maybeDailyBackup() {
     const now = nowDateTime();
     const hour = Number(now.slice(11, 13));
-    if (hour < 2 || hour > 5) return null;
+    // 02:00 是计划时间；若宿主机在时间窗内离线，启动后当天首次检查会补跑。
+    if (hour < 2) return null;
     const date = now.slice(0, 10);
     const existing = this.db.prepare(`
       SELECT id FROM backups
@@ -301,7 +313,16 @@ export class StorageService {
     try {
       this.pruneBackups(30);
       return this.createBackup(null, '自动');
-    } catch {
+    } catch (error) {
+      audit(this.db, null, {
+        type: '备份执行',
+        objectType: '系统',
+        objectId: '每日自动备份',
+        after: '失败',
+        reason: String(error.message || error).slice(0, 1000),
+        result: '失败'
+      });
+      this.logger.error?.('[backup]', error);
       return null;
     }
   }

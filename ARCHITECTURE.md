@@ -27,6 +27,7 @@ tianping-system/
       uploads.js
       storage.js
       exporter.js
+      logs.js
   public/
     index.html
     assets/
@@ -124,7 +125,7 @@ HTTP 状态使用 400/401/403/404/409/413/415/429/500。接口不得把堆栈返
 {
   "point": 0,
   "idx": 1,
-  "value": 200.0062,
+  "value": 200.0009,
   "unit": "g",
   "off": 32,
   "time": "2026-09-28 08:32",
@@ -217,6 +218,7 @@ HTTP 状态使用 400/401/403/404/409/413/415/429/500。接口不得把堆栈返
 - `POST /api/uploads/init`
 - `GET /api/uploads/:uploadId`
 - `PUT /api/uploads/:uploadId/content`，请求头 `Upload-Offset`，原始分片
+- `POST /api/uploads/:uploadId/confirm-time`，视频元数据缺失时确认拍摄时间并继续
 - `DELETE /api/uploads/:uploadId`
 
 ### 业务
@@ -225,7 +227,7 @@ HTTP 状态使用 400/401/403/404/409/413/415/429/500。接口不得把堆栈返
 - `POST /api/tasks/:id/retry`
 - `POST /api/tasks/:id/cancel`
 - `POST /api/tasks/:id/manual-complete`
-- `GET /api/records`
+- `GET /api/records?devices=F001&devices=F002&from=&to=&inspector=&status=&conclusion=&page=1&pageSize=50`
 - `GET /api/records/:id`
 - `PATCH /api/records/:id`
 - `POST /api/records/:id/readouts/:key`
@@ -295,12 +297,16 @@ async function analyzeVideo(context)
 
 ```js
 {
-  engine: "sample-manifest",
+  engine: "tesseract.js-7.0.0 + seven-segment-template",
   personCard: {account, conf},
   deviceCard: {code, conf},
   deviceId: "F001",
+  inferredDeviceId: "F001",
+  startTime: "2026-09-28 08:31",
+  startTimeSource: "video-creation-time",
   durationSeconds: 393.62,
   rangeSwitch: true,
+  rangeTransition: {fromRange: 1, toRange: 2, startOffsetSeconds, endOffsetSeconds},
   readouts: [],
   speech: {},
   screenshots: [],
@@ -308,8 +314,11 @@ async function analyzeVideo(context)
 }
 ```
 
-错误使用 `AnalyzerError(code, message, status)`，其中 `status` 可为
-`待人工处理` 或 `失败`。未知哈希绝不返回伪造读数。
+读数由 `src/services/display-ocr.js` 在自动搜索出的显示屏区域上对真实视频帧逐秒
+识别，不使用文件哈希查找预置读数。人员卡和设备卡必须是唯一、有效且相互一致的
+二维码身份；缺少卡面或缺少任一有效读数截图时，队列不得生成自动正式记录。错误
+使用 `AnalyzerError(code, message, status)`，其中 `status` 可为 `待人工处理` 或
+`失败`。无法识别稳定示值时不返回伪造读数。
 
 ## 9. 队列契约
 

@@ -15,6 +15,7 @@ services:
       HOST: 0.0.0.0
       PORT: 8080
       PDF_FONT_PATH: /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+      DISPLAY_REGION: "${DISPLAY_REGION:-}"
       SECURE_COOKIE: "${SECURE_COOKIE:-false}"
       INITIAL_PASSWORD: "${INITIAL_PASSWORD:?首次启动前必须设置 INITIAL_PASSWORD}"
       TRUST_PROXY: "${TRUST_PROXY:-}"

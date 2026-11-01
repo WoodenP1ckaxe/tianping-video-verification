@@ -1,4 +1,4 @@
-/* global window, document, fetch, URLSearchParams, Blob, File */
+/* global window, document, fetch, URLSearchParams, Blob, File, indexedDB */
 
 const root = document.getElementById('app');
 const modalRoot = document.getElementById('modal-root');
@@ -74,7 +74,7 @@ const state = {
   },
   filters: {
     records: {
-      device: '',
+      devices: [],
       from: '',
       to: '',
       inspector: '',
@@ -87,6 +87,11 @@ const state = {
       to: '',
       inspector: ''
     },
+    history: {
+      from: '',
+      to: '',
+      conclusion: ''
+    },
     audit: {
       from: '',
       to: '',
@@ -94,9 +99,41 @@ const state = {
       type: ''
     }
   },
+  recordsView: {
+    loaded: false,
+    loading: false,
+    items: [],
+    total: 0,
+    page: 1,
+    pageSize: 50,
+    totalPages: 1,
+    error: ''
+  },
+  historyView: {
+    device: '',
+    loaded: false,
+    loading: false,
+    items: [],
+    total: 0,
+    page: 1,
+    pageSize: 200,
+    totalPages: 1,
+    error: ''
+  },
+  verifyView: {
+    loaded: false,
+    loading: false,
+    items: [],
+    total: 0,
+    page: 1,
+    pageSize: 100,
+    totalPages: 1,
+    error: ''
+  },
   upload: {
     file: null,
     startedAt: '',
+    expectedDeviceId: '',
     confirmed: false,
     uploadId: null,
     offset: 0,
@@ -106,7 +143,9 @@ const state = {
     abortController: null,
     busy: false,
     completedTaskId: '',
-    sha256: ''
+    sha256: '',
+    duplicateWarning: '',
+    metadataStartTime: ''
   },
   modal: null
 };
@@ -178,7 +217,10 @@ function formatDate(value) {
 function formatFileSize(mb) {
   const value = Number(mb);
   if (!Number.isFinite(value)) return '—';
-  return value >= 1 ? `${value.toFixed(1)} MB` : `${Math.round(value * 1024)} KB`;
+  if (value >= 1) return `${value.toFixed(1)} MB`;
+  const kilobytes = value * 1024;
+  if (value > 0 && kilobytes < 1) return '<1 KB';
+  return `${Math.round(kilobytes)} KB`;
 }
 
 function formatDuration(milliseconds) {
@@ -222,6 +264,26 @@ function todayText() {
 function daysAgoText(days) {
   return new Date(Date.now() - days * 86_400_000)
     .toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
+}
+
+function dateTimeAtOffset(base, seconds) {
+  const normalized = String(base || currentDateTimeText()).replace(' ', 'T').slice(0, 16) + ':00+08:00';
+  const date = new Date(new Date(normalized).getTime() + Number(seconds || 0) * 1000);
+  const p = shanghaiParts(date);
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`;
+}
+
+function naturalWeekRange(anchorText = todayText()) {
+  const anchor = new Date(`${anchorText}T00:00:00Z`);
+  const weekday = anchor.getUTCDay() || 7;
+  const monday = new Date(anchor);
+  monday.setUTCDate(anchor.getUTCDate() - weekday + 1);
+  const sunday = new Date(monday);
+  sunday.setUTCDate(monday.getUTCDate() + 6);
+  return {
+    from: monday.toISOString().slice(0, 10),
+    to: sunday.toISOString().slice(0, 10)
+  };
 }
 
 function parseRoute() {
@@ -335,6 +397,9 @@ async function loadState({ renderAfter = true } = {}) {
   state.data = data;
   state.session = data.user;
   state.csrfToken = data.csrfToken || state.csrfToken;
+  state.recordsView.loaded = false;
+  state.historyView.loaded = false;
+  state.verifyView.loaded = false;
   if (renderAfter) render();
   return data;
 }
@@ -348,7 +413,9 @@ async function boot() {
       renderChangePassword();
       return;
     }
-    await loadState();
+    await loadState({ renderAfter: false });
+    await restoreUploadSession();
+    render();
   } catch (error) {
     if (error.status === 401) renderLogin();
     else {
@@ -451,7 +518,7 @@ function renderChangePassword() {
 
 function navigationItems() {
   const queueCount = state.data?.queue?.queued || 0;
-  const pendingVerify = state.data?.records?.filter((record) => record.status === '已提交').length || 0;
+  const pendingVerify = Number(state.data?.recordSummary?.byStatus?.['已提交'] || 0);
   const myDrafts = state.data?.records?.filter(
     (record) => record.status === '待提交' && record.inspector === state.data?.user?.id
   ).length || 0;
@@ -566,37 +633,45 @@ function roleActions() {
 
 function pageDashboard() {
   const records = state.data.records || [];
-  const today = todayText();
-  const todayRecords = records.filter((record) => record.date === today);
-  const pendingDrafts = records.filter(
-    (record) => record.status === '待提交' && (isRole('inspector') ? record.inspector === state.data.user.id : true)
-  );
-  const pendingVerify = records.filter((record) => record.status === '已提交');
+  const summary = state.data.recordSummary || {};
+  const pendingDraftCount = isRole('inspector')
+    ? Number(summary.ownPendingDrafts || 0)
+    : Number(summary.byStatus?.['待提交'] || 0);
+  const pendingVerifyCount = Number(summary.byStatus?.['已提交'] || 0);
+  const todayCount = isRole('inspector')
+    ? Number(summary.ownToday || 0)
+    : Number(summary.today || 0);
   const failedTasks = (state.data.tasks || []).filter((task) => task.status === '失败' || task.status === '待人工处理');
   const stats = isRole('inspector')
     ? [
-      ['今日已上传', todayRecords.filter((record) => record.inspector === state.data.user.id).length, '条校验记录', 'blue'],
-      ['待核对提交', pendingDrafts.filter((record) => record.inspector === state.data.user.id).length, '条记录等待电子确认', 'amber'],
+      ['今日已上传', todayCount, '条校验记录', 'blue'],
+      ['待核对提交', pendingDraftCount, '条记录等待电子确认', 'amber'],
       ['分析队列', state.data.queue?.queued || 0, '段视频排队中', 'violet'],
       ['最近异常', failedTasks.filter((task) => task.user === state.data.user.id).length, '项任务需关注', 'red']
     ]
     : isRole('verifier')
       ? [
-        ['待复核记录', pendingVerify.length, '条记录等待电子签名', 'amber'],
-        ['今日完成校验', todayRecords.length, '条日常校验记录', 'blue'],
-        ['本月已复核', records.filter((record) => record.status === '已复核确认').length, '条可正式导出', 'green'],
+        ['待复核记录', pendingVerifyCount, '条记录等待电子签名', 'amber'],
+        ['今日完成校验', todayCount, '条日常校验记录', 'blue'],
+        ['累计已复核', Number(summary.byStatus?.['已复核确认'] || 0), '条可正式导出', 'green'],
         ['异常记录', records.filter((record) => recordEvaluation(record)?.conclusion === '不通过').length, '条含判定不满足项', 'red']
       ]
       : [
         ['分析队列', state.data.queue?.queued || 0, '段等待分析', 'blue'],
-        ['待复核', pendingVerify.length, '条记录等待复核', 'amber'],
-        ['今日记录', todayRecords.length, '条已生成校验记录', 'green'],
+        ['待复核', pendingVerifyCount, '条记录等待复核', 'amber'],
+        ['今日记录', todayCount, '条已生成校验记录', 'green'],
         ['异常任务', failedTasks.length, '项失败或待人工处理', 'red']
       ];
   const recent = records
     .filter((record) => isRole('inspector') || record.status !== '待提交' || record.inspector === state.data.user.id)
     .slice(0, 7);
-  const tasks = (state.data.tasks || []).slice(0, 5);
+  const tasks = (state.data.tasks || [])
+    .filter((task) => ['分析中', '排队中'].includes(task.status))
+    .sort((left, right) => (
+      Number(left.queuePosition || Number.MAX_SAFE_INTEGER)
+      - Number(right.queuePosition || 0)
+    ))
+    .slice(0, 5);
   return `${pageHeader('工作台', `欢迎回来，${state.data.user.name}。今天也要完成可追溯的设备校验。`)}
     <section class="hero">
       <div class="hero-kicker">Daily verification · 可操作 / 可重复 / 可溯源</div>
@@ -621,9 +696,9 @@ function pageDashboard() {
       <section class="card">
         <div class="card-head"><div><h2>分析队列</h2><p>单机串行 · 严格按上传顺序</p></div>${tag(state.data.queue?.running ? '分析中' : '空闲', state.data.queue?.running ? 'violet' : 'gray')}</div>
         <div class="queue-list">
-          ${tasks.length ? tasks.map((task, index) => `
+          ${tasks.length ? tasks.map((task) => `
             <div class="queue-item">
-              <span class="queue-pos">${index + 1}</span>
+              <span class="queue-pos">${task.status === '分析中' ? '▶' : esc(task.queuePosition || '—')}</span>
               <span><strong>${esc(task.file)}</strong><small>${esc(task.user)} · ${esc(formatDate(task.queuedAt))}</small></span>
               ${tag(task.status)}
             </div>`).join('') : `<div class="empty"><strong>队列空闲</strong>暂无分析任务</div>`}
@@ -643,19 +718,20 @@ function recordsTable(records, options = {}) {
     <div class="table-wrap desktop-table">
       <table>
         <thead><tr>
-          <th>校验日期</th><th>天平编号</th><th>检验人员</th><th>砝码盒</th>
-          <th>判定</th><th>状态</th><th>提交时间</th><th></th>
+          <th>校验日期</th><th>天平编号 / 唯一号</th><th>检验人员</th><th>砝码盒</th>
+          <th>判定</th><th>复核状态</th><th>提交时间</th><th>复核时间</th><th></th>
         </tr></thead>
         <tbody>${records.slice(0, limit).map((record) => `
           <tr class="${record.status === '已作废' ? 'row-muted' : ''}">
             <td class="nowrap num">${esc(record.date)}</td>
             <td><a href="#/records/${encodeURIComponent(record.id)}"><b>${esc(record.device)}</b></a>
-              <div class="muted small">${esc(record.id)}</div></td>
+              <div class="muted small">${esc(record.deviceSnapshot?.uniqueNo || deviceById(record.device)?.uniqueNo || '—')} · ${esc(record.id)}</div></td>
             <td>${esc(accountName(record.inspector))}</td>
             <td class="num">${esc(record.box || '—')}</td>
             <td>${tag(recordEvaluation(record)?.conclusion || '—')}</td>
             <td>${tag(record.status)}</td>
             <td class="num nowrap">${esc(formatDate(record.submittedAt))}</td>
+            <td class="num nowrap">${esc(formatDate(record.verifiedAt))}</td>
             <td class="col-actions"><a class="btn btn-ghost btn-sm" href="#/records/${encodeURIComponent(record.id)}">查看</a></td>
           </tr>`).join('')}</tbody>
       </table>
@@ -665,7 +741,7 @@ function recordsTable(records, options = {}) {
         <a class="info-card" href="#/records/${encodeURIComponent(record.id)}">
           <div class="row between"><strong>${esc(record.device)}</strong>${tag(record.status)}</div>
           <h3 class="mt8">${esc(record.id)}</h3>
-          <p>${esc(record.date)} · ${esc(accountName(record.inspector))}</p>
+          <p>${esc(record.date)} · ${esc(record.deviceSnapshot?.uniqueNo || deviceById(record.device)?.uniqueNo || '—')} · ${esc(accountName(record.inspector))}</p>
           <div class="row between mt8"><span class="muted small">砝码盒 ${esc(record.box || '—')}</span>${tag(recordEvaluation(record)?.conclusion || '—')}</div>
         </a>`).join('')}
     </div>`;
@@ -675,11 +751,14 @@ function pageUpload() {
   const up = state.upload;
   const rules = state.data.fileRules;
   if (!up.startedAt) up.startedAt = currentDateTimeInput();
+  if (!up.expectedDeviceId) {
+    up.expectedDeviceId = state.data.devices.find((device) => device.status === '在用')?.id || '';
+  }
   const file = up.file;
   return `${pageHeader('上传校验视频', '上传原始视频并确认拍摄开始时间；服务端按分片接收并计算 SHA-256。')}
     <div class="grid grid-3">
       <section class="card span-2">
-        <div class="card-head"><div><h2>选择视频</h2><p>支持手机或 PC 拍摄的 MP4 / MOV 文件</p></div>${file ? `<button class="btn btn-secondary btn-sm" data-action="upload-clear">重新选择</button>` : ''}</div>
+        <div class="card-head"><div><h2>选择视频</h2><p>支持手机或 PC 拍摄的 MP4 / MOV 文件</p></div>${file && !up.busy ? `<button class="btn btn-secondary btn-sm" data-action="upload-clear">重新选择</button>` : ''}</div>
         <input id="video-file" type="file" accept=".mp4,.mov,video/mp4,video/quicktime" class="sr-only" ${up.busy ? 'disabled' : ''}>
         ${file ? `
           <div class="file-chip">
@@ -696,24 +775,32 @@ function pageUpload() {
           <div class="field">
             <label for="upload-start" class="required">拍摄开始时间</label>
             <input id="upload-start" name="startedAt" type="datetime-local" value="${attr(up.startedAt)}" ${up.busy ? 'disabled' : ''}>
-            <span class="hint">无视频元数据时必须由上传者确认，精确到分钟</span>
+            <span class="hint">视频有 creation_time 时优先使用元数据；缺失时才要求确认此时间</span>
           </div>
           <div class="field">
             <label>归属检验人员</label>
             <input value="${attr(state.data.user.name)}（${attr(state.data.user.id)}）" disabled>
           </div>
+          <div class="field">
+            <label for="upload-device" class="required">预计天平</label>
+            <select id="upload-device" name="expectedDeviceId" ${up.busy || up.uploadId ? 'disabled' : ''} required>
+              ${state.data.devices.filter((device) => device.status === '在用').map((device) => `<option value="${attr(device.id)}" ${up.expectedDeviceId === device.id ? 'selected' : ''}>${esc(device.id)} · ${esc(device.uniqueNo)}</option>`).join('')}
+            </select>
+            <span class="hint">仅用于同日重复上传提前提示；正式记录以设备卡为准</span>
+          </div>
         </div>
         <label class="row mt12" style="font-size:11px">
           <input type="checkbox" name="timeConfirmed" ${up.confirmed ? 'checked' : ''} ${up.busy ? 'disabled' : ''}>
-          <span>我已确认上述拍摄开始时间，提交后作为校验日期及读数时间计算基准。</span>
+          <span>若视频缺少拍摄时间元数据，我确认使用上述时间作为校验日期及读数时间基准。</span>
         </label>
         ${up.status ? `<div class="mt16">
           <div class="progress-label"><span>${esc(up.status)}</span><span class="num">${Math.round(up.progress)}%</span></div>
           <div class="progress"><i style="width:${Math.max(0, Math.min(100, up.progress))}%"></i></div>
           ${up.message ? `<div class="alert ${up.completedTaskId ? 'success' : 'warn'} mt12">${esc(up.message)}</div>` : ''}
         </div>` : ''}
+        ${up.duplicateWarning ? `<div class="alert warn mt12">${esc(up.duplicateWarning)}</div>` : ''}
         <div class="row row-wrap mt16">
-          <button class="btn btn-primary" data-action="upload-start" ${!file || !up.confirmed || up.busy ? 'disabled' : ''}>
+          <button class="btn btn-primary" data-action="upload-start" ${!file || up.busy ? 'disabled' : ''}>
             ${up.busy ? '<span class="spinner"></span>' : icon('upload')} ${up.busy ? '正在上传…' : '开始上传'}
           </button>
           ${up.busy ? '<button class="btn btn-secondary" data-action="upload-cancel">取消上传</button>' : ''}
@@ -732,8 +819,8 @@ function pageUpload() {
         </section>
         <section class="card">
           <div class="card-head"><h2>当前识别能力</h2></div>
-          <div class="alert">${esc(state.data.system?.env?.analyzerMode || 'sample-manifest')} 模式</div>
-          <p class="account-note mt8">三段客户样例可按文件哈希完成确定性演示分析。未知视频会自动进入“待人工处理”，由管理员核对后补录，系统不会伪造识别结果。</p>
+          <div class="alert">${esc(state.data.system?.env?.analyzerMode || 'local-display-ocr')} 模式</div>
+          <p class="account-note mt8">系统先在多帧中搜索显示屏候选区域，再逐秒读取该区域，基于七段码模板与离线 OCR 还原示值，并对连续帧做稳定段判定。部署时仍可用 DISPLAY_REGION 强制指定区域；无法形成可信读数时进入“待人工处理”。</p>
         </section>
       </aside>
     </div>`;
@@ -750,7 +837,7 @@ function pageTasks() {
     <div class="grid grid-4">
       ${[
         ['排队中', queue.queued || tasks.filter((task) => task.status === '排队中').length, '按上传顺序等待'],
-        ['分析中', tasks.filter((task) => task.status === '分析中').length, '单消费者，最多 1 段'],
+        ['分析中', tasks.filter((task) => task.status === '分析中').length, queue.currentTask ? `当前 ${queue.currentTask.id}` : '单消费者，最多 1 段'],
         ['已完成', tasks.filter((task) => task.status === '已完成').length, '已生成待提交记录'],
         ['需处理', tasks.filter((task) => ['失败', '待人工处理'].includes(task.status)).length, '失败或需人工补录']
       ].map(([label, value, note], index) => `
@@ -758,17 +845,22 @@ function pageTasks() {
           <div class="stat-label">${esc(label)}</div><div class="stat-value">${Number(value)}</div><div class="stat-note">${esc(note)}</div>
         </article>`).join('')}
     </div>
+    <div class="alert info mt12">
+      当前任务：${esc(queue.currentTask ? `${queue.currentTask.id} · ${queue.currentTask.file}` : '无')} ·
+      平均单段分析耗时：${esc(formatDuration(queue.averageSegmentDurationMs ?? queue.averageDurationMs))}
+    </div>
     <section class="card mt16">
       <div class="card-head"><div><h2>任务明细</h2><p>队列状态自动刷新；管理员可取消排队任务、重试失败任务或人工补录</p></div>
         <span class="muted small">最近刷新 ${esc(currentDateTimeText())}</span></div>
       ${tasks.length ? `
         <div class="table-wrap desktop-table"><table>
-          <thead><tr><th>任务编号</th><th>原始文件</th><th>上传时间</th><th>状态</th><th>记录 / 异常</th><th>耗时</th><th class="col-actions">操作</th></tr></thead>
+          <thead><tr><th>队列</th><th>任务编号</th><th>原始文件</th><th>上传 / 分析 / 完成时间</th><th>状态</th><th>记录 / 异常</th><th>耗时</th><th class="col-actions">操作</th></tr></thead>
           <tbody>${tasks.map((task) => `
             <tr class="${['失败','待人工处理'].includes(task.status) ? 'row-danger' : task.status === '已取消' ? 'row-muted' : ''}">
+              <td class="num nowrap">${task.status === '分析中' ? '执行中' : task.queuePosition ? `第 ${task.queuePosition} 位` : '—'}</td>
               <td><b class="mono">${esc(task.id)}</b><div class="muted small">${esc(task.user)}</div></td>
               <td>${esc(task.file)}<div class="muted small">${formatFileSize(task.size)}</div></td>
-              <td class="num">${esc(formatDate(task.queuedAt))}</td>
+              <td class="small">排队 ${esc(formatDate(task.queuedAt))}<br>开始 ${esc(formatDate(task.startedAt))}<br>完成 ${esc(formatDate(task.finishedAt))}</td>
               <td>${tag(task.status)}</td>
               <td>${task.recordId
                 ? `<a href="#/records/${encodeURIComponent(task.recordId)}" class="mono">${esc(task.recordId)}</a>`
@@ -781,7 +873,8 @@ function pageTasks() {
           <div class="info-card">
             <div class="row between"><strong class="mono">${esc(task.id)}</strong>${tag(task.status)}</div>
             <p>${esc(task.file)} · ${formatFileSize(task.size)}</p>
-            <p>${esc(formatDate(task.queuedAt))} · ${esc(task.user)}</p>
+            <p>${task.queuePosition ? `队列第 ${task.queuePosition} 位 · ` : ''}${esc(formatDate(task.queuedAt))} · ${esc(task.user)}</p>
+            <p class="muted small">分析 ${esc(formatDate(task.startedAt))} · 完成 ${esc(formatDate(task.finishedAt))}</p>
             ${task.reason ? `<div class="alert ${task.status === '失败' ? 'danger' : 'warn'} mt8">${esc(task.reason)}</div>` : ''}
             <div class="btn-group mt8">${taskActions(task)}</div>
           </div>`).join('')}</div>` : `<div class="empty"><strong>暂无分析任务</strong>${isRole('inspector') ? '上传一段校验视频后，任务会进入串行队列。' : '目前没有系统内的分析任务。'}</div>`}
@@ -803,35 +896,73 @@ function taskActions(task) {
   return actions.join('') || '<span class="muted small">只读</span>';
 }
 
-function filterRecords(records) {
+async function loadRecordsPage(pageNumber = 1) {
+  if (state.recordsView.loading) return;
   const filter = state.filters.records;
   const draftOnly = parseRoute().query.get('draft') === '1';
-  return records.filter((record) => {
-    if (draftOnly && !(record.status === '待提交' && record.inspector === state.data.user.id)) return false;
-    if (filter.device && record.device !== filter.device) return false;
-    if (filter.from && record.date < filter.from) return false;
-    if (filter.to && record.date > filter.to) return false;
-    if (filter.inspector && record.inspector !== filter.inspector) return false;
-    if (filter.status && record.status !== filter.status) return false;
-    if (filter.conclusion && recordEvaluation(record)?.conclusion !== filter.conclusion) return false;
-    return true;
-  });
+  const page = Math.max(1, Number(pageNumber) || 1);
+  state.recordsView.loading = true;
+  state.recordsView.error = '';
+  if (parseRoute().path === '/records') render();
+  const query = new URLSearchParams();
+  for (const device of filter.devices || []) query.append('devices', device);
+  if (filter.from) query.set('from', filter.from);
+  if (filter.to) query.set('to', filter.to);
+  if (draftOnly) {
+    query.set('inspector', state.data.user.id);
+    query.set('status', '待提交');
+  } else {
+    if (filter.inspector) query.set('inspector', filter.inspector);
+    if (filter.status) query.set('status', filter.status);
+  }
+  if (filter.conclusion) query.set('conclusion', filter.conclusion);
+  query.set('page', String(page));
+  query.set('pageSize', '50');
+  try {
+    const result = await api(`/api/records?${query.toString()}`);
+    state.recordsView = {
+      loaded: true,
+      loading: false,
+      items: result.items || [],
+      total: Number(result.total || 0),
+      page: Number(result.page || page),
+      pageSize: Number(result.pageSize || 50),
+      totalPages: Number(result.totalPages || 1),
+      error: ''
+    };
+  } catch (error) {
+    state.recordsView = {
+      ...state.recordsView,
+      loaded: true,
+      loading: false,
+      error: errorMessage(error)
+    };
+  }
+  if (parseRoute().path === '/records') render();
 }
 
 function pageRecords() {
   const draftOnly = parseRoute().query.get('draft') === '1';
-  const records = filterRecords(state.data.records || []);
+  const view = state.recordsView;
+  const records = view.items || [];
+  if (!view.loaded || view.loading) {
+    return `${pageHeader(
+      draftOnly ? '待核对记录' : '校验记录',
+      '正在从服务端读取分页结果…',
+      ''
+    )}
+      <section class="card"><div class="empty"><span class="spinner"></span>正在查询记录</div></section>`;
+  }
   const inspectors = state.data.accounts.filter((account) => account.role === 'inspector' && account.status !== '已删除');
   return `${pageHeader(
     draftOnly ? '待核对记录' : '校验记录',
     draftOnly ? '核对低置信读数、口述字段和砝码盒编号后，一键提交。' : '所有角色均可查询全部记录，不作“仅本人记录”限制。',
-    `<button class="btn btn-secondary" data-action="export-records-csv">${icon('download')}导出当前清单</button>`
+    `<button class="btn btn-secondary" data-action="export-records-csv">${icon('download')}导出当前筛选清单</button>`
   )}
     <form class="card filterbar" data-form="record-filter">
-      <div class="field"><label>天平编号</label><select name="device">
-        <option value="">全部天平</option>
-        ${state.data.devices.map((device) => `<option value="${attr(device.id)}" ${state.filters.records.device === device.id ? 'selected' : ''}>${esc(device.id)} · ${esc(device.uniqueNo)}</option>`).join('')}
-      </select></div>
+      <div class="field"><label>天平编号（可多选）</label><select name="devices" multiple size="4">
+        ${state.data.devices.map((device) => `<option value="${attr(device.id)}" ${state.filters.records.devices.includes(device.id) ? 'selected' : ''}>${esc(device.id)} · ${esc(device.uniqueNo)}</option>`).join('')}
+      </select><span class="hint">按住 Ctrl / Command 多选；不选表示全部天平</span></div>
       <div class="field"><label>开始日期</label><input type="date" name="from" value="${attr(state.filters.records.from)}"></div>
       <div class="field"><label>结束日期</label><input type="date" name="to" value="${attr(state.filters.records.to)}"></div>
       <div class="field"><label>检验人员</label><select name="inspector">
@@ -848,9 +979,15 @@ function pageRecords() {
       <button class="btn btn-secondary" type="button" data-action="reset-record-filter">重置</button>
     </form>
     <section class="card">
-      <div class="card-head"><div><h2>${records.length} 条记录</h2><p>${draftOnly ? '显示本人待提交记录' : '日期倒序排列，点击编号查看完整证据链'}</p></div>
+      <div class="card-head"><div><h2>${view.total} 条记录</h2><p>${draftOnly ? '显示本人待提交记录' : '服务端分页，日期倒序排列，点击编号查看完整证据链'}</p></div>
         <a class="btn btn-ghost btn-sm" href="#/records">清除待提交筛选</a></div>
+      ${view.error ? `<div class="alert danger">${esc(view.error)}</div>` : ''}
       ${recordsTable(records)}
+      <div class="row between mt12">
+        <button class="btn btn-secondary btn-sm" data-action="records-page" data-page="${view.page - 1}" ${view.page <= 1 ? 'disabled' : ''}>上一页</button>
+        <span class="muted small">第 ${view.page} / ${view.totalPages} 页 · 每页 ${view.pageSize} 条</span>
+        <button class="btn btn-secondary btn-sm" data-action="records-page" data-page="${view.page + 1}" ${view.page >= view.totalPages ? 'disabled' : ''}>下一页</button>
+      </div>
     </section>`;
 }
 
@@ -951,6 +1088,8 @@ function showFrameEvidenceModal(record, key) {
       <div><span>测量时间</span><strong>${esc(readout.time || '—')}</strong></div>
       <div><span>置信度</span><strong>${readout.conf == null ? '—' : `${Math.round(Number(readout.conf) * 100)}%`}</strong></div>
       <div><span>稳定读数</span><strong>${readout.stable === false ? '否，未满足稳定段' : '是'}</strong></div>
+      <div><span>识别引擎</span><strong>${esc(readout.ocr?.method === 'tesseract' ? 'Tesseract 离线 OCR' : readout.ocr?.method === 'seven-segment-template' ? '七段码模板 OCR' : '历史校准数据')}</strong></div>
+      <div><span>稳定段</span><strong>${readout.ocr ? `${readout.ocr.segmentStart ?? '—'}s ~ ${readout.ocr.segmentEnd ?? '—'}s` : '—'}</strong></div>
     </div>`);
 }
 
@@ -1001,6 +1140,11 @@ function pageRecordDetail(record) {
           ['内部校正方式', record.deviceSnapshot?.internalCal || device.internalCal || '—'],
           ['校验日期', record.date],
           ['拍摄开始时间', record.startTime],
+          ['量程切换过程', device.ranges === 2
+            ? (record.rangeTransition?.endOffsetSeconds !== undefined
+              ? `${formatVideoOffset(record.rangeTransition.startOffsetSeconds)} → ${formatVideoOffset(record.rangeTransition.endOffsetSeconds)}`
+              : '未保存过程段')
+            : '单量程'],
           ['砝码盒编号', record.box || '—'],
           ['原始文件', record.file],
           ['文件大小', formatFileSize(record.fileSize)],
@@ -1109,26 +1253,81 @@ function pageRecordDetail(record) {
     </div>`;
 }
 
+async function loadHistoryRecords(deviceId, pageNumber = 1) {
+  if (state.historyView.loading) return;
+  const filter = state.filters.history;
+  const page = Math.max(1, Number(pageNumber) || 1);
+  state.historyView.device = deviceId;
+  state.historyView.loading = true;
+  state.historyView.error = '';
+  if (parseRoute().path === `/history/${encodeURIComponent(deviceId)}`) render();
+  const query = new URLSearchParams();
+  query.append('devices', deviceId);
+  if (filter.from) query.set('from', filter.from);
+  if (filter.to) query.set('to', filter.to);
+  if (filter.conclusion) query.set('conclusion', filter.conclusion);
+  query.set('page', String(page));
+  query.set('pageSize', '200');
+  try {
+    const result = await api(`/api/records?${query.toString()}`);
+    state.historyView = {
+      device: deviceId,
+      loaded: true,
+      loading: false,
+      items: result.items || [],
+      total: Number(result.total || 0),
+      page: Number(result.page || page),
+      pageSize: Number(result.pageSize || 200),
+      totalPages: Number(result.totalPages || 1),
+      error: ''
+    };
+  } catch (error) {
+    state.historyView = {
+      ...state.historyView,
+      device: deviceId,
+      loaded: true,
+      loading: false,
+      error: errorMessage(error)
+    };
+  }
+  if (parseRoute().path.startsWith('/history/')) render();
+}
+
 function pageHistory(deviceId) {
   const device = deviceById(deviceId);
   if (!device) {
     return `${pageHeader('天平历史汇总', '未找到天平档案')}
       <section class="card"><div class="empty"><strong>天平 ${esc(deviceId)} 不存在</strong>请检查天平编号或返回记录列表。</div></section>`;
   }
-  const records = state.data.records
-    .filter((record) => record.device === deviceId)
-    .sort((a, b) => b.date.localeCompare(a.date));
+  if (state.historyView.device !== deviceId || !state.historyView.loaded || state.historyView.loading) {
+    return `${pageHeader(`${device.id} 历史汇总`, '正在读取历史记录…')}
+      <section class="card"><div class="empty"><span class="spinner"></span>正在查询 ${esc(device.id)} 的历史记录</div></section>`;
+  }
+  const view = state.historyView;
+  const records = [...view.items].sort((a, b) => b.date.localeCompare(a.date));
   const active = records.filter((record) => record.status !== '已作废');
   const abnormal = active.filter((record) => recordEvaluation(record)?.conclusion === '不通过');
+  const currentWeek = naturalWeekRange();
+  const filter = state.filters.history;
   return `${pageHeader(
     `${device.id} 历史汇总`,
     `${device.uniqueNo} · ${device.dept} · Max ${device.max}g / d ${device.d}mg`,
-    `<a class="btn btn-secondary" href="#/print/week?device=${encodeURIComponent(device.id)}&from=${attr(daysAgoText(6))}&to=${attr(todayText())}">${icon('printer')}本周打印</a>
+    `<a class="btn btn-secondary" href="#/print/week?device=${encodeURIComponent(device.id)}&from=${attr(currentWeek.from)}&to=${attr(currentWeek.to)}">${icon('printer')}本周打印</a>
      <button class="btn btn-secondary" data-action="history-csv" data-device="${attr(device.id)}">${icon('download')}示值明细 CSV</button>`
   )}
+    <form class="card filterbar" data-form="history-filter">
+      <div class="field"><label>开始日期</label><input type="date" name="from" value="${attr(filter.from)}"></div>
+      <div class="field"><label>结束日期</label><input type="date" name="to" value="${attr(filter.to)}"></div>
+      <div class="field"><label>判定结论</label><select name="conclusion">
+        ${['', '通过', '不通过'].map((value) => `<option value="${value}" ${filter.conclusion === value ? 'selected' : ''}>${value || '全部结论'}</option>`).join('')}
+      </select></div>
+      <button class="btn btn-primary" type="submit">筛选历史</button>
+      <button class="btn btn-secondary" type="button" data-action="reset-history-filter" data-device="${attr(device.id)}">重置</button>
+    </form>
+    ${view.error ? `<div class="alert danger mt12">${esc(view.error)}</div>` : ''}
     <div class="grid grid-4">
       ${[
-        ['历史记录', records.length, '含异常与已作废'],
+        ['筛选记录', view.total, '服务端筛选总数'],
         ['有效记录', active.length, '已排除作废记录'],
         ['不合格记录', abnormal.length, '异常同样完成复核归档'],
         ['最近校验', records[0]?.date || '—', records[0] ? accountName(records[0].inspector) : '暂无记录']
@@ -1138,8 +1337,13 @@ function pageHistory(deviceId) {
         </article>`).join('')}
     </div>
     <section class="card mt16">
-      <div class="card-head"><div><h2>历史记录</h2><p>按校验日期倒序显示；异常记录在判定列明确标注</p></div></div>
+      <div class="card-head"><div><h2>历史记录</h2><p>按校验日期倒序显示；异常记录在判定列明确标注</p></div>
+        <span class="muted small">第 ${view.page} / ${view.totalPages} 页</span></div>
       ${recordsTable(records)}
+      <div class="row between mt12">
+        <button class="btn btn-secondary btn-sm" data-action="history-page" data-device="${attr(device.id)}" data-page="${view.page - 1}" ${view.page <= 1 ? 'disabled' : ''}>上一页</button>
+        <button class="btn btn-secondary btn-sm" data-action="history-page" data-device="${attr(device.id)}" data-page="${view.page + 1}" ${view.page >= view.totalPages ? 'disabled' : ''}>下一页</button>
+      </div>
     </section>
     <section class="card mt16">
       <div class="card-head"><div><h2>示值明细汇总</h2><p>按标称点列出历次示值，不提供图形化趋势曲线</p></div></div>
@@ -1160,18 +1364,49 @@ function pageHistory(deviceId) {
     </section>`;
 }
 
+async function loadVerifyRecords(pageNumber = 1) {
+  if (state.verifyView.loading) return;
+  const filter = state.filters.verify;
+  const page = Math.max(1, Number(pageNumber) || 1);
+  state.verifyView.loading = true;
+  state.verifyView.error = '';
+  if (parseRoute().path === '/verify') render();
+  const query = new URLSearchParams({ status: '已提交', page: String(page), pageSize: '100' });
+  if (filter.device) query.set('devices', filter.device);
+  if (filter.inspector) query.set('inspector', filter.inspector);
+  if (filter.from) query.set('from', filter.from);
+  if (filter.to) query.set('to', filter.to);
+  try {
+    const result = await api(`/api/records?${query.toString()}`);
+    state.verifyView = {
+      loaded: true,
+      loading: false,
+      items: result.items || [],
+      total: Number(result.total || 0),
+      page: Number(result.page || page),
+      pageSize: Number(result.pageSize || 100),
+      totalPages: Number(result.totalPages || 1),
+      error: ''
+    };
+  } catch (error) {
+    state.verifyView = {
+      ...state.verifyView,
+      loaded: true,
+      loading: false,
+      error: errorMessage(error)
+    };
+  }
+  if (parseRoute().path === '/verify') render();
+}
+
 function pageVerify() {
   const filter = state.filters.verify;
-  const pending = state.data.records
-    .filter((record) => record.status === '已提交')
-    .filter((record) => {
-      if (filter.device && record.device !== filter.device) return false;
-      if (filter.inspector && record.inspector !== filter.inspector) return false;
-      const date = record.submittedAt?.slice(0, 10) || '';
-      if (filter.from && date < filter.from) return false;
-      if (filter.to && date > filter.to) return false;
-      return true;
-    });
+  const view = state.verifyView;
+  if (!view.loaded || view.loading) {
+    return `${pageHeader('待复核记录', '正在读取服务端待复核队列…')}
+      <section class="card"><div class="empty"><span class="spinner"></span>正在查询待复核记录</div></section>`;
+  }
+  const pending = view.items;
   const inspectors = state.data.accounts.filter((account) => account.role === 'inspector');
   return `${pageHeader('待复核记录', '复核确认即电子签名。确认后全部字段锁定；发现问题可退回或按现行方式口头通知。')}
     <form class="card filterbar" data-form="verify-filter">
@@ -1183,12 +1418,13 @@ function pageVerify() {
         <option value="">全部人员</option>
         ${inspectors.map((account) => `<option value="${attr(account.id)}" ${filter.inspector === account.id ? 'selected' : ''}>${esc(account.name)}</option>`).join('')}
       </select></div>
-      <div class="field"><label>提交开始日期</label><input type="date" name="from" value="${attr(filter.from)}"></div>
-      <div class="field"><label>提交结束日期</label><input type="date" name="to" value="${attr(filter.to)}"></div>
+      <div class="field"><label>校验开始日期</label><input type="date" name="from" value="${attr(filter.from)}"></div>
+      <div class="field"><label>校验结束日期</label><input type="date" name="to" value="${attr(filter.to)}"></div>
       <button class="btn btn-primary" type="submit">筛选</button>
       <button class="btn btn-secondary" type="button" data-action="reset-verify-filter">重置</button>
     </form>
-    <div class="alert warn">${pending.length} 条已提交记录等待复核。低置信字段、修改痕迹和原始视频均应在签名前检查。</div>
+    <div class="alert warn">${view.total} 条已提交记录等待复核。低置信字段、修改痕迹和原始视频均应在签名前检查。</div>
+    ${view.error ? `<div class="alert danger">${esc(view.error)}</div>` : ''}
     <div class="cards-grid mt16">
       ${pending.length ? pending.map((record) => {
         const evaluation = recordEvaluation(record);
@@ -1207,12 +1443,23 @@ function pageVerify() {
           </div>
         </article>`;
       }).join('') : `<div class="card"><div class="empty"><strong>待复核队列已清空</strong>没有符合当前筛选条件的已提交记录。</div></div>`}
+    </div>
+    <div class="row between mt16">
+      <button class="btn btn-secondary btn-sm" data-action="verify-page" data-page="${view.page - 1}" ${view.page <= 1 ? 'disabled' : ''}>上一页</button>
+      <span class="muted small">第 ${view.page} / ${view.totalPages} 页 · 每页 ${view.pageSize} 条</span>
+      <button class="btn btn-secondary btn-sm" data-action="verify-page" data-page="${view.page + 1}" ${view.page >= view.totalPages ? 'disabled' : ''}>下一页</button>
     </div>`;
 }
 
 function pageMasterData() {
   const devices = state.data.devices;
   const boxes = state.data.weightBoxes;
+  const dictionaries = state.data.dictionaries || [];
+  const dictionaryLabels = {
+    department: '科室',
+    internal_cal: '内部校正方式',
+    device_numbering_rule: '天平编号规则'
+  };
   const write = can('masterdata.write');
   const devicesContent = `
     <div class="table-wrap desktop-table"><table>
@@ -1248,24 +1495,39 @@ function pageMasterData() {
         ${write ? `<button class="btn btn-ghost btn-sm mt8" data-action="box-edit" data-id="${attr(box.id)}">编辑字典项</button>` : ''}
       </article>`).join('') : `<div class="card"><div class="empty">暂无砝码盒字典项</div></div>`}
     </div>`;
+  const dictionariesContent = `
+    <div class="table-wrap"><table>
+      <thead><tr><th>类别</th><th>字典值</th><th>显示名称</th><th>排序</th><th>状态</th><th>备注</th><th class="col-actions">操作</th></tr></thead>
+      <tbody>${dictionaries.map((item) => `<tr class="${item.status === '停用' ? 'row-muted' : ''}">
+        <td>${esc(dictionaryLabels[item.category] || item.category)}</td>
+        <td class="mono">${esc(item.value)}</td>
+        <td>${esc(item.label)}</td>
+        <td class="num">${Number(item.sortOrder || 0)}</td>
+        <td>${tag(item.status)}</td>
+        <td class="small">${esc(item.remark || '—')}</td>
+        <td class="col-actions">${write ? `<button class="btn btn-ghost btn-sm" data-action="dictionary-edit" data-id="${attr(item.id)}">编辑</button>` : '只读'}</td>
+      </tr>`).join('') || '<tr><td colspan="7"><div class="empty">暂无数据字典项</div></td></tr>'}</tbody>
+    </table></div>`;
   return `${pageHeader(
-    '天平档案与砝码盒',
-    '天平编号唯一；砝码盒仅作使用记录，不与天平建立固定绑定。',
+    '天平档案与基础数据字典',
+    '天平编号唯一；科室、内部校正方式、编号规则与砝码盒集中维护。',
     write ? `<button class="btn btn-primary" data-action="device-new">${icon('plus')}新建天平</button>
       <button class="btn btn-secondary" data-action="box-new">${icon('plus')}新增砝码盒</button>
+      <button class="btn btn-secondary" data-action="dictionary-new">${icon('plus')}新增字典项</button>
       <button class="btn btn-secondary" data-action="export-devices-csv">${icon('download')}天平清单</button>` : ''
   )}
     <div class="row between">
       <div class="tabs">
         <button class="tab ${state.ui.masterTab === 'devices' ? 'active' : ''}" data-action="master-tab" data-tab="devices">天平档案 ${devices.length}</button>
         <button class="tab ${state.ui.masterTab === 'boxes' ? 'active' : ''}" data-action="master-tab" data-tab="boxes">砝码盒字典 ${boxes.length}</button>
+        <button class="tab ${state.ui.masterTab === 'dictionaries' ? 'active' : ''}" data-action="master-tab" data-tab="dictionaries">基础数据字典 ${dictionaries.length}</button>
       </div>
     </div>
     <section class="card mt12">
-      <div class="card-head"><div><h2>${state.ui.masterTab === 'devices' ? '天平档案' : '砝码盒字典'}</h2>
-        <p>${state.ui.masterTab === 'devices' ? '限度=(1±容差%)×L，小数位按对应量程分度值对齐' : '编号仅含字母与数字，最多 10 位'}</p></div>
+      <div class="card-head"><div><h2>${state.ui.masterTab === 'devices' ? '天平档案' : state.ui.masterTab === 'boxes' ? '砝码盒字典' : '基础数据字典'}</h2>
+        <p>${state.ui.masterTab === 'devices' ? '限度=(1±容差%)×L，小数位按对应量程分度值对齐' : state.ui.masterTab === 'boxes' ? '编号仅含字母与数字，最多 10 位' : '编号规则使用 {seq:03} 或 %03d 表示流水号'}</p></div>
       </div>
-      ${state.ui.masterTab === 'devices' ? devicesContent : boxesContent}
+      ${state.ui.masterTab === 'devices' ? devicesContent : state.ui.masterTab === 'boxes' ? boxesContent : dictionariesContent}
     </section>`;
 }
 
@@ -1279,9 +1541,11 @@ function pageTemplate() {
         <div class="card-head"><div><h2>模板参数</h2><p>固定纸质表结构不可拖拽重排，仅调整允许项</p></div>${tag(template.version, 'violet')}</div>
         <div class="form-grid">
           <div class="field"><label>容差系数（%）</label><input type="number" name="tol" min="0.001" max="10" step="0.001" value="${attr(template.tol)}" ${write ? '' : 'disabled'}></div>
+          ${(template.points || [200, 50, 10]).map((point, index) => `<div class="field"><label>L${index + 1} 标称点（g）</label><input type="number" name="point${index + 1}" min="0.000001" step="any" value="${attr(point)}" ${write ? '' : 'disabled'}></div>`).join('')}
           <div class="field"><label>测量时间</label>
             <label class="row" style="min-height:38px"><input type="checkbox" name="printTime" ${template.printTime !== false ? 'checked' : ''} ${write ? '' : 'disabled'}> 在导出与打印中显示测量时间行</label>
           </div>
+          <div class="field full"><label class="row" style="min-height:38px"><input type="checkbox" name="useTemplatePoints" ${template.useTemplatePoints === true ? 'checked' : ''} ${write ? '' : 'disabled'}> 新记录判定使用模板标称点（默认使用各天平档案标称点）</label></div>
           <div class="field full"><label>页脚说明</label><textarea name="footerNote" ${write ? '' : 'disabled'}>${esc(template.footerNote || '')}</textarea></div>
           <div class="field full"><label>判定依据说明</label><textarea name="footerExtra" ${write ? '' : 'disabled'}>${esc(template.footerExtra || '')}</textarea></div>
         </div>
@@ -1301,6 +1565,19 @@ function pageTemplate() {
         </div>` : '<div class="alert mt16">当前角色仅可查看模板配置。</div>'}
       </form>
       <aside class="stack">
+        <section class="card">
+          <div class="card-head"><div><h2>即时预览</h2><p>反映尚未保存的字段、页脚与测量时间设置</p></div></div>
+          <div class="template-preview" data-template-preview>
+            <div class="template-preview-title">电子天平日常校验记录表</div>
+            <div class="template-preview-grid" data-preview-fields>
+              ${fields.filter((field) => field.show !== false && !['time', 'detail'].includes(field.key))
+                .map((field) => `<span>${esc(field.label)}</span><b>示例</b>`).join('')}
+            </div>
+            <div class="muted small" data-preview-points>${(template.points || [200, 50, 10]).map((point, index) => `L${index + 1}=${esc(point)}g`).join(' · ')} · ${template.useTemplatePoints === true ? '判定使用模板值' : '判定使用设备档案值'}</div>
+            <div class="muted small" data-preview-time>${fields.find((field) => field.key === 'time')?.show === false || template.printTime === false ? '不打印测量时间' : `打印测量时间：${esc(fields.find((field) => field.key === 'time')?.label || '测量时间')}`}</div>
+            <div class="muted small" data-preview-footer>${esc(template.footerExtra || template.footerNote || '')}</div>
+          </div>
+        </section>
         <section class="card">
           <div class="card-head"><h2>版本历史</h2></div>
           <div class="trace-list">
@@ -1324,6 +1601,7 @@ function pageExport() {
   const defaultDevice = devices.find((device) => device.status === '在用')?.id || devices[0]?.id || '';
   const defaultFrom = daysAgoText(30);
   const defaultTo = todayText();
+  const week = naturalWeekRange();
   return `${pageHeader('导出与打印', '正式 PDF 仅对已复核确认记录无水印；其他状态带“未复核”标记，作废记录带“已作废”水印。')}
     <div class="grid grid-3">
       <form class="card span-2" data-form="export-batch">
@@ -1339,10 +1617,16 @@ function pageExport() {
         <div class="form-grid mt16">
           <div class="field"><label>开始日期</label><input type="date" name="from" value="${attr(defaultFrom)}" required></div>
           <div class="field"><label>结束日期</label><input type="date" name="to" value="${attr(defaultTo)}" required></div>
+          <div class="field full"><label>分文件方式</label>
+            <select name="mode">
+              <option value="merged">合并为一个 PDF</option>
+              <option value="per-device-day">每台天平每日一个 PDF（ZIP 文件包）</option>
+            </select>
+          </div>
           <label class="row full" style="font-size:11px"><input type="checkbox" name="includeUnverified"> 同时包含待提交/已提交记录（导出件自动加水印）</label>
         </div>
         <div class="row row-wrap mt16">
-          <button type="submit" class="btn btn-primary">${icon('download')}生成合并 PDF</button>
+          <button type="submit" class="btn btn-primary">${icon('download')}生成批量 PDF</button>
           <button type="button" class="btn btn-secondary" data-action="export-csv" data-type="records">${icon('file')}记录清单 CSV</button>
           <button type="button" class="btn btn-secondary" data-action="export-csv" data-type="readouts">${icon('file')}示值明细 CSV</button>
         </div>
@@ -1352,8 +1636,8 @@ function pageExport() {
         <div class="field"><label>单台天平</label><select name="device" required>
           ${devices.filter((device) => device.status === '在用').map((device) => `<option value="${attr(device.id)}">${esc(device.id)} · ${esc(device.uniqueNo)}</option>`).join('')}
         </select></div>
-        <div class="field mt12"><label>周起始日期</label><input type="date" name="from" value="${attr(defaultFrom)}" required></div>
-        <div class="field mt12"><label>周结束日期</label><input type="date" name="to" value="${attr(defaultTo)}" required></div>
+        <div class="field mt12"><label>周一</label><input type="date" name="from" value="${attr(week.from)}" required></div>
+        <div class="field mt12"><label>周日</label><input type="date" name="to" value="${attr(week.to)}" required></div>
         <button class="btn btn-primary btn-block mt16" type="submit">${icon('printer')}生成周统计 PDF</button>
         <a class="btn btn-secondary btn-block mt8" href="#/print/week">在浏览器中预览</a>
       </form>
@@ -1469,6 +1753,7 @@ function pageSystem() {
   const storage = system.storage || state.data.storage || {};
   const settings = state.data.settings || {};
   const queue = system.queue || state.data.queue || {};
+  const logs = system.logs || {};
   const backedUp = (system.backups || state.data.backups || [])[0];
   const usage = Number(storage.percent ?? storage.usagePercent ?? storage.usedPercent ?? 0);
   return `${pageHeader('存储与运行状态', '服务健康、分析队列、磁盘容量、备份与配置集中查看。',
@@ -1485,6 +1770,19 @@ function pageSystem() {
         <div class="stat-label">${esc(label)}</div><div class="stat-value" style="${String(value).length > 12 ? 'font-size:16px' : ''}">${esc(value)}</div><div class="stat-note">${esc(note)}</div>
       </article>`).join('')}
     </div>
+    <section class="card mt16">
+      <div class="card-head"><div><h2>各天平视频占用</h2><p>预计可保留 ${storage.retainDays === null ? '需继续积累用量样本' : `${Number(storage.retainDays)} 天`} · 磁盘可用 ${storage.diskAvailableBytes === null ? '无法探测' : formatFileSize(storage.diskAvailableBytes / 1024 / 1024)}</p></div>
+        ${tag(`${Number(storage.videoCount || 0)} 个视频`, 'blue')}</div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>天平编号</th><th>视频数</th><th>占用容量</th></tr></thead>
+        <tbody>${(storage.byDevice || []).map((item) => `<tr><td>${esc(item.id)}</td><td>${Number(item.count || 0)}</td><td>${formatNumber(item.sizeGb, 2)} GB</td></tr>`).join('') || '<tr><td colspan="3"><div class="empty">暂无视频占用数据</div></td></tr>'}</tbody>
+      </table></div>
+      <div class="card-head mt16"><div><h2>最近清理记录</h2><p>达到配额后按最早视频优先清理，电子记录不受影响</p></div></div>
+      <div class="trace-list">${(storage.cleaned || []).map((item) => `<div class="trace-item">
+        <strong>${esc(item.file)} · ${formatNumber(item.size, 1)} MB</strong>
+        <p>${esc(formatDate(item.time))} · ${esc(item.reason)}</p>
+      </div>`).join('') || '<div class="empty">尚无容量清理记录</div>'}</div>
+    </section>
     <div class="grid grid-3 mt16">
       <section class="card span-2">
         <div class="card-head"><h2>服务状态</h2><span class="muted small">${esc(system.env?.serverTime || currentDateTimeText())}</span></div>
@@ -1493,7 +1791,7 @@ function pageSystem() {
           <div class="grow"><strong>${esc(service.name)}</strong><span>${esc(service.detail || '')}</span></div>
           ${tag(service.status)}
         </div>`).join('') || '<div class="empty">暂无服务状态</div>'}
-        <div class="alert warn mt16">当前识别适配器：${esc(system.analyzer?.mode || system.env?.analyzerMode || 'sample-manifest')}。未知视频不自动生成记录，须人工补录。</div>
+        <div class="alert warn mt16">当前识别适配器：${esc(system.analyzer?.mode || system.env?.analyzerMode || 'local-display-ocr')}。默认自动搜索显示屏区域，DISPLAY_REGION 可覆盖；无法识别稳定示值时须人工补录。</div>
       </section>
       <aside class="stack">
         <section class="card">
@@ -1509,7 +1807,7 @@ function pageSystem() {
             <div class="kv"><span>操作系统</span><strong>${esc(system.env?.os || '—')}</strong></div>
             <div class="kv"><span>Node.js</span><strong>${esc(system.env?.node || '—')}</strong></div>
             <div class="kv"><span>时区</span><strong>${esc(system.env?.timezone || 'Asia/Shanghai')}</strong></div>
-            <div class="kv"><span>NTP</span><strong>${esc(system.env?.ntp || '未探测')}</strong></div>
+            <div class="kv"><span>NTP</span><strong>${esc(system.env?.ntp || '未探测')}</strong><small class="muted">${esc(system.env?.ntpDetail || '')}</small></div>
             <div class="kv"><span>运行时长</span><strong>${formatDuration(Number(system.env?.uptimeSeconds || 0) * 1000)}</strong></div>
           </div>
         </section>
@@ -1537,7 +1835,19 @@ function pageSystem() {
           </div>`).join('') || '<div class="empty"><strong>没有近期错误</strong>服务运行正常。</div>'}
         </div>
       </section>
-    </div>`;
+    </div>
+    <section class="card mt16">
+      <div class="card-head"><div><h2>应用日志</h2><p>${Number(logs.fileCount || 0)} 个文件 · ${formatFileSize(Number(logs.totalBytes || 0) / 1024 / 1024)} · 按配置自动轮转与清理</p></div>
+        <button class="btn btn-secondary" data-action="export-app-logs">${icon('download')}导出日志</button></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>时间</th><th>级别</th><th>消息</th></tr></thead>
+        <tbody>${(logs.recent || []).map((item) => `<tr>
+          <td class="num nowrap">${esc(formatDate(item.time))}</td>
+          <td>${tag(String(item.level || '').toUpperCase(), item.level === 'error' ? 'red' : item.level === 'warn' ? 'amber' : 'blue')}</td>
+          <td class="small">${esc(item.message || '')}</td>
+        </tr>`).join('') || '<tr><td colspan="3"><div class="empty">暂无应用日志</div></td></tr>'}</tbody>
+      </table></div>
+    </section>`;
 }
 
 function printRecordContent(record) {
@@ -1545,6 +1855,42 @@ function printRecordContent(record) {
   const evaluation = recordEvaluation(record) || {};
   const itemMap = new Map((evaluation.items || []).map((item) => [item.key, item]));
   const template = record.templateSnapshot || state.data.template || {};
+  const configuredField = (key, fallback) => {
+    const item = Array.isArray(template.fields)
+      ? template.fields.find((field) => field?.key === key)
+      : null;
+    return {
+      label: item?.label || fallback,
+      show: item?.show !== false
+    };
+  };
+  const fieldDefinitions = [
+    ['id', '天平编号', device.id, true],
+    ['dept', '科室', device.dept || '', false],
+    ['uniqueNo', '天平唯一号', device.uniqueNo || '', false],
+    ['max', 'Max(g)', device.max === undefined ? '' : `${device.max} g`, false],
+    ['d', 'd(mg)', device.d === undefined ? '' : `${device.d} mg`, false],
+    ['internalCalType', '内部校正方式', device.internalCal || '', false],
+    ['date', '校验日期', record.date, false],
+    ['cleanliness', '清洁', record.cleanliness || '', false],
+    ['level', '水平调节', record.level || '', false],
+    ['internalCal', '内部校正是否通过', record.internalCal || '', false],
+    ['box', '砝码盒编号', record.box || '', false]
+  ];
+  const visibleFields = fieldDefinitions.map(([key, fallback, value, fixed]) => {
+    const config = fixed
+      ? { label: fallback, show: true }
+      : configuredField(key, fallback);
+    return { key, label: config.label, show: config.show, value };
+  }).filter((field) => field.show);
+  const metaRows = [];
+  for (let index = 0; index < visibleFields.length; index += 3) {
+    metaRows.push(visibleFields.slice(index, index + 3));
+  }
+  const remarkConfig = configuredField('remark', '备注');
+  const timeConfig = configuredField('time', '测量时间');
+  const detailConfig = configuredField('detail', '判定依据');
+  const showTime = template.printTime !== false && timeConfig.show;
   const watermark = record.status === '已复核确认' ? '' : record.status === '已作废' ? '已作废' : '未复核';
   const readouts = record.readouts || [];
   return `
@@ -1552,13 +1898,12 @@ function printRecordContent(record) {
     <div class="print-title">电子天平日常校验记录表</div>
     <div class="print-sub">天平编号：${esc(record.device)} · 记录编号：${esc(record.id)}</div>
     <table class="print-grid">
-      <tr><td class="label">科室</td><td>${esc(device.dept || '')}</td><td class="label">天平唯一号</td><td>${esc(device.uniqueNo || '')}</td><td class="label">Max / d</td><td>${esc(device.max || '')} g / ${esc(device.d || '')} mg</td></tr>
-      <tr><td class="label">内部校正方式</td><td>${esc(device.internalCal || '')}</td><td class="label">校验日期</td><td>${esc(record.date)}</td><td class="label">砝码盒编号</td><td>${esc(record.box || '')}</td></tr>
-      <tr><td class="label">清洁</td><td>${esc(record.cleanliness || '')}</td><td class="label">水平调节</td><td>${esc(record.level || '')}</td><td class="label">内部校正通过</td><td>${esc(record.internalCal || '')}</td></tr>
-      <tr><td class="label">备注</td><td colspan="5">${esc(record.remark || '无')}</td></tr>
+      ${metaRows.map((row) => `<tr>${row.map((field) => `<td class="label">${esc(field.label)}</td><td>${esc(field.value)}</td>`).join('')}${row.length < 3 ? `<td colspan="${(3 - row.length) * 2}"></td>` : ''}</tr>`).join('')}
+      <tr><td class="label">模板标称点</td><td colspan="5">${(template.points || device.points || []).map((point, index) => `L${index + 1}=${esc(point)}g`).join(' · ')}</td></tr>
+      ${remarkConfig.show ? `<tr><td class="label">${esc(remarkConfig.label)}</td><td colspan="5">${esc(record.remark || '无')}</td></tr>` : ''}
     </table>
     <table class="print-grid" style="margin-top:8px">
-      <thead><tr><th>读数</th><th>量程</th><th>L(g)</th><th>限度区间(g)</th><th>示值 I(g)</th><th>偏差(g)</th><th>是否在限内</th>${template.printTime !== false ? '<th>测量时间</th>' : ''}</tr></thead>
+      <thead><tr><th>读数</th><th>量程</th><th>L(g)</th><th>限度区间(g)</th><th>示值 I(g)</th><th>偏差(g)</th><th>是否在限内</th>${showTime ? `<th>${esc(timeConfig.label)}</th>` : ''}</tr></thead>
       <tbody>${readouts.map((readout, index) => {
         const key = readoutKey(readout, index);
         const item = itemMap.get(key) || {};
@@ -1569,11 +1914,11 @@ function printRecordContent(record) {
           <td>${formatNumber(item.value ?? readout.value, dec)}</td>
           <td>${item.dev == null ? '—' : formatNumber(item.dev, dec)}</td>
           <td>${item.inLimit ? '是' : '否'}</td>
-          ${template.printTime !== false ? `<td>${esc(formatDate(readout.time))}</td>` : ''}</tr>`;
+          ${showTime ? `<td>${esc(formatDate(readout.time))}</td>` : ''}</tr>`;
       }).join('')}</tbody>
     </table>
     <table class="print-grid" style="margin-top:8px">
-      <tr><td class="label">外部校正</td><td>${esc(evaluation.conclusion || '')}</td><td class="label">判定依据</td><td>9 次读数均在 (1±${esc(evaluation.tol ?? 0.05)}%)×L 内，稳定、齐全、顺序正确${device.ranges === 2 ? '且完成量程切换' : ''}</td></tr>
+      <tr><td class="label">外部校正</td><td>${esc(evaluation.conclusion || '')}</td>${detailConfig.show ? `<td class="label">${esc(detailConfig.label)}</td><td>9 次读数均在 (1±${esc(evaluation.tol ?? 0.05)}%)×L 内，稳定、齐全、顺序正确${device.ranges === 2 ? '且完成量程切换' : ''}</td>` : '<td colspan="2"></td>'}</tr>
     </table>
     <div class="print-sign">
       <div>校验人员：${esc(accountName(record.submittedBy || record.inspector))}<br>签名时间：${esc(formatDate(record.submittedAt))}</div>
@@ -1591,14 +1936,16 @@ function pagePrintRecord(record) {
 function pagePrintWeek() {
   const query = parseRoute().query;
   const deviceId = query.get('device') || state.data.devices[0]?.id || '';
-  const from = query.get('from') || daysAgoText(6);
-  const to = query.get('to') || todayText();
+  const week = naturalWeekRange();
+  const from = query.get('from') || week.from;
+  const to = query.get('to') || week.to;
   const device = deviceById(deviceId);
   const records = state.data.records.filter((record) => (
     record.device === deviceId && record.status === '已复核确认' && record.date >= from && record.date <= to
   ));
   const dates = [...new Set(records.map((record) => record.date))].sort();
   const evals = records.map(recordEvaluation);
+  const recordsForDate = (date) => records.filter((record) => record.date === date);
   return `<div class="print-toolbar app-only"><div><strong>每周天平校验统计记录 · A4 横向预览</strong><div class="muted small">${esc(deviceId)} · ${esc(from)} ~ ${esc(to)}</div></div>
       <div class="row"><a class="btn btn-secondary" href="#/export">返回导出</a><button class="btn btn-primary" data-action="print-window">${icon('printer')}打印</button></div></div>
     <article class="print-paper week">
@@ -1616,21 +1963,23 @@ function pagePrintWeek() {
           ['备注', (record) => record.remark],
           ['外部校正', (record) => recordEvaluation(record)?.conclusion]
         ].map(([label, getter]) => `<tr><td class="label">${esc(label)}</td>${dates.length ? dates.map((date) => {
-          const record = records.find((item) => item.date === date);
-          return `<td colspan="2">${esc(record ? getter(record) : '')}</td>`;
+          const sameDay = recordsForDate(date);
+          return `<td colspan="2">${esc(sameDay.map((record) => getter(record)).join(' / '))}</td>`;
         }).join('') : '<td colspan="2">—</td>'}</tr>`).join('')}
         ${[0, 1, 2].map((point) => `<tr><td class="label">L${point + 1} 示值 / 结论</td>${dates.length ? dates.map((date) => {
-          const record = records.find((item) => item.date === date);
-          const items = (recordEvaluation(record)?.items || []).filter((item) => item.point === point);
-          return `<td colspan="2">${items.map((item) => `${formatNumber(item.value, item.dec)}${item.inLimit ? '✓' : '!'}`).join(' / ') || '—'}</td>`;
+          const value = recordsForDate(date).map((record) => {
+            const items = (recordEvaluation(record)?.items || []).filter((item) => item.point === point);
+            return items.map((item) => `${formatNumber(item.value, item.dec)}${item.inLimit ? '✓' : '!'}`).join(' / ');
+          }).filter(Boolean).join('；');
+          return `<td colspan="2">${value || '—'}</td>`;
         }).join('') : '<td colspan="2">—</td>'}</tr>`).join('')}
         <tr><td class="label">校验人员</td>${dates.length ? dates.map((date) => {
-          const record = records.find((item) => item.date === date);
-          return `<td colspan="2">${esc(record ? accountName(record.inspector) : '')}</td>`;
+          const value = recordsForDate(date).map((record) => accountName(record.inspector)).join(' / ');
+          return `<td colspan="2">${esc(value)}</td>`;
         }).join('') : '<td colspan="2">—</td>'}</tr>
         <tr><td class="label">复核确认人</td>${dates.length ? dates.map((date) => {
-          const record = records.find((item) => item.date === date);
-          return `<td colspan="2">${esc(record ? accountName(record.verifiedBy) : '')}</td>`;
+          const value = recordsForDate(date).map((record) => accountName(record.verifiedBy)).join(' / ');
+          return `<td colspan="2">${esc(value)}</td>`;
         }).join('') : '<td colspan="2">—</td>'}</tr>
       </table>
       <div class="print-note">本统计仅使用已复核确认且未作废记录。无记录日期不生成列。导出时间：${esc(currentDateTimeText())}</div>
@@ -1713,6 +2062,9 @@ function render() {
   }
   if (path === '/records') {
     const drafts = query.get('draft') === '1';
+    if (!state.recordsView.loaded && !state.recordsView.loading) {
+      window.setTimeout(() => loadRecordsPage(state.recordsView.page || 1), 0);
+    }
     shell(drafts ? '待核对记录' : '校验记录', drafts ? '核对并电子确认' : '跨人员、跨天平查询', pageRecords(), { pathname: path });
     return;
   }
@@ -1744,10 +2096,17 @@ function render() {
   const historyMatch = /^\/history\/([^/]+)$/.exec(path);
   if (historyMatch) {
     const deviceId = decodeURIComponent(historyMatch[1]);
+    if (state.historyView.device !== deviceId
+      || (!state.historyView.loaded && !state.historyView.loading)) {
+      window.setTimeout(() => loadHistoryRecords(deviceId, 1), 0);
+    }
     shell('天平历史汇总', `${deviceId} · 示值明细`, pageHistory(deviceId), { pathname: '/records' });
     return;
   }
   if (path === '/verify') {
+    if (!state.verifyView.loaded && !state.verifyView.loading) {
+      window.setTimeout(() => loadVerifyRecords(1), 0);
+    }
     shell('待复核', '检查证据并完成电子签名', pageVerify(), { pathname: path });
     return;
   }
@@ -1900,10 +2259,10 @@ function fileNameFromResponse(response, fallback) {
   return plain?.[1] || fallback;
 }
 
-async function downloadFromApi(path, body, fallbackName) {
+async function downloadFromApi(path, body, fallbackName, method = 'POST') {
   const response = await fetchResponse(path, {
-    method: 'POST',
-    body: body || {}
+    method,
+    body: method === 'GET' ? undefined : (body || {})
   });
   const blob = await response.blob();
   triggerDownload(blob, fileNameFromResponse(response, fallbackName));
@@ -1955,6 +2314,9 @@ async function loadRecordDetail(id) {
 
 function deviceForm(device = null) {
   const editing = Boolean(device);
+  const dictionaries = state.data.dictionaries || [];
+  const departments = dictionaries.filter((item) => item.category === 'department' && item.status === '启用');
+  const calibrationOptions = dictionaries.filter((item) => item.category === 'internal_cal' && item.status === '启用');
   const value = device || {
     id: '',
     uniqueNo: '',
@@ -1974,7 +2336,8 @@ function deviceForm(device = null) {
     <div class="form-grid">
       <div class="field"><label class="${editing ? '' : 'required'}">天平编号</label><input name="id" value="${attr(value.id)}" ${editing ? 'disabled' : ''} placeholder="留空自动生成，如 F001"></div>
       <div class="field"><label class="required">天平唯一号</label><input name="uniqueNo" value="${attr(value.uniqueNo)}" maxlength="20" required></div>
-      <div class="field"><label class="required">科室</label><input name="dept" value="${attr(value.dept)}" required></div>
+      <div class="field"><label class="required">科室</label><input name="dept" list="department-list" value="${attr(value.dept)}" required>
+        <datalist id="department-list">${departments.map((item) => `<option value="${attr(item.value)}">${esc(item.label)}</option>`).join('')}</datalist></div>
       <div class="field"><label class="required">量程数量</label><select name="ranges" id="device-ranges">
         <option value="1" ${value.ranges !== 2 ? 'selected' : ''}>单量程</option>
         <option value="2" ${value.ranges === 2 ? 'selected' : ''}>双量程</option>
@@ -1984,7 +2347,8 @@ function deviceForm(device = null) {
       <div class="field" id="range2-max-field"><label>第二量程 Max(g)</label><input name="range2Max" type="number" step="0.0001" value="${attr(value.range2?.max ?? '')}"></div>
       <div class="field" id="range2-d-field"><label>第二量程 d(mg)</label><input name="range2D" type="number" step="0.0001" value="${attr(value.range2?.d ?? '')}"></div>
       <div class="field"><label class="required">内部校正方式</label><select name="internalCal">
-        ${['自动触发', '手动触发', 'NA'].map((option) => `<option ${value.internalCal === option ? 'selected' : ''}>${option}</option>`).join('')}
+        ${(calibrationOptions.length ? calibrationOptions : ['自动触发', '手动触发', 'NA'].map((option) => ({ value: option, label: option }))).map((item) => `<option value="${attr(item.value)}" ${value.internalCal === item.value ? 'selected' : ''}>${esc(item.label)}</option>`).join('')}
+        ${!calibrationOptions.some((item) => item.value === value.internalCal) && value.internalCal ? `<option value="${attr(value.internalCal)}" selected>${esc(value.internalCal)}（历史值）</option>` : ''}
       </select></div>
       <div class="field"><label class="required">容差系数（%）</label><input name="tol" type="number" step="0.001" min="0.001" max="10" value="${attr(value.tol || 0.05)}" required></div>
       <div class="field"><label class="required">L1(g)</label><input name="point1" type="number" step="0.0001" value="${attr(value.points?.[0] ?? 200)}" required></div>
@@ -2076,6 +2440,53 @@ function showBoxModal(box = null) {
       });
       closeModal();
       toast('砝码盒字典项已保存并写入审计日志', 'success');
+      await refreshAndRender();
+    }
+  });
+}
+
+function showDictionaryModal(item = null) {
+  const editing = Boolean(item);
+  openModal({
+    title: editing ? `编辑字典项 ${item.label || item.value}` : '新增基础数据字典项',
+    subtitle: '编号规则使用 {seq:03} 或 %03d 表示流水号；启用新规则后旧规则自动停用',
+    body: `<div class="form-grid">
+      <div class="field"><label class="required">类别</label><select name="category">
+        <option value="department" ${item?.category === 'department' ? 'selected' : ''}>科室</option>
+        <option value="internal_cal" ${item?.category === 'internal_cal' ? 'selected' : ''}>内部校正方式</option>
+        <option value="device_numbering_rule" ${item?.category === 'device_numbering_rule' ? 'selected' : ''}>天平编号规则</option>
+      </select></div>
+      <div class="field"><label class="required">字典值</label><input name="value" maxlength="100" value="${attr(item?.value || '')}" required></div>
+      <div class="field"><label class="required">显示名称</label><input name="label" maxlength="100" value="${attr(item?.label || '')}" required></div>
+      <div class="field"><label>排序</label><input name="sortOrder" type="number" min="-10000" max="10000" value="${attr(item?.sortOrder ?? 100)}"></div>
+      <div class="field"><label>状态</label><select name="status">
+        <option ${item?.status !== '停用' ? 'selected' : ''}>启用</option>
+        <option ${item?.status === '停用' ? 'selected' : ''}>停用</option>
+      </select></div>
+      <div class="field full"><label>备注</label><textarea name="remark">${esc(item?.remark || '')}</textarea></div>
+    </div>`,
+    primary: '保存字典项',
+    onConfirm: async (form) => {
+      const data = formObject(form);
+      if (!data.value?.trim() || !data.label?.trim()) {
+        throw new ClientError('字典值与显示名称不能为空');
+      }
+      await api(
+        editing ? `/api/dictionaries/${encodeURIComponent(item.id)}` : '/api/dictionaries',
+        {
+          method: editing ? 'PATCH' : 'POST',
+          body: {
+            category: data.category,
+            value: data.value.trim(),
+            label: data.label.trim(),
+            sortOrder: Number(data.sortOrder || 100),
+            status: data.status,
+            remark: data.remark?.trim() || ''
+          }
+        }
+      );
+      closeModal();
+      toast('基础数据字典已保存并写入审计日志', 'success');
       await refreshAndRender();
     }
   });
@@ -2203,6 +2614,7 @@ function showManualTaskModal(task) {
     wide: true,
     body: `
       <div class="alert warn">人工补录仅用于已核实原始视频的失败或待处理任务。服务端会记录补录行为，读数仍由统一规则判定。</div>
+      <div class="field full mt12"><label class="required">人工补录理由</label><textarea name="manualReason" required placeholder="说明卡面、读数或显示区域无法自动识别的核实过程"></textarea></div>
       <div class="form-grid mt16">
         <div class="field"><label class="required">天平档案</label><select name="deviceId" required>
           ${activeDevices.map((device) => `<option value="${attr(device.id)}">${esc(device.id)} · ${esc(device.uniqueNo)} · ${esc(device.points.join(' / '))}g</option>`).join('')}
@@ -2219,9 +2631,10 @@ function showManualTaskModal(task) {
         <tbody>${Array.from({ length: 9 }, (_, index) => {
           const point = Math.floor(index / 3);
           const idx = (index % 3) + 1;
+          const offset = 30 + index * 35;
           return `<tr><td><b class="mono">I${point + 1}-${idx}</b></td>
             <td><input name="value_${point}_${idx}" type="number" step="any"></td>
-            <td><input name="time_${point}_${idx}" type="datetime-local" value="${attr(String(task.startTime || currentDateTimeInput()).replace(' ', 'T').slice(0,16))}"></td>
+            <td><input name="time_${point}_${idx}" type="datetime-local" value="${attr(dateTimeAtOffset(task.startTime, offset))}"></td>
             <td><input name="stable_${point}_${idx}" type="checkbox" checked></td></tr>`;
         }).join('')}</tbody>
       </table></div>`,
@@ -2234,15 +2647,23 @@ function showManualTaskModal(task) {
       for (let point = 0; point < 3; point += 1) {
         for (let idx = 1; idx <= 3; idx += 1) {
           const value = data[`value_${point}_${idx}`];
+          const timeValue = String(data[`time_${point}_${idx}`] || '').replace('T', ' ');
+          const startMs = new Date(
+            String(task.startTime).replace(' ', 'T').slice(0, 16) + ':00+08:00'
+          ).getTime();
+          const readoutMs = new Date(`${String(data[`time_${point}_${idx}`]).slice(0, 16)}:00+08:00`).getTime();
+          const off = Number.isFinite(startMs) && Number.isFinite(readoutMs)
+            ? Math.max(0, Math.round((readoutMs - startMs) / 1000))
+            : 30 + (point * 3 + idx - 1) * 35;
           readouts.push({
             point,
             idx,
             value: value === '' ? null : Number(value),
             unit: 'g',
-            off: 30 + (point * 3 + idx - 1) * 35,
+            off,
             conf: value === '' ? 0 : 1,
             stable: form.querySelector(`[name="stable_${point}_${idx}"]`)?.checked !== false,
-            time: String(data[`time_${point}_${idx}`] || '').replace('T', ' '),
+            time: timeValue,
             range: device.ranges === 2 && point > 0 ? 2 : 1
           });
         }
@@ -2251,6 +2672,7 @@ function showManualTaskModal(task) {
         method: 'POST',
         body: {
           deviceId: device.id,
+          manualReason: data.manualReason?.trim() || '',
           durationSeconds: data.durationSeconds ? Number(data.durationSeconds) : null,
           rangeSwitch: form.querySelector('[name="rangeSwitch"]')?.checked !== false,
           readouts,
@@ -2281,6 +2703,109 @@ function validateVideoFile(file) {
   return file;
 }
 
+function openUploadDatabase() {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') {
+      reject(new Error('当前浏览器不支持上传会话恢复'));
+      return;
+    }
+    const request = indexedDB.open('tianping-upload-resume', 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains('sessions')) {
+        request.result.createObjectStore('sessions', { keyPath: 'key' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('无法打开上传恢复存储'));
+  });
+}
+
+async function saveUploadSession() {
+  const up = state.upload;
+  if (!up.file || !up.uploadId || !state.data?.user?.id) return;
+  const db = await openUploadDatabase();
+  await new Promise((resolve, reject) => {
+    const transaction = db.transaction('sessions', 'readwrite');
+    transaction.objectStore('sessions').put({
+      key: 'active',
+      userId: state.data.user.id,
+      uploadId: up.uploadId,
+      fileName: up.file.name,
+      fileType: up.file.type,
+      fileSize: up.file.size,
+      fileBlob: up.file,
+      startedAt: up.startedAt,
+      expectedDeviceId: up.expectedDeviceId,
+      timeConfirmed: up.confirmed,
+      offset: up.offset,
+      savedAt: Date.now()
+    });
+    transaction.oncomplete = resolve;
+    transaction.onerror = () => reject(transaction.error || new Error('保存上传会话失败'));
+  });
+  db.close();
+}
+
+async function clearUploadSession() {
+  try {
+    const db = await openUploadDatabase();
+    await new Promise((resolve) => {
+      const transaction = db.transaction('sessions', 'readwrite');
+      transaction.objectStore('sessions').delete('active');
+      transaction.oncomplete = resolve;
+      transaction.onerror = resolve;
+    });
+    db.close();
+  } catch {
+    // Browser storage may be disabled; the active upload still works in memory.
+  }
+}
+
+async function restoreUploadSession() {
+  if (!state.data?.user?.id || state.upload.busy || state.upload.uploadId) return false;
+  try {
+    const db = await openUploadDatabase();
+    const saved = await new Promise((resolve, reject) => {
+      const request = db.transaction('sessions', 'readonly')
+        .objectStore('sessions').get('active');
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    if (!saved || saved.userId !== state.data.user.id || !saved.uploadId) return false;
+    const current = await api(`/api/uploads/${encodeURIComponent(saved.uploadId)}`, {
+      allowUnauthorized: true
+    });
+    if (!['上传中', '失败'].includes(current.status)) {
+      await clearUploadSession();
+      return false;
+    }
+    const file = new File([saved.fileBlob], saved.fileName || current.fileName, {
+      type: saved.fileType || 'video/mp4',
+      lastModified: saved.savedAt || Date.now()
+    });
+    state.upload.file = file;
+    state.upload.uploadId = saved.uploadId;
+    state.upload.startedAt = current.startedAt || saved.startedAt;
+    state.upload.expectedDeviceId = saved.expectedDeviceId || state.upload.expectedDeviceId;
+    state.upload.offset = Number(current.receivedBytes || 0);
+    state.upload.progress = file.size ? state.upload.offset / file.size * 100 : 0;
+    state.upload.confirmed = Boolean(current.timeConfirmed || saved.timeConfirmed);
+    state.upload.status = current.receivedBytes >= current.sizeBytes && !state.upload.confirmed
+      ? '等待确认拍摄时间'
+      : current.status === '失败'
+        ? '已恢复失败的上传会话，可取消后重新开始'
+        : '已恢复未完成上传，可从服务器断点继续';
+    state.upload.message = current.receivedBytes >= current.sizeBytes && !state.upload.confirmed
+      ? '视频已完整接收，但缺少拍摄时间元数据；确认时间后可继续创建任务。'
+      : '浏览器刷新后已恢复所选视频和服务器上传偏移。';
+    return true;
+  } catch {
+    await clearUploadSession();
+    return false;
+  }
+}
+
 function chooseVideoFile(file) {
   try {
     state.upload.file = validateVideoFile(file);
@@ -2291,6 +2816,9 @@ function chooseVideoFile(file) {
     state.upload.message = '';
     state.upload.completedTaskId = '';
     state.upload.sha256 = '';
+    state.upload.duplicateWarning = '';
+    state.upload.metadataStartTime = '';
+    clearUploadSession();
     render();
   } catch (error) {
     toast(errorMessage(error), 'error');
@@ -2300,13 +2828,13 @@ function chooseVideoFile(file) {
 async function startUpload() {
   const up = state.upload;
   if (up.busy || !up.file) return;
-  if (!up.confirmed) {
-    toast('请先确认拍摄开始时间', 'warn');
-    return;
-  }
   const startedAt = String(up.startedAt || '').replace('T', ' ');
   if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(startedAt)) {
     toast('请填写完整的拍摄开始时间', 'error');
+    return;
+  }
+  if (!up.expectedDeviceId) {
+    toast('请选择预计天平', 'warn');
     return;
   }
   up.busy = true;
@@ -2316,25 +2844,45 @@ async function startUpload() {
   up.completedTaskId = '';
   render();
   try {
-    const initialized = await api('/api/uploads/init', {
-      method: 'POST',
-      body: {
-        fileName: up.file.name,
-        sizeBytes: up.file.size,
-        startedAt
-      },
-      signal: up.abortController.signal
-    });
-    up.uploadId = initialized.uploadId;
-    up.offset = Number(initialized.receivedBytes || 0);
+    let initialized;
+    if (up.uploadId) {
+      initialized = await api(`/api/uploads/${encodeURIComponent(up.uploadId)}`, {
+        signal: up.abortController.signal
+      });
+      if (!['上传中', '失败'].includes(initialized.status)) {
+        await clearUploadSession();
+        up.uploadId = null;
+        initialized = null;
+      }
+    }
+    if (!initialized) {
+      initialized = await api('/api/uploads/init', {
+        method: 'POST',
+        body: {
+          fileName: up.file.name,
+          sizeBytes: up.file.size,
+          startedAt,
+          timeConfirmed: up.confirmed,
+          expectedDeviceId: up.expectedDeviceId
+        },
+        signal: up.abortController.signal
+      });
+      up.uploadId = initialized.uploadId;
+      up.duplicateWarning = initialized.duplicateWarning || '';
+    }
+    up.offset = Number(initialized.receivedBytes || up.offset || 0);
     up.progress = up.file.size ? up.offset / up.file.size * 100 : 0;
     up.status = up.offset ? '从服务器断点继续上传' : '正在上传';
+    await saveUploadSession().catch(() => {});
     render();
     await uploadRemainingChunks();
   } catch (error) {
     if (error.name === 'AbortError') {
       up.status = '上传已取消';
       up.message = '已中止本次上传。若服务端已接收部分分片，可使用同一会话继续。';
+    } else if (error.code === 'TIME_CONFIRMATION_REQUIRED') {
+      up.status = '等待确认拍摄时间';
+      up.message = '视频没有拍摄时间元数据；请勾选确认拍摄开始时间，然后再次点击上传继续，无需重新发送文件。';
     } else {
       up.status = '上传失败';
       up.message = errorMessage(error);
@@ -2351,6 +2899,20 @@ async function uploadRemainingChunks() {
   if (!up.file || !up.uploadId) throw new ClientError('上传会话不存在');
   const chunkSize = 8 * 1024 * 1024;
   let result = null;
+  if (up.offset >= up.file.size) {
+    if (!up.confirmed) {
+      throw new ClientError(
+        '视频没有拍摄时间元数据，请勾选确认拍摄开始时间后继续',
+        400,
+        'TIME_CONFIRMATION_REQUIRED'
+      );
+    }
+    result = await api(`/api/uploads/${encodeURIComponent(up.uploadId)}/confirm-time`, {
+      method: 'POST',
+      body: { startedAt: String(up.startedAt || '').replace('T', ' ') }
+    });
+    up.offset = Number(result.receivedBytes || up.file.size);
+  }
   while (up.offset < up.file.size) {
     if (up.abortController?.signal.aborted) throw new DOMException('Aborted', 'AbortError');
     const end = Math.min(up.file.size, up.offset + chunkSize);
@@ -2367,6 +2929,7 @@ async function uploadRemainingChunks() {
       up.offset = Number(result.receivedBytes);
       up.progress = Math.min(100, up.offset / up.file.size * 100);
       up.status = up.offset >= up.file.size ? '正在校验文件并创建任务' : `正在上传 ${formatFileSize(up.offset / 1024 / 1024)} / ${formatFileSize(up.file.size / 1024 / 1024)}`;
+      await saveUploadSession().catch(() => {});
       render();
     } catch (error) {
       if (error.code === 'UPLOAD_OFFSET_CONFLICT' || error.status === 409) {
@@ -2389,8 +2952,14 @@ async function uploadRemainingChunks() {
   up.message = `文件 SHA-256 校验通过，已创建任务 ${result.taskId}。系统将按上传顺序串行分析。`;
   up.completedTaskId = result.taskId || '';
   up.sha256 = result.sha256 || result.sha || '';
+  await clearUploadSession();
   toast('视频上传完成，已创建分析任务', 'success');
   await loadState({ renderAfter: false });
+  const createdTask = (state.data.tasks || []).find((task) => task.id === up.completedTaskId);
+  if (createdTask?.startTime && createdTask.startTime !== String(up.startedAt).replace('T', ' ')) {
+    up.message = `文件校验通过，已创建任务 ${result.taskId}。系统已使用视频元数据时间 ${createdTask.startTime} 作为分析基准。`;
+    up.metadataStartTime = createdTask.startTime;
+  }
   render();
 }
 
@@ -2408,6 +2977,7 @@ async function cancelUpload() {
   up.abortController = null;
   up.status = '上传已取消';
   up.message = '本次上传会话已取消，未创建分析任务。';
+  await clearUploadSession();
   render();
 }
 
@@ -2511,6 +3081,16 @@ async function handleAction(action, element) {
       return;
     }
     case 'upload-clear':
+      if (state.upload.uploadId) {
+        try {
+          await api(`/api/uploads/${encodeURIComponent(state.upload.uploadId)}`, {
+            method: 'DELETE'
+          });
+        } catch {
+          // The server may already have finished the session; local state is still cleared.
+        }
+      }
+      await clearUploadSession();
       state.upload.file = null;
       state.upload.uploadId = null;
       state.upload.offset = 0;
@@ -2518,6 +3098,9 @@ async function handleAction(action, element) {
       state.upload.status = '';
       state.upload.message = '';
       state.upload.completedTaskId = '';
+      state.upload.duplicateWarning = '';
+      state.upload.metadataStartTime = '';
+      state.upload.expectedDeviceId = '';
       render();
       return;
     case 'upload-start':
@@ -2650,28 +3233,35 @@ async function handleAction(action, element) {
     }
     case 'export-records-csv':
       await withBusy(element, async () => {
-        const records = filterRecords(state.data.records);
-        const devices = [...new Set(records.map((record) => record.device))];
         await downloadFromApi('/api/exports/csv', {
           type: 'records',
-          devices,
+          devices: state.filters.records.devices,
           from: state.filters.records.from || undefined,
-          to: state.filters.records.to || undefined
+          to: state.filters.records.to || undefined,
+          inspector: state.filters.records.inspector || undefined,
+          status: state.filters.records.status || undefined,
+          conclusion: state.filters.records.conclusion || undefined
         }, '天平校验记录清单.csv');
         toast('记录清单 CSV 已开始下载', 'success');
       });
       return;
     case 'history-csv':
       await withBusy(element, async () => {
+        const filters = state.filters.history;
         await downloadFromApi('/api/exports/csv', {
           type: 'readouts',
-          devices: [element.dataset.device]
+          devices: [element.dataset.device],
+          from: filters.from || undefined,
+          to: filters.to || undefined,
+          conclusion: filters.conclusion || undefined
         }, `天平校验示值明细_${element.dataset.device}.csv`);
         toast('示值明细 CSV 已开始下载', 'success');
       });
       return;
     case 'master-tab':
-      state.ui.masterTab = element.dataset.tab === 'boxes' ? 'boxes' : 'devices';
+      state.ui.masterTab = ['boxes', 'dictionaries'].includes(element.dataset.tab)
+        ? element.dataset.tab
+        : 'devices';
       render();
       return;
     case 'device-new':
@@ -2685,6 +3275,16 @@ async function handleAction(action, element) {
     case 'box-new':
       showBoxModal();
       return;
+    case 'dictionary-new':
+      showDictionaryModal();
+      return;
+    case 'dictionary-edit': {
+      const item = (state.data.dictionaries || []).find(
+        (candidate) => String(candidate.id) === String(id)
+      );
+      if (item) showDictionaryModal(item);
+      return;
+    }
     case 'box-edit': {
       const box = state.data.weightBoxes.find((candidate) => candidate.id === id);
       if (box) showBoxModal(box);
@@ -2807,14 +3407,37 @@ async function handleAction(action, element) {
       state.ui.auditPage = Math.max(1, Number(element.dataset.page || 1));
       render();
       return;
-    case 'reset-record-filter':
-      state.filters.records = { device: '', from: '', to: '', inspector: '', status: '', conclusion: '' };
-      if (parseRoute().query.get('draft') === '1') navigate('/records?draft=1');
-      else render();
+    case 'records-page':
+      await loadRecordsPage(Math.max(1, Number(element.dataset.page || 1)));
       return;
+    case 'verify-page':
+      await loadVerifyRecords(Math.max(1, Number(element.dataset.page || 1)));
+      return;
+    case 'history-page':
+      await loadHistoryRecords(
+        element.dataset.device,
+        Math.max(1, Number(element.dataset.page || 1))
+      );
+      return;
+    case 'reset-record-filter':
+      state.filters.records = { devices: [], from: '', to: '', inspector: '', status: '', conclusion: '' };
+      state.recordsView.loaded = false;
+      state.recordsView.page = 1;
+      await loadRecordsPage(1);
+      return;
+    case 'reset-history-filter': {
+      const deviceId = element.dataset.device;
+      state.filters.history = { from: '', to: '', conclusion: '' };
+      state.historyView.loaded = false;
+      state.historyView.page = 1;
+      await loadHistoryRecords(deviceId, 1);
+      return;
+    }
     case 'reset-verify-filter':
       state.filters.verify = { device: '', from: '', to: '', inspector: '' };
-      render();
+      state.verifyView.loaded = false;
+      state.verifyView.page = 1;
+      await loadVerifyRecords(1);
       return;
     case 'reset-audit-filter':
       state.filters.audit = { from: '', to: '', account: '', type: '' };
@@ -2859,11 +3482,70 @@ async function handleAction(action, element) {
       await refreshAndRender();
       toast('运行状态已刷新', 'success');
       return;
+    case 'export-app-logs':
+      await withBusy(element, async () => {
+        await downloadFromApi(
+          '/api/system/logs?download=1',
+          null,
+          '应用日志.log',
+          'GET'
+        );
+        toast('应用日志已导出，导出动作已写入审计日志', 'success');
+      });
+      return;
     case 'print-window':
       window.print();
       return;
     default:
       return;
+  }
+}
+
+function updateTemplatePreview(form) {
+  const preview = document.querySelector('[data-template-preview]');
+  if (!preview || !form) return;
+  const fields = (state.data.template.fields || []).map((field) => {
+    const showInput = form.querySelector(`[name="show_${field.key}"]`);
+    const labelInput = form.querySelector(`[name="label_${field.key}"]`);
+    return {
+      ...field,
+      show: showInput ? showInput.checked : field.show,
+      label: labelInput?.value.trim() || field.label
+    };
+  });
+  const fieldsRoot = preview.querySelector('[data-preview-fields]');
+  if (fieldsRoot) {
+    fieldsRoot.innerHTML = fields
+      .filter((field) => field.show !== false && !['time', 'detail'].includes(field.key))
+      .map((field) => `<span>${esc(field.label)}</span><b>示例</b>`)
+      .join('');
+  }
+  const timeField = fields.find((field) => field.key === 'time');
+  const pointsRoot = preview.querySelector('[data-preview-points]');
+  if (pointsRoot) {
+    pointsRoot.textContent = ['point1', 'point2', 'point3']
+      .map((name, index) => {
+        const value = form.querySelector(`[name="${name}"]`)?.value;
+        return `L${index + 1}=${value || '—'}g`;
+      })
+      .join(' · ') + (
+        form.querySelector('[name="useTemplatePoints"]')?.checked
+          ? ' · 判定使用模板值'
+          : ' · 判定使用设备档案值'
+      );
+  }
+  const timeRoot = preview.querySelector('[data-preview-time]');
+  if (timeRoot) {
+    timeRoot.textContent = form.querySelector('[name="printTime"]')?.checked === false
+      || timeField?.show === false
+      ? '不打印测量时间'
+      : `打印测量时间：${timeField?.label || '测量时间'}`;
+  }
+  const footerRoot = preview.querySelector('[data-preview-footer]');
+  if (footerRoot) {
+    footerRoot.textContent = form.querySelector('[name="footerExtra"]')?.value
+      || form.querySelector('[name="footerNote"]')?.value
+      || '';
   }
 }
 
@@ -2887,6 +3569,7 @@ async function handleForm(form) {
           return;
         }
         await loadState({ renderAfter: false });
+        await restoreUploadSession();
         navigate('/dashboard');
         toast(`登录成功：${result.user.name}`, 'success');
       } catch (error) {
@@ -2913,6 +3596,7 @@ async function handleForm(form) {
       });
       state.session.mustChangePassword = false;
       await loadState({ renderAfter: false });
+      await restoreUploadSession();
       window.location.hash = '#/dashboard';
       render();
       toast('口令修改成功，已进入系统', 'success');
@@ -2922,11 +3606,32 @@ async function handleForm(form) {
     return;
   }
   if (type === 'record-filter') {
+    const data = formObject(form);
     state.filters.records = {
-      ...state.filters.records,
-      ...formObject(form)
+      devices: new FormData(form).getAll('devices').map(String),
+      from: data.from || '',
+      to: data.to || '',
+      inspector: data.inspector || '',
+      status: data.status || '',
+      conclusion: data.conclusion || ''
     };
-    render();
+    state.recordsView.loaded = false;
+    state.recordsView.page = 1;
+    await loadRecordsPage(1);
+    return;
+  }
+  if (type === 'history-filter') {
+    const data = formObject(form);
+    const match = /^\/history\/([^/]+)$/.exec(parseRoute().path);
+    if (!match) return;
+    state.filters.history = {
+      from: data.from || '',
+      to: data.to || '',
+      conclusion: data.conclusion || ''
+    };
+    state.historyView.loaded = false;
+    state.historyView.page = 1;
+    await loadHistoryRecords(decodeURIComponent(match[1]), 1);
     return;
   }
   if (type === 'verify-filter') {
@@ -2934,7 +3639,9 @@ async function handleForm(form) {
       ...state.filters.verify,
       ...formObject(form)
     };
-    render();
+    state.verifyView.loaded = false;
+    state.verifyView.page = 1;
+    await loadVerifyRecords(1);
     return;
   }
   if (type === 'audit-filter') {
@@ -2964,7 +3671,9 @@ async function handleForm(form) {
         body: {
           config: {
             tol: Number(data.tol),
+            points: [data.point1, data.point2, data.point3].map(Number),
             printTime: form.querySelector('[name="printTime"]')?.checked === true,
+            useTemplatePoints: form.querySelector('[name="useTemplatePoints"]')?.checked === true,
             footerNote: data.footerNote || '',
             footerExtra: data.footerExtra || '',
             fields
@@ -2986,13 +3695,18 @@ async function handleForm(form) {
     }
     const data = formObject(form);
     await withBusy(submit, async () => {
+      const mode = data.mode || 'merged';
+      const extension = mode === 'per-device-day' ? 'zip' : 'pdf';
       await downloadFromApi('/api/exports/records', {
         devices,
         from: data.from,
         to: data.to,
+        mode,
         includeUnverified: form.querySelector('[name="includeUnverified"]')?.checked === true
-      }, `天平校验记录_${devices.join('-')}_${data.from.replaceAll('-', '')}-${data.to.replaceAll('-', '')}.pdf`);
-      toast('批量 PDF 已生成并开始下载', 'success');
+      }, `天平校验记录_${devices.join('-')}_${data.from.replaceAll('-', '')}-${data.to.replaceAll('-', '')}.${extension}`);
+      toast(mode === 'per-device-day'
+        ? '逐台每日 PDF 文件包已生成并开始下载'
+        : '合并 PDF 已生成并开始下载', 'success');
       await loadState({ renderAfter: false });
     });
     return;
@@ -3127,6 +3841,8 @@ document.addEventListener('submit', async (event) => {
 
 document.addEventListener('change', async (event) => {
   const target = event.target;
+  const templateForm = target.closest?.('[data-form="template-save"]');
+  if (templateForm) updateTemplatePreview(templateForm);
   if (target.id === 'video-file') {
     chooseVideoFile(target.files?.[0]);
     return;
@@ -3135,8 +3851,13 @@ document.addEventListener('change', async (event) => {
     state.upload.startedAt = target.value;
     return;
   }
+  if (target.id === 'upload-device') {
+    state.upload.expectedDeviceId = target.value;
+    return;
+  }
   if (target.name === 'timeConfirmed') {
     state.upload.confirmed = target.checked;
+    await saveUploadSession().catch(() => {});
     render();
     return;
   }
@@ -3155,6 +3876,11 @@ document.addEventListener('change', async (event) => {
   }
 });
 
+document.addEventListener('input', (event) => {
+  const templateForm = event.target.closest?.('[data-form="template-save"]');
+  if (templateForm) updateTemplatePreview(templateForm);
+});
+
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && modalRoot.children.length) closeModal();
 });
@@ -3165,6 +3891,8 @@ window.addEventListener('hashchange', () => {
     else renderLogin();
     return;
   }
+  if (parseRoute().path === '/records') state.recordsView.loaded = false;
+  if (parseRoute().path === '/verify') state.verifyView.loaded = false;
   render();
   window.scrollTo({ top: 0, behavior: 'instant' });
 });

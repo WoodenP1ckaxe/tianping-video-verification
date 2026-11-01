@@ -207,6 +207,21 @@ export function initSchema(db) {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS dictionary_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      category TEXT NOT NULL,
+      value TEXT NOT NULL,
+      label TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT '启用' CHECK(status IN ('启用', '停用')),
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      remark TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(category, value)
+    );
+    CREATE INDEX IF NOT EXISTS idx_dictionary_category_status
+      ON dictionary_items(category, status, sort_order, id);
+
     CREATE TABLE IF NOT EXISTS template_versions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       version TEXT NOT NULL UNIQUE,
@@ -223,6 +238,7 @@ export function initSchema(db) {
       size_bytes INTEGER NOT NULL,
       received_bytes INTEGER NOT NULL DEFAULT 0,
       started_at TEXT NOT NULL,
+      time_confirmed INTEGER NOT NULL DEFAULT 0,
       temp_path TEXT NOT NULL,
       sha256 TEXT,
       status TEXT NOT NULL CHECK(status IN ('上传中', '校验中', '已完成', '已取消', '失败')),
@@ -284,6 +300,7 @@ export function initSchema(db) {
       person_card_json TEXT NOT NULL DEFAULT '{}',
       device_card_json TEXT NOT NULL DEFAULT '{}',
       range_switch INTEGER NOT NULL DEFAULT 1,
+      range_transition_json TEXT NOT NULL DEFAULT '{}',
       checks_json TEXT NOT NULL DEFAULT '{}',
       modifications_json TEXT NOT NULL DEFAULT '[]',
       template_version TEXT NOT NULL,
@@ -382,9 +399,11 @@ export function initSchema(db) {
   // Small migration hook for local databases produced by early builds.
   ensureColumn(db, 'tasks', 'warnings_json', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn(db, 'records', 'checks_json', "TEXT NOT NULL DEFAULT '{}'");
+  ensureColumn(db, 'records', 'range_transition_json', "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(db, 'records', 'tolerance_percent', 'REAL');
   ensureColumn(db, 'records', 'device_snapshot_json', "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(db, 'records', 'template_snapshot_json', "TEXT NOT NULL DEFAULT '{}'");
+  ensureColumn(db, 'uploads', 'time_confirmed', 'INTEGER NOT NULL DEFAULT 0');
 }
 
 function insertAudit(db, entry) {
@@ -427,6 +446,8 @@ function defaultTemplate() {
     version: 'v1',
     tol: 0.05,
     printTime: true,
+    points: [200, 50, 10],
+    useTemplatePoints: false,
     footerNote: '注：出现异常时应在备注栏准确记录，必要时及时报修。',
     footerExtra: '判定依据：|I − L| ≤ 容差系数 × L；9 次读数全部在限内、读数稳定、顺序正确、双量程量程切换完整时判为“通过”。',
     fields: [
@@ -449,6 +470,25 @@ function defaultTemplate() {
 
 export function getDefaultTemplate() {
   return defaultTemplate();
+}
+
+export function ensureDefaultDictionaries(db) {
+  const time = nowDateTime();
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO dictionary_items (
+      category, value, label, status, sort_order, remark, created_at, updated_at
+    ) VALUES (?, ?, ?, '启用', ?, '', ?, ?)
+  `);
+  [
+    ['department', '化学室', '化学室', 10],
+    ['department', '理化室', '理化室', 20],
+    ['internal_cal', '自动触发', '自动触发', 10],
+    ['internal_cal', '手动触发', '手动触发', 20],
+    ['internal_cal', 'NA', '不适用', 30],
+    ['device_numbering_rule', 'F{seq:03}', 'F + 三位流水号', 10],
+  ].forEach(([category, value, label, sortOrder]) => {
+    insert.run(category, value, label, sortOrder, time, time);
+  });
 }
 
 function readout(point, idx, value, range = 1, conf = 0.997, stable = true, offset = 32) {
@@ -687,6 +727,22 @@ export function seedDatabase(db, config = {}) {
     insertBox.run('FM2512922', '启用', '500g / 100g / 20g 一组', '2026-09-19', timestamp, timestamp);
     insertBox.run('FM2410088', '停用', '砝码盒胶带磨损待送检', '2026-06-28', timestamp, timestamp);
 
+    const insertDictionary = db.prepare(`
+      INSERT OR IGNORE INTO dictionary_items (
+        category, value, label, status, sort_order, remark, created_at, updated_at
+      ) VALUES (?, ?, ?, '启用', ?, '', ?, ?)
+    `);
+    [
+      ['department', '化学室', '化学室', 10],
+      ['department', '理化室', '理化室', 20],
+      ['internal_cal', '自动触发', '自动触发', 10],
+      ['internal_cal', '手动触发', '手动触发', 20],
+      ['internal_cal', 'NA', '不适用', 30],
+      ['device_numbering_rule', 'F{seq:03}', 'F + 三位流水号', 10],
+    ].forEach(([category, value, label, sortOrder]) => {
+      insertDictionary.run(category, value, label, sortOrder, timestamp, timestamp);
+    });
+
     const template = defaultTemplate();
     db.prepare(`
       INSERT INTO template_versions (
@@ -709,7 +765,7 @@ export function seedDatabase(db, config = {}) {
       recordRetentionYears: 5,
       sessionIdleMinutes: 30,
       appVersion: '1.0.0',
-      analyzerMode: 'sample-manifest'
+      analyzerMode: 'local-display-ocr'
     };
     const insertSetting = db.prepare(`
       INSERT INTO settings (key, value_json, updated_at, updated_by)
@@ -881,6 +937,13 @@ export function openDatabase(config = {}) {
   const db = new DatabaseSync(dbPath);
   initSchema(db);
   seedDatabase(db, config);
+  ensureDefaultDictionaries(db);
+  const analyzerMode = db.prepare(
+    "SELECT value_json FROM settings WHERE key = 'analyzerMode'"
+  ).get();
+  if (analyzerMode && jsonParse(analyzerMode.value_json, null) === 'sample-manifest') {
+    setSetting(db, 'analyzerMode', 'local-display-ocr');
+  }
   return { db, dbPath };
 }
 
@@ -1002,6 +1065,45 @@ export function getWeightBox(db, id) {
   return mapWeightBox(db.prepare('SELECT * FROM weight_boxes WHERE id = ?').get(id));
 }
 
+export function mapDictionaryItem(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    category: row.category,
+    value: row.value,
+    label: row.label || row.value,
+    status: row.status,
+    sortOrder: row.sort_order,
+    remark: row.remark,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+export function getDictionaryItems(db, filters = {}) {
+  const clauses = [];
+  const params = [];
+  if (filters.category) {
+    clauses.push('category = ?');
+    params.push(filters.category);
+  }
+  if (filters.status) {
+    clauses.push('status = ?');
+    params.push(filters.status);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  return db.prepare(`
+    SELECT * FROM dictionary_items ${where}
+    ORDER BY category, sort_order, id
+  `).all(...params).map(mapDictionaryItem);
+}
+
+export function getDictionaryItem(db, id) {
+  return mapDictionaryItem(
+    db.prepare('SELECT * FROM dictionary_items WHERE id = ?').get(Number(id))
+  );
+}
+
 export function mapTask(row) {
   if (!row) return null;
   return {
@@ -1041,7 +1143,18 @@ export function getTasks(db, actor, scope = null) {
     : db.prepare(
       'SELECT * FROM tasks WHERE user_id = ? ORDER BY queued_at DESC, created_at DESC'
     ).all(actor?.user?.id);
-  return rows.map(mapTask);
+  const queuedOrder = db.prepare(`
+    SELECT id FROM tasks
+    WHERE status = '排队中'
+    ORDER BY queued_at ASC, created_at ASC, rowid ASC
+  `).all();
+  const positions = new Map(
+    queuedOrder.map((row, index) => [row.id, index + 1])
+  );
+  return rows.map((row) => ({
+    ...mapTask(row),
+    queuePosition: positions.get(row.id) || null
+  }));
 }
 
 export function mapRecord(row) {
@@ -1067,6 +1180,7 @@ export function mapRecord(row) {
     personCard: jsonParse(row.person_card_json, {}),
     deviceCard: jsonParse(row.device_card_json, {}),
     rangeSwitch: truthy(row.range_switch),
+    rangeTransition: jsonParse(row.range_transition_json, {}),
     checks: jsonParse(row.checks_json, {}),
     modifications: jsonParse(row.modifications_json, []),
     templateVersion: row.template_version,
@@ -1100,7 +1214,7 @@ export function getRecord(db, id) {
   return mapRecord(getRawRecord(db, id));
 }
 
-export function getRecords(db, filters = {}) {
+function recordFilterClause(filters = {}) {
   const clauses = [];
   const params = [];
   if (filters.device) {
@@ -1130,11 +1244,24 @@ export function getRecords(db, filters = {}) {
   if (filters.includeVoided === false) {
     clauses.push("status <> '已作废'");
   }
-  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  return {
+    where: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '',
+    params
+  };
+}
+
+export function getRecordCount(db, filters = {}) {
+  const { where, params } = recordFilterClause(filters);
+  return db.prepare(`SELECT COUNT(*) AS n FROM records ${where}`).get(...params).n;
+}
+
+export function getRecords(db, filters = {}) {
+  const { where, params } = recordFilterClause(filters);
   const limit = Math.min(10000, Math.max(1, Number(filters.limit || 5000)));
+  const offset = Math.max(0, Number(filters.offset || 0));
   return db.prepare(
-    `SELECT * FROM records ${where} ORDER BY id DESC LIMIT ?`
-  ).all(...params, limit).map(mapRecord);
+    `SELECT * FROM records ${where} ORDER BY id DESC LIMIT ? OFFSET ?`
+  ).all(...params, limit, offset).map(mapRecord);
 }
 
 export function nextRecordId(db, deviceId, date) {
@@ -1273,14 +1400,42 @@ export function getQueueStats(db) {
     WHERE status = '已完成' AND duration_ms IS NOT NULL
     ORDER BY finished_at DESC LIMIT 20
   `).all().map((row) => Number(row.duration_ms));
+  const current = db.prepare(`
+    SELECT id, file_name, user_id, analysis_started_at
+    FROM tasks
+    WHERE status = '分析中'
+    ORDER BY analysis_started_at ASC, rowid ASC
+    LIMIT 1
+  `).get();
+  const queuedRows = db.prepare(`
+    SELECT id, file_name, user_id, queued_at
+    FROM tasks
+    WHERE status = '排队中'
+    ORDER BY queued_at ASC, created_at ASC, rowid ASC
+  `).all();
+  const averageDurationMs = durations.length
+    ? Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length)
+    : null;
   return {
     queued: byStatus['排队中'] || 0,
     running: byStatus['分析中'] || 0,
     completed: byStatus['已完成'] || 0,
     failed: (byStatus['失败'] || 0) + (byStatus['待人工处理'] || 0),
-    averageDurationMs: durations.length
-      ? Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length)
-      : null
+    averageDurationMs,
+    averageSegmentDurationMs: averageDurationMs,
+    currentTask: current ? {
+      id: current.id,
+      file: current.file_name,
+      user: current.user_id,
+      startedAt: current.analysis_started_at
+    } : null,
+    nextTasks: queuedRows.slice(0, 10).map((row, index) => ({
+      position: index + 1,
+      id: row.id,
+      file: row.file_name,
+      user: row.user_id,
+      queuedAt: row.queued_at
+    }))
   };
 }
 

@@ -20,6 +20,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 COPY --chown=node:node . .
 RUN mkdir -p /app/data /app/backups \
     && chown -R node:node /app/data /app/backups

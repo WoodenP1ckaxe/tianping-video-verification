@@ -18,12 +18,15 @@ import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import {
   audit,
+  getDevice,
+  getTask,
   nextTaskId,
   nowDateTime,
   nowIso,
   uniqueFilename
 } from '../db.js';
 import { HttpError } from '../auth.js';
+import { inspectVideoMetadata } from './analyzer.js';
 
 const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
 const ALLOWED_EXTENSIONS = new Set(['.mp4', '.mov']);
@@ -42,7 +45,7 @@ function diskAvailableBytes(directory) {
   }
 }
 
-function uploadDto(row) {
+function uploadDto(row, extras = {}) {
   if (!row) return null;
   return {
     uploadId: row.id,
@@ -50,6 +53,7 @@ function uploadDto(row) {
     sizeBytes: row.size_bytes,
     receivedBytes: row.received_bytes,
     startedAt: row.started_at,
+    timeConfirmed: Boolean(row.time_confirmed),
     sha256: row.sha256,
     status: row.status,
     taskId: row.task_id,
@@ -59,7 +63,8 @@ function uploadDto(row) {
     } : null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    completedAt: row.completed_at
+    completedAt: row.completed_at,
+    ...extras
   };
 }
 
@@ -84,6 +89,7 @@ export class UploadService {
     const fileName = path.basename(String(payload?.fileName || '').trim());
     const sizeBytes = Number(payload?.sizeBytes);
     const startedAt = String(payload?.startedAt || '').trim().replace('T', ' ');
+    const expectedDeviceId = String(payload?.expectedDeviceId || '').trim().toUpperCase();
     const extension = path.extname(fileName).toLowerCase();
 
     if (!fileName || !ALLOWED_EXTENSIONS.has(extension)) {
@@ -98,6 +104,23 @@ export class UploadService {
     if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(startedAt)) {
       throw new HttpError(400, 'INVALID_START_TIME', '请确认拍摄开始时间，精确到分钟');
     }
+    if (expectedDeviceId) {
+      const expectedDevice = getDevice(this.db, expectedDeviceId);
+      if (!expectedDevice || expectedDevice.status !== '在用') {
+        throw new HttpError(400, 'EXPECTED_DEVICE_INVALID', '预计天平编号不存在或已停用');
+      }
+    }
+    const sameDayRows = this.db.prepare(`
+      SELECT device_id, COUNT(*) AS count
+      FROM records
+      WHERE inspector_id = ? AND date = ? AND status <> '已作废'
+        AND (? = '' OR device_id = ?)
+      GROUP BY device_id
+      ORDER BY device_id
+    `).all(actor.user.id, startedAt.slice(0, 10), expectedDeviceId, expectedDeviceId);
+    const duplicateWarning = sameDayRows.length
+      ? `${expectedDeviceId ? `该天平（${expectedDeviceId}）当日已有记录` : '该拍摄日期您已有记录'}：${sameDayRows.map((row) => `${row.device_id} ${row.count} 条`).join('、')}。系统会生成独立的当日记录，不会覆盖已有记录；可继续上传。`
+      : '';
 
     const active = this.db.prepare(`
       SELECT
@@ -153,14 +176,15 @@ export class UploadService {
       this.db.prepare(`
         INSERT INTO uploads (
           id, user_id, original_name, size_bytes, received_bytes, started_at,
-          temp_path, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 0, ?, ?, '上传中', ?, ?)
+          time_confirmed, temp_path, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, '上传中', ?, ?)
       `).run(
         id,
         actor.user.id,
         fileName,
         sizeBytes,
         startedAt,
+        payload?.timeConfirmed === true ? 1 : 0,
         tempPath,
         time,
         time
@@ -178,7 +202,11 @@ export class UploadService {
       this.db.exec('ROLLBACK');
       throw error;
     }
-    return uploadDto(this.db.prepare('SELECT * FROM uploads WHERE id = ?').get(id));
+    return {
+      ...uploadDto(this.db.prepare('SELECT * FROM uploads WHERE id = ?').get(id)),
+      expectedDeviceId,
+      duplicateWarning
+    };
   }
 
   get(actor, uploadId) {
@@ -188,6 +216,18 @@ export class UploadService {
       throw new HttpError(403, 'FORBIDDEN', '无权访问此上传会话');
     }
     return uploadDto(row);
+  }
+
+  recordAppendFailure(actor, row, code, message) {
+    audit(this.db, actor, {
+      type: '视频上传失败',
+      objectType: '上传会话',
+      objectId: row.id,
+      before: row.status,
+      after: `${row.status}（分片未写入）`,
+      reason: `${code} ${message}`,
+      result: '失败'
+    });
   }
 
   async append(actor, uploadId, offsetHeader, req) {
@@ -205,6 +245,12 @@ export class UploadService {
       throw new HttpError(400, 'INVALID_OFFSET', 'Upload-Offset 必须为非负整数');
     }
     if (offset !== row.received_bytes) {
+      this.recordAppendFailure(
+        actor,
+        row,
+        'UPLOAD_OFFSET_CONFLICT',
+        `客户端偏移 ${offset}，服务器偏移 ${row.received_bytes}`,
+      );
       throw new HttpError(
         409,
         'UPLOAD_OFFSET_CONFLICT',
@@ -217,9 +263,16 @@ export class UploadService {
 
     const contentLength = Number(req.headers['content-length'] || 0);
     if (contentLength > MAX_CHUNK_BYTES) {
+      this.recordAppendFailure(actor, row, 'CHUNK_TOO_LARGE', `分片大小 ${contentLength} bytes`);
       throw new HttpError(413, 'CHUNK_TOO_LARGE', '单个上传分片不能超过 16MB');
     }
     if (offset + contentLength > row.size_bytes) {
+      this.recordAppendFailure(
+        actor,
+        row,
+        'UPLOAD_SIZE_OVERFLOW',
+        `偏移 ${offset} 加 ${contentLength} bytes 超过声明大小 ${row.size_bytes} bytes`,
+      );
       throw new HttpError(400, 'UPLOAD_SIZE_OVERFLOW', '上传内容超过声明的视频大小');
     }
 
@@ -250,6 +303,12 @@ export class UploadService {
         this.db.prepare(
           'UPDATE uploads SET received_bytes = ?, updated_at = ? WHERE id = ?'
         ).run(recoverableOffset, nowDateTime(), uploadId);
+        this.recordAppendFailure(
+          actor,
+          row,
+          'UPLOAD_INTERRUPTED',
+          `分片写入中断，已保留可续传偏移 ${recoverableOffset} bytes：${error.message}`,
+        );
         throw new HttpError(
           400,
           'UPLOAD_INTERRUPTED',
@@ -260,6 +319,12 @@ export class UploadService {
 
       const actualSize = statSync(row.temp_path).size;
       if (actualSize !== received) {
+        this.recordAppendFailure(
+          actor,
+          row,
+          'UPLOAD_SIZE_MISMATCH',
+          `写入大小 ${actualSize} bytes，接收大小 ${received} bytes`,
+        );
         throw new HttpError(409, 'UPLOAD_SIZE_MISMATCH', '写入大小与接收大小不一致');
       }
       this.db.prepare(
@@ -274,6 +339,38 @@ export class UploadService {
     } finally {
       this.active.delete(uploadId);
     }
+  }
+
+  async confirmTime(actor, uploadId, startedAtValue) {
+    const row = this.db.prepare('SELECT * FROM uploads WHERE id = ?').get(uploadId);
+    if (!row) throw new HttpError(404, 'UPLOAD_NOT_FOUND', '上传会话不存在');
+    if (row.user_id !== actor.user.id) {
+      throw new HttpError(403, 'FORBIDDEN', '只能确认自己的上传时间');
+    }
+    if (row.status !== '上传中' || row.received_bytes !== row.size_bytes) {
+      throw new HttpError(409, 'UPLOAD_NOT_TIME_CONFIRMABLE', '仅已完整接收且等待时间的上传可确认拍摄时间');
+    }
+    const startedAt = String(startedAtValue || '').trim().replace('T', ' ');
+    if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(startedAt)) {
+      throw new HttpError(400, 'INVALID_START_TIME', '拍摄开始时间格式应为 YYYY-MM-DD HH:mm');
+    }
+    this.db.prepare(`
+      UPDATE uploads
+      SET started_at = ?, time_confirmed = 1, error_code = NULL,
+          error_message = NULL, updated_at = ?
+      WHERE id = ?
+    `).run(startedAt, nowDateTime(), uploadId);
+    audit(this.db, actor, {
+      type: '上传时间确认',
+      objectType: '上传会话',
+      objectId: uploadId,
+      before: row.started_at,
+      after: startedAt,
+      reason: '视频缺少拍摄时间元数据，由上传者确认后继续分析',
+      result: '成功'
+    });
+    await this.finalize(actor, uploadId);
+    return uploadDto(this.db.prepare('SELECT * FROM uploads WHERE id = ?').get(uploadId));
   }
 
   async finalize(actor, uploadId) {
@@ -292,6 +389,25 @@ export class UploadService {
       if (size !== row.size_bytes) {
         throw new Error(`文件大小校验失败：声明 ${row.size_bytes}，实际 ${size}`);
       }
+      const media = await inspectVideoMetadata({
+        filePath: row.temp_path,
+        config: this.config
+      });
+      const metadataDate = media.creationTime ? new Date(media.creationTime) : null;
+      const metadataStartTime = metadataDate && !Number.isNaN(metadataDate.getTime())
+        ? nowDateTime(metadataDate)
+        : null;
+      if (!metadataStartTime && !row.time_confirmed) {
+        const confirmation = new HttpError(
+          400,
+          'TIME_CONFIRMATION_REQUIRED',
+          '视频没有拍摄时间元数据，请确认拍摄开始时间后继续分析',
+        );
+        confirmation.keepUploadRetryable = true;
+        throw confirmation;
+      }
+      const effectiveStartTime = metadataStartTime || row.started_at;
+      const startTimeSource = metadataStartTime ? 'video-creation-time' : 'user-confirmed';
 
       const taskId = nextTaskId(this.db);
       const finalDir = path.join(
@@ -319,7 +435,7 @@ export class UploadService {
           finalPath,
           row.size_bytes,
           row.user_id,
-          row.started_at,
+          effectiveStartTime,
           time,
           sha256,
           actor.ip || '',
@@ -328,15 +444,16 @@ export class UploadService {
         );
         this.db.prepare(`
           UPDATE uploads
-          SET status = '已完成', sha256 = ?, task_id = ?, completed_at = ?, updated_at = ?
+          SET status = '已完成', sha256 = ?, task_id = ?, started_at = ?,
+              completed_at = ?, updated_at = ?
           WHERE id = ?
-        `).run(sha256, taskId, time, time, uploadId);
+        `).run(sha256, taskId, effectiveStartTime, time, time, uploadId);
         audit(this.db, actor, {
           type: '视频上传完成',
           objectType: '分析任务',
           objectId: taskId,
           after: '排队中',
-          reason: `文件名 ${row.original_name}；SHA-256 ${sha256}；拍摄开始时间 ${row.started_at}`,
+          reason: `文件名 ${row.original_name}；SHA-256 ${sha256}；拍摄开始时间 ${effectiveStartTime}（${startTimeSource}）；时长 ${media.duration.toFixed(1)} 秒；编码 ${media.videoCodec}`,
           result: '成功'
         });
         this.db.exec('COMMIT');
@@ -359,17 +476,22 @@ export class UploadService {
       }
       this.db.prepare(`
         UPDATE uploads
-        SET status = '失败', error_code = 'E-UPLOAD-HASH',
-            error_message = ?, updated_at = ?
+        SET status = ?, error_code = ?, error_message = ?, updated_at = ?
         WHERE id = ?
-      `).run(String(error.message || error).slice(0, 500), nowDateTime(), uploadId);
+      `).run(
+        error.keepUploadRetryable ? '上传中' : '失败',
+        String(error.code || 'E-UPLOAD-FINALIZE').slice(0, 100),
+        String(error.message || error).slice(0, 500),
+        nowDateTime(),
+        uploadId,
+      );
       audit(this.db, actor, {
-        type: '视频上传失败',
+        type: error.keepUploadRetryable ? '上传时间待确认' : '视频上传失败',
         objectType: '上传会话',
         objectId: uploadId,
-        after: '失败',
+        after: error.keepUploadRetryable ? '待确认拍摄时间' : '失败',
         reason: String(error.message || error),
-        result: '失败'
+        result: error.keepUploadRetryable ? '待处理' : '失败'
       });
       throw error;
     }

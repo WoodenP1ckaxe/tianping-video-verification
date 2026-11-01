@@ -5,6 +5,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import {
   audit,
   boolInt,
@@ -15,11 +16,14 @@ import {
   getDevice,
   getDevices,
   getDefaultTemplate,
+  getDictionaryItem,
+  getDictionaryItems,
   getExports,
   getQueueStats,
   getRawAccount,
   getRawRecord,
   getRecord,
+  getRecordCount,
   getRecords,
   getSetting,
   getTask,
@@ -58,6 +62,7 @@ import { getAnalyzerStatus } from './services/analyzer.js';
 
 const JSON_LIMIT = 2 * 1024 * 1024;
 const EXPORT_LIMIT = 1000;
+let ntpProbeCache = null;
 
 function sendJson(res, status, body, extraHeaders = {}) {
   const json = JSON.stringify(body);
@@ -136,6 +141,13 @@ function optionalString(value, label, maxLength = 1000) {
   return text;
 }
 
+function stringList(value) {
+  const source = Array.isArray(value) ? value : (value ? [value] : []);
+  return [...new Set(source.flatMap((item) => String(item).split(','))
+    .map((item) => item.trim())
+    .filter(Boolean))];
+}
+
 function newTemporaryPassword() {
   return `Tp-${randomBytes(15).toString('base64url')}-9a`;
 }
@@ -146,6 +158,82 @@ function normalizeDate(value, label) {
     throw new HttpError(400, 'VALIDATION_ERROR', `${label}格式应为 YYYY-MM-DD`);
   }
   return text;
+}
+
+function requireNaturalWeek(from, to) {
+  const start = new Date(`${from}T00:00:00Z`);
+  const end = new Date(`${to}T00:00:00Z`);
+  if (start.getUTCDay() !== 1 || end.getUTCDay() !== 0) {
+    throw new HttpError(
+      400,
+      'NATURAL_WEEK_REQUIRED',
+      '周统计日期必须为同一自然周的周一至周日',
+    );
+  }
+  const days = Math.round((end.getTime() - start.getTime()) / 86_400_000);
+  if (days !== 6) {
+    throw new HttpError(
+      400,
+      'NATURAL_WEEK_REQUIRED',
+      '周统计必须覆盖且仅覆盖连续 7 天（周一至周日）',
+    );
+  }
+  return { from, to };
+}
+
+function detectNtpSync() {
+  if (ntpProbeCache && Date.now() - ntpProbeCache.checkedAtMs < 60_000) {
+    return ntpProbeCache.value;
+  }
+  let value;
+  if (process.env.NTP_STATUS) {
+    value = {
+      status: process.env.NTP_STATUS,
+      detail: process.env.NTP_STATUS_DETAIL || '由 NTP_STATUS 环境变量指定',
+      checkedAt: nowDateTime()
+    };
+  } else if (process.platform === 'win32') {
+    const result = spawnSync('w32tm', ['/query', '/status'], {
+      encoding: 'buffer',
+      timeout: 1500,
+      windowsHide: true
+    });
+    const decode = (value) => {
+      if (!value?.length) return '';
+      try {
+        return new TextDecoder('gbk').decode(value);
+      } catch {
+        return Buffer.from(value).toString('utf8');
+      }
+    };
+    const rawText = `${decode(result.stdout)}\n${decode(result.stderr)}`.trim();
+    const accessDenied = /拒绝访问|Access is denied|0x80070005/i.test(rawText);
+    const text = accessDenied
+      ? 'Windows 时间服务状态读取被系统拒绝，请由管理员检查 w32tm /query /status'
+      : rawText;
+    const localClock = /Local CMOS Clock|Free-running System Clock|本地 CMOS|自由运行/i.test(text);
+    value = {
+      status: result.status === 0 ? (localClock ? '未同步' : '已同步') : '无法探测',
+      detail: text.split(/\r?\n/).filter(Boolean).slice(0, 4).join('；')
+        || 'w32tm 未返回同步状态',
+      checkedAt: nowDateTime()
+    };
+  } else {
+    const result = spawnSync('timedatectl', ['show', '--property=NTPSynchronized', '--value'], {
+      encoding: 'utf8',
+      timeout: 1500,
+      windowsHide: true
+    });
+    const output = String(result.stdout || '').trim().toLowerCase();
+    value = {
+      status: result.status === 0 ? (output === 'yes' ? '已同步' : '未同步') : '无法探测',
+      detail: String(result.stderr || result.stdout || '').trim().slice(0, 500)
+        || 'timedatectl 未返回同步状态',
+      checkedAt: nowDateTime()
+    };
+  }
+  ntpProbeCache = { checkedAtMs: Date.now(), value };
+  return value;
 }
 
 function roleLabel(role) {
@@ -379,12 +467,27 @@ function validateDevicePayload(payload, existing = null) {
 }
 
 function nextDeviceId(db) {
-  const rows = db.prepare("SELECT id FROM devices WHERE id LIKE 'F%'").all();
+  const rule = db.prepare(`
+    SELECT value FROM dictionary_items
+    WHERE category = 'device_numbering_rule' AND status = '启用'
+    ORDER BY sort_order, id LIMIT 1
+  `).get()?.value || 'F{seq:03}';
+  const token = /^(.*?)\{seq:(\d+)\}(.*)$/.exec(rule);
+  const percent = /^(.*?)%0?(\d+)d(.*)$/.exec(rule);
+  const prefix = token?.[1] ?? percent?.[1] ?? 'F';
+  const width = Math.max(1, Number(token?.[2] || percent?.[2] || 3));
+  const suffix = token?.[3] ?? percent?.[3] ?? '';
+  const rows = db.prepare(`
+    SELECT id FROM devices WHERE id LIKE ?
+  `).all(`${prefix}%${suffix}`);
   const max = rows.reduce((value, row) => {
-    const match = /^F(\d+)$/.exec(row.id);
-    return match ? Math.max(value, Number(match[1])) : value;
+    const id = String(row.id);
+    if (!id.startsWith(prefix) || !id.endsWith(suffix)) return value;
+    const middle = id.slice(prefix.length, suffix ? -suffix.length : undefined);
+    const match = /^\d+$/.exec(middle);
+    return match ? Math.max(value, Number(middle)) : value;
   }, 0);
-  return `F${String(max + 1).padStart(3, '0')}`;
+  return `${prefix}${String(max + 1).padStart(width, '0')}${suffix}`;
 }
 
 function nextTemplateVersion(db) {
@@ -403,16 +506,9 @@ export class ApiRouter {
     this.storage = storage;
     this.queue = queue;
     this.logger = logger;
-    this.queryAuditTimes = new Map();
   }
 
-  auditQuery(actor, type, objectType, objectId, reason, throttleMs = 60_000) {
-    const key = `${actor.session.id}\u0000${type}\u0000${objectType}\u0000${objectId}`;
-    const now = Date.now();
-    const previous = this.queryAuditTimes.get(key) || 0;
-    if (now - previous < throttleMs) return;
-    if (this.queryAuditTimes.size > 2048) this.queryAuditTimes.clear();
-    this.queryAuditTimes.set(key, now);
+  auditQuery(actor, type, objectType, objectId, reason) {
     audit(this.db, actor, {
       type,
       objectType,
@@ -553,6 +649,18 @@ export class ApiRouter {
         return true;
       }
 
+      match = /^\/api\/uploads\/([^/]+)\/confirm-time$/.exec(pathname);
+      if (match && req.method === 'POST') {
+        requirePermission(actor, 'upload.own');
+        const body = await readJson(req);
+        sendJson(res, 200, await this.uploads.confirmTime(
+          actor,
+          match[1],
+          body.startedAt,
+        ));
+        return true;
+      }
+
       match = /^\/api\/uploads\/([^/]+)$/.exec(pathname);
       if (match && req.method === 'GET') {
         requirePermission(actor, 'upload.own');
@@ -611,27 +719,72 @@ export class ApiRouter {
       if (req.method === 'GET' && pathname === '/api/records') {
         requirePermission(actor, 'records.read');
         const q = queryObject(url);
-        const records = getRecords(this.db, {
-          device: q.device || undefined,
+        const requestedDevices = [
+          ...url.searchParams.getAll('devices'),
+          ...(q.device ? [q.device] : []),
+        ].flatMap((value) => String(value).split(','))
+          .map((value) => value.trim())
+          .filter(Boolean);
+        const devices = [...new Set(requestedDevices)].slice(0, 100);
+        const page = Math.max(1, Math.floor(Number(q.page || 1)) || 1);
+        const pageSize = Math.min(
+          200,
+          Math.max(1, Math.floor(Number(q.pageSize || q.limit || 50)) || 50),
+        );
+        const filters = {
+          devices: devices.length ? devices : undefined,
           inspector: q.inspector || undefined,
-          from: q.from || undefined,
-          to: q.to || undefined,
+          from: q.from ? normalizeDate(q.from, '起始日期') : undefined,
+          to: q.to ? normalizeDate(q.to, '结束日期') : undefined,
           status: q.status || undefined,
-          limit: q.limit || 1000
-        });
-        const withEvaluation = await Promise.all(records.map(async (record) => ({
-          ...record,
-          evaluation: await evaluate(record, getDevice(this.db, record.device))
-        })));
+          includeVoided: undefined
+        };
+        if (filters.from && filters.to && filters.from > filters.to) {
+          throw new HttpError(400, 'INVALID_DATE_RANGE', '起始日期不能晚于结束日期');
+        }
+        let total;
+        let pageRecords;
+        if (q.conclusion === '通过' || q.conclusion === '不通过') {
+          const candidates = getRecords(this.db, { ...filters, limit: 10000 });
+          const evaluated = await Promise.all(candidates.map(async (record) => ({
+            record,
+            evaluation: await evaluate(record, getDevice(this.db, record.device))
+          })));
+          const matched = evaluated.filter((item) => item.evaluation?.conclusion === q.conclusion);
+          total = matched.length;
+          const start = (page - 1) * pageSize;
+          pageRecords = matched.slice(start, start + pageSize).map((item) => ({
+            ...item.record,
+            evaluation: item.evaluation
+          }));
+        } else {
+          total = getRecordCount(this.db, filters);
+          const records = getRecords(this.db, {
+            ...filters,
+            limit: pageSize,
+            offset: (page - 1) * pageSize
+          });
+          pageRecords = await Promise.all(records.map(async (record) => ({
+            ...record,
+            evaluation: await evaluate(record, getDevice(this.db, record.device))
+          })));
+        }
+        const totalPages = Math.max(1, Math.ceil(total / pageSize));
         this.auditQuery(
           actor,
           '查询记录列表',
           '校验记录',
           'records',
-          `筛选条件 ${JSON.stringify(q)}；返回 ${withEvaluation.length} 条`,
+          `筛选条件 ${JSON.stringify(q)}；第 ${page}/${totalPages} 页，返回 ${pageRecords.length}/${total} 条`,
           30_000
         );
-        sendJson(res, 200, { items: withEvaluation, total: withEvaluation.length });
+        sendJson(res, 200, {
+          items: pageRecords,
+          total,
+          page,
+          pageSize,
+          totalPages
+        });
         return true;
       }
 
@@ -818,6 +971,27 @@ export class ApiRouter {
         return true;
       }
 
+      if (pathname === '/api/dictionaries') {
+        if (req.method === 'GET') {
+          sendJson(res, 200, {
+            items: getDictionaryItems(this.db, queryObject(url))
+          });
+          return true;
+        }
+        requirePermission(actor, 'masterdata.write');
+        const body = await readJson(req);
+        sendJson(res, 201, this.saveDictionaryItem(actor, body, false));
+        return true;
+      }
+
+      match = /^\/api\/dictionaries\/([^/]+)$/.exec(pathname);
+      if (match && req.method === 'PATCH') {
+        requirePermission(actor, 'masterdata.write');
+        const body = await readJson(req);
+        sendJson(res, 200, this.saveDictionaryItem(actor, body, Number(match[1])));
+        return true;
+      }
+
       if (pathname === '/api/templates') {
         if (req.method === 'GET') {
           sendJson(res, 200, {
@@ -910,6 +1084,38 @@ export class ApiRouter {
         return true;
       }
 
+      if (pathname === '/api/system/logs' && req.method === 'GET') {
+        requirePermission(actor, 'system.read');
+        if (!this.logger?.status || !this.logger?.tail || !this.logger?.exportText) {
+          throw new HttpError(501, 'APP_LOGS_UNAVAILABLE', '当前运行环境未启用应用日志服务');
+        }
+        const q = queryObject(url);
+        if (q.download === '1' || q.format === 'text') {
+          const text = this.logger.exportText();
+          const fileName = `应用日志_${nowDateTime().slice(0, 10).replaceAll('-', '')}.log`;
+          audit(this.db, actor, {
+            type: '导出',
+            objectType: '应用日志',
+            objectId: 'application',
+            after: fileName,
+            reason: '导出应用级运行日志',
+            result: '成功'
+          });
+          sendBuffer(
+            res,
+            Buffer.from(`\uFEFF${text}`, 'utf8'),
+            'text/plain; charset=utf-8',
+            fileName
+          );
+        } else {
+          sendJson(res, 200, {
+            ...this.logger.status(),
+            recent: this.logger.tail(Math.min(500, Number(q.limit || 100)))
+          });
+        }
+        return true;
+      }
+
       if (pathname === '/api/system/settings' && req.method === 'PATCH') {
         requirePermission(actor, 'system.read');
         const body = await readJson(req);
@@ -965,7 +1171,26 @@ export class ApiRouter {
   async buildState(actor) {
     const accounts = getAccounts(this.db);
     const devices = getDevices(this.db);
-    const records = getRecords(this.db, { limit: 10000 });
+    const records = getRecords(this.db, { limit: 200 });
+    const recordStatusRows = this.db.prepare(`
+      SELECT status, COUNT(*) AS count FROM records GROUP BY status
+    `).all();
+    const recordStatus = Object.fromEntries(
+      recordStatusRows.map((row) => [row.status, row.count])
+    );
+    const todayDate = nowDateTime().slice(0, 10);
+    const recordSummary = {
+      total: getRecordCount(this.db),
+      byStatus: recordStatus,
+      today: this.db.prepare('SELECT COUNT(*) AS n FROM records WHERE date = ?').get(todayDate).n,
+      ownToday: this.db.prepare(
+        'SELECT COUNT(*) AS n FROM records WHERE date = ? AND inspector_id = ?'
+      ).get(todayDate, actor.user.id).n,
+      ownPendingDrafts: this.db.prepare(`
+        SELECT COUNT(*) AS n FROM records
+        WHERE status = '待提交' AND inspector_id = ?
+      `).get(actor.user.id).n
+    };
     const tasks = getTasks(this.db, actor, actor.user.role === 'inspector' ? 'own' : 'all');
     const evaluations = {};
     await Promise.all(records.map(async (record) => {
@@ -988,10 +1213,13 @@ export class ApiRouter {
         })),
       devices,
       weightBoxes: getWeightBoxes(this.db),
+      dictionaries: getDictionaryItems(this.db),
       records: records.map((record) => ({
         ...record,
         evaluation: evaluations[record.id]
       })),
+      recordTotal: getRecordCount(this.db),
+      recordSummary,
       tasks: tasks.map(publicTask),
       evaluations,
       audit: canAudit ? getAuditLogs(this.db, { limit: 5000 }) : [],
@@ -1020,7 +1248,7 @@ export class ApiRouter {
           env: {
             timezone: 'Asia/Shanghai',
             serverTime: nowDateTime(),
-            analyzerMode: getSetting(this.db, 'analyzerMode', 'sample-manifest')
+            analyzerMode: getSetting(this.db, 'analyzerMode', 'local-display-ocr')
           }
         },
       fileRules: {
@@ -1054,7 +1282,8 @@ export class ApiRouter {
       objectId: row.object_id,
       message: row.reason
     }));
-    const analyzerMode = getSetting(this.db, 'analyzerMode', 'sample-manifest');
+    const analyzerMode = getSetting(this.db, 'analyzerMode', 'local-display-ocr');
+    const ntp = detectNtpSync();
     if (persistAudit && actor) {
       audit(this.db, actor, {
         type: '健康检查',
@@ -1087,6 +1316,7 @@ export class ApiRouter {
       queue,
       database: { status: dbOk ? '正常' : '异常', latencyMs: dbLatency },
       storage: this.storage.getStats(),
+      logs: this.logger?.status?.() || null,
       backups: getBackups(this.db).slice(0, 20),
       recentErrors,
       analyzer: getAnalyzerStatus(this.config),
@@ -1096,7 +1326,9 @@ export class ApiRouter {
         timezone: 'Asia/Shanghai',
         serverTime: nowDateTime(),
         uptimeSeconds: Math.round(process.uptime()),
-        ntp: '未探测',
+        ntp: ntp.status,
+        ntpDetail: ntp.detail,
+        ntpCheckedAt: ntp.checkedAt,
         analyzerMode,
         ffprobeConfigured: Boolean(this.config.ffprobePath),
         ffmpegConfigured: Boolean(this.config.ffmpegPath)
@@ -1565,6 +1797,99 @@ export class ApiRouter {
     return getWeightBox(this.db, id);
   }
 
+  saveDictionaryItem(actor, body, existingId = false) {
+    const before = existingId ? getDictionaryItem(this.db, existingId) : null;
+    if (existingId && !before) {
+      throw new HttpError(404, 'DICTIONARY_NOT_FOUND', '数据字典项不存在');
+    }
+    const category = String(body.category || before?.category || '');
+    const labels = {
+      department: '科室',
+      internal_cal: '内部校正方式',
+      device_numbering_rule: '天平编号规则'
+    };
+    if (!labels[category]) {
+      throw new HttpError(400, 'INVALID_DICTIONARY_CATEGORY', '数据字典类别无效');
+    }
+    const value = requireString(body.value ?? before?.value, '字典值', 100);
+    const label = optionalString(body.label ?? before?.label ?? value, '显示名称', 100) || value;
+    const status = body.status === '停用' ? '停用' : '启用';
+    const sortOrder = Number(body.sortOrder ?? before?.sortOrder ?? 100);
+    if (!Number.isSafeInteger(sortOrder) || sortOrder < -10000 || sortOrder > 10000) {
+      throw new HttpError(400, 'INVALID_SORT_ORDER', '排序值必须是 -10000 至 10000 的整数');
+    }
+    if (category === 'device_numbering_rule'
+      && !/\{seq:\d+\}/.test(value)
+      && !/%0?\d+d/.test(value)) {
+      throw new HttpError(
+        400,
+        'INVALID_DEVICE_NUMBER_RULE',
+        '天平编号规则必须包含 {seq:03} 或 %03d 形式的流水号占位符',
+      );
+    }
+    const duplicate = this.db.prepare(`
+      SELECT id FROM dictionary_items
+      WHERE category = ? AND value = ? AND id <> ?
+    `).get(category, value, before?.id || 0);
+    if (duplicate) {
+      throw new HttpError(409, 'DUPLICATE_DICTIONARY_ITEM', '同类别下已存在相同字典值');
+    }
+    const time = nowDateTime();
+    let id = before?.id;
+    withTransaction(this.db, () => {
+      if (before) {
+        this.db.prepare(`
+          UPDATE dictionary_items
+          SET category = ?, value = ?, label = ?, status = ?, sort_order = ?,
+              remark = ?, updated_at = ?
+          WHERE id = ?
+        `).run(
+          category,
+          value,
+          label,
+          status,
+          sortOrder,
+          optionalString(body.remark ?? before.remark, '备注', 1000),
+          time,
+          before.id,
+        );
+      } else {
+        const result = this.db.prepare(`
+          INSERT INTO dictionary_items (
+            category, value, label, status, sort_order, remark, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          category,
+          value,
+          label,
+          status,
+          sortOrder,
+          optionalString(body.remark, '备注', 1000),
+          time,
+          time,
+        );
+        id = Number(result.lastInsertRowid);
+      }
+      if (category === 'device_numbering_rule' && status === '启用') {
+        this.db.prepare(`
+          UPDATE dictionary_items SET status = '停用', updated_at = ?
+          WHERE category = 'device_numbering_rule' AND id <> ? AND status = '启用'
+        `).run(time, id);
+      }
+      const after = getDictionaryItem(this.db, id);
+      audit(this.db, actor, {
+        type: '基础数据字典变更',
+        objectType: labels[category],
+        objectId: String(id),
+        before: before ? jsonString(before) : '',
+        after: jsonString(after),
+        reason: before ? '修改数据字典项' : '新增数据字典项',
+        result: '成功'
+      });
+    });
+    return getDictionaryItem(this.db, id);
+  }
+
   saveTemplate(actor, body) {
     const current = getTemplate(this.db);
     const reset = body.reset === true;
@@ -1583,6 +1908,17 @@ export class ApiRouter {
     }
     config.tol = tol;
     config.printTime = config.printTime !== false;
+    config.useTemplatePoints = config.useTemplatePoints === true;
+    if (!Array.isArray(config.points) || config.points.length !== 3) {
+      throw new HttpError(400, 'INVALID_TEMPLATE_POINTS', '模板标称点必须包含 L1、L2、L3 三个值');
+    }
+    config.points = config.points.map((value, index) => {
+      const point = Number(value);
+      if (!Number.isFinite(point) || point <= 0 || point > 100000) {
+        throw new HttpError(400, 'INVALID_TEMPLATE_POINTS', `L${index + 1} 标称点必须为大于 0 的数值`);
+      }
+      return point;
+    });
     config.footerNote = String(config.footerNote || '').slice(0, 2000);
     config.footerExtra = String(config.footerExtra || '').slice(0, 4000);
     if (!Array.isArray(config.fields) || !config.fields.length) {
@@ -1601,9 +1937,27 @@ export class ApiRouter {
         type: '模板参数变更',
         objectType: '记录模板',
         objectId: version,
-        before: current?.version || '',
-        after: version,
-        reason: `${summary}；仅对新生成记录生效`,
+        before: jsonString(current ? {
+          version: current.version,
+          tol: current.tol,
+          printTime: current.printTime,
+          footerNote: current.footerNote,
+          footerExtra: current.footerExtra,
+          fields: current.fields,
+          points: current.points,
+          useTemplatePoints: current.useTemplatePoints
+        } : null),
+        after: jsonString({
+          version,
+          tol: config.tol,
+          printTime: config.printTime,
+          footerNote: config.footerNote,
+          footerExtra: config.footerExtra,
+          fields: config.fields,
+          points: config.points,
+          useTemplatePoints: config.useTemplatePoints
+        }),
+        reason: `${summary}；已记录配置前后差异，仅对新生成记录生效`,
         result: '成功'
       });
     });
@@ -1768,6 +2122,9 @@ export class ApiRouter {
       }
       setSetting(this.db, key, value, actor.user.id);
     }
+    if (body.logRetentionDays !== undefined && this.logger?.cleanup) {
+      this.logger.cleanup(Number(body.logRetentionDays));
+    }
     audit(this.db, actor, {
       type: '系统配置变更',
       objectType: '系统',
@@ -1829,7 +2186,7 @@ export class ApiRouter {
     }
 
     if (pathname === '/api/exports/records') {
-      const devices = Array.isArray(body.devices) ? body.devices.map(String) : [];
+      const devices = stringList(body.devices);
       const from = normalizeDate(body.from, '起始日期');
       const to = normalizeDate(body.to, '结束日期');
       if (from > to) throw new HttpError(400, 'INVALID_DATE_RANGE', '起始日期不能晚于结束日期');
@@ -1864,16 +2221,42 @@ export class ApiRouter {
           ? record.templateSnapshot
           : getTemplate(this.db, record.templateVersion)
       }));
-      const fileName = `天平校验记录_${devices.join('-')}_${from.replaceAll('-', '')}-${to.replaceAll('-', '')}.pdf`;
-      const buffer = await exporter.generateBatchPdf(exportItems, {
+      const exportOptions = {
         devices: [...deviceMap.values()],
         exportedAt: new Date(),
         generatedBy: actor.user.name,
         inspectorNames,
         verifierNames: inspectorNames
-      });
+      };
+      const splitFiles = body.mode === 'per-device-day'
+        || body.mode === 'split'
+        || body.fileMode === 'per-device-day';
+      let fileName;
+      let outputBuffer;
+      let contentType = 'application/pdf';
+      if (splitFiles) {
+        const groups = new Map();
+        for (const item of exportItems) {
+          const key = `${item.record.device}/${item.record.date}`;
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(item);
+        }
+        const files = [...groups.values()].map((items) => {
+          const record = items[0].record;
+          return {
+            name: `天平校验记录_${record.device}_${record.date.replaceAll('-', '')}.pdf`,
+            data: exporter.generateBatchPdf(items, exportOptions)
+          };
+        });
+        outputBuffer = exporter.generateZip(files);
+        fileName = `天平校验记录分文件_${from.replaceAll('-', '')}-${to.replaceAll('-', '')}.zip`;
+        contentType = 'application/zip';
+      } else {
+        fileName = `天平校验记录_${devices.join('-')}_${from.replaceAll('-', '')}-${to.replaceAll('-', '')}.pdf`;
+        outputBuffer = await exporter.generateBatchPdf(exportItems, exportOptions);
+      }
       this.storage.recordExport(actor, {
-        type: '批量 PDF',
+        type: splitFiles ? '批量 PDF（逐台每日分文件）' : '批量 PDF（合并）',
         scope: `${devices.join('、')} / ${from} ~ ${to}`,
         count: records.length,
         fileName,
@@ -1884,10 +2267,10 @@ export class ApiRouter {
         objectType: '校验记录',
         objectId: devices.join(','),
         after: `${fileName}，${records.length} 条`,
-        reason: `批量 PDF；日期 ${from} ~ ${to}`,
+        reason: `批量 PDF；模式 ${splitFiles ? '逐台每日分文件' : '合并文件'}；日期 ${from} ~ ${to}`,
         result: '成功'
       });
-      sendBuffer(res, Buffer.from(buffer), 'application/pdf', fileName);
+      sendBuffer(res, Buffer.from(outputBuffer), contentType, fileName);
       return;
     }
 
@@ -1896,6 +2279,7 @@ export class ApiRouter {
       if (!device) throw new HttpError(404, 'DEVICE_NOT_FOUND', '天平档案不存在');
       const from = normalizeDate(body.from, '起始日期');
       const to = normalizeDate(body.to, '结束日期');
+      requireNaturalWeek(from, to);
       const records = getRecords(this.db, { device: device.id, from, to })
         .filter((record) => record.status === '已复核确认');
       if (!records.length) throw new HttpError(404, 'NO_EXPORT_RECORDS', '该日期段没有已复核确认记录');
@@ -1932,21 +2316,34 @@ export class ApiRouter {
       let headers;
       let rows;
       if (type === 'readouts') {
-        headers = ['记录编号', '校验日期', '天平编号', '砝码盒编号', '读数编号', '标称值(g)', '示值(g)', '时间', '是否在限内', '判定结论'];
-        const records = getRecords(this.db, {
+        headers = ['记录编号', '校验日期', '天平编号', '天平唯一号', '砝码盒编号', '检验人员', '复核确认人', '复核时间', '读数编号', '标称值(g)', '示值(g)', '时间', '是否在限内', '判定结论'];
+        const candidates = getRecords(this.db, {
           from: body.from,
           to: body.to,
-          devices: body.devices,
+          devices: stringList(body.devices),
+          inspector: body.inspector,
+          status: body.status,
           includeVoided: false
         });
+        const records = [];
+        for (const record of candidates) {
+          const evaluation = await evaluate(record, getDevice(this.db, record.device));
+          if (!body.conclusion || evaluation?.conclusion === body.conclusion) {
+            records.push({ record, evaluation });
+          }
+        }
         rows = [];
-        for (const record of records) {
+        for (const { record, evaluation } of records) {
           const device = getDevice(this.db, record.device);
-          const evaluation = await evaluate(record, device);
           for (const item of evaluation.items) {
             rows.push([
-              record.id, record.date, record.device, record.box, item.key,
-              item.L, item.value, item.time, item.inLimit ? '是' : '否',
+              record.id, record.date, record.device,
+              record.deviceSnapshot?.uniqueNo || device?.uniqueNo || '',
+              record.box,
+              getAccount(this.db, record.inspector)?.name || record.inspector,
+              getAccount(this.db, record.verifiedBy)?.name || record.verifiedBy || '',
+              record.verifiedAt || '',
+              item.key, item.L, item.value, item.time, item.inLimit ? '是' : '否',
               evaluation.conclusion
             ]);
           }
@@ -1958,19 +2355,27 @@ export class ApiRouter {
           device.ranges, ...device.points, device.status, device.remark
         ]);
       } else {
-        headers = ['记录编号', '校验日期', '天平编号', '砝码盒编号', '检验人员', '判定结论', '复核状态', '提交时间', '复核时间'];
+        headers = ['记录编号', '校验日期', '天平编号', '天平唯一号', '砝码盒编号', '检验人员', '判定结论', '复核状态', '提交时间', '复核确认人', '复核时间', '备注'];
         const records = getRecords(this.db, {
           from: body.from,
           to: body.to,
-          devices: body.devices
+          devices: stringList(body.devices),
+          inspector: body.inspector,
+          status: body.status
         });
         rows = [];
         for (const record of records) {
-          const evaluation = await evaluate(record, getDevice(this.db, record.device));
+          const device = getDevice(this.db, record.device);
+          const evaluation = await evaluate(record, device);
+          if (body.conclusion && evaluation?.conclusion !== body.conclusion) continue;
           rows.push([
-            record.id, record.date, record.device, record.box,
+            record.id, record.date, record.device,
+            record.deviceSnapshot?.uniqueNo || device?.uniqueNo || '',
+            record.box,
             getAccount(this.db, record.inspector)?.name || record.inspector,
-            evaluation.conclusion, record.status, record.submittedAt, record.verifiedAt
+            evaluation.conclusion, record.status, record.submittedAt,
+            getAccount(this.db, record.verifiedBy)?.name || record.verifiedBy || '',
+            record.verifiedAt, record.remark || ''
           ]);
         }
       }
