@@ -70,6 +70,7 @@ export function loadConfig(overrides = {}) {
     trustProxy: overrides.trustProxy ?? process.env.TRUST_PROXY ?? '',
     ffprobePath: overrides.ffprobePath || process.env.FFPROBE_PATH || 'ffprobe',
     ffmpegPath: overrides.ffmpegPath || process.env.FFMPEG_PATH || 'ffmpeg',
+    pdftoppmPath: overrides.pdftoppmPath || process.env.PDFTOPPM_PATH || 'pdftoppm',
     displayRegion: overrides.displayRegion
       || envDisplayRegion(process.env.DISPLAY_REGION),
     workerIntervalMs: Number(
@@ -205,7 +206,7 @@ function serveStatic(req, res, publicDir, pathname) {
     res.end();
     return true;
   }
-  const cache = target.endsWith('index.html')
+  const cache = target.endsWith('index.html') || /\.(?:js|css)$/i.test(target)
     ? 'no-cache'
     : 'public, max-age=300, must-revalidate';
   res.writeHead(200, {

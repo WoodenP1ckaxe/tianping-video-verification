@@ -1156,6 +1156,140 @@ export function generateWeekPdf(recordsOrOptions, devices = [], options = {}) {
 }
 
 /**
+ * 生成可直接打印的空白校验记录表。空白表不包含二维码或人员/设备清单，
+ * 避免操作人员把辅助卡片当作正式表格内容。
+ */
+export function generateBlankFormPdf(options = {}) {
+  const document = new PdfDocument({
+    title: '电子天平日常校验空白记录',
+    createdAt: options.exportedAt || options.generatedAt || new Date(),
+  });
+  document.addPage(A4_PORTRAIT.width, A4_PORTRAIT.height);
+  const page = document.currentPage;
+  const margin = 42;
+  const width = page.width - margin * 2;
+  drawTitle(document, '电子天平日常校验记录表', '空白记录表 · 打印后填写并随电子记录留档');
+  let top = 94;
+  const labelWidth = 82;
+  const valueWidth = (width - labelWidth * 3) / 3;
+  const metaRows = [
+    [
+      ['科室', ''],
+      ['天平编号', ''],
+      ['天平唯一号', ''],
+    ],
+    [
+      ['Max(g)', ''],
+      ['d(mg)', ''],
+      ['内部校正方式', '□自动  □手动  □NA'],
+    ],
+    [
+      ['校验日期', ''],
+      ['砝码盒编号', ''],
+      ['模板版本', options.templateVersion || 'v1'],
+    ],
+    [
+      ['清洁', '□是  □否  □NA'],
+      ['水平调节', '□是  □否  □NA'],
+      ['内部校正通过', '□是  □否  □NA'],
+    ],
+  ];
+  for (const row of metaRows) {
+    row.forEach(([label, value], index) => {
+      drawCellText(document, margin + index * (labelWidth + valueWidth), top, labelWidth, 27, label, {
+        size: 7.7,
+        align: 'center',
+        fill: [0.94, 0.96, 0.97],
+      });
+      drawCellText(
+        document,
+        margin + index * (labelWidth + valueWidth) + labelWidth,
+        top,
+        valueWidth,
+        27,
+        value,
+        { size: 8.2, align: 'center' },
+      );
+    });
+    top += 27;
+  }
+  drawCellText(document, margin, top, labelWidth, 42, '备注', {
+    size: 7.7,
+    align: 'center',
+    fill: [0.94, 0.96, 0.97],
+  });
+  drawCellText(document, margin + labelWidth, top, width - labelWidth, 42, '', {
+    size: 8,
+  });
+  top += 42;
+
+  const columns = [
+    ['标称点', 60],
+    ['标称值 L(g)', 62],
+    ['限度区间(g)', 112],
+    ['第 1 次 I(g)', 72],
+    ['第 2 次 I(g)', 72],
+    ['第 3 次 I(g)', 72],
+    ['测量时间', 70],
+  ];
+  const totalColumnWidth = columns.reduce((sum, [, columnWidth]) => sum + columnWidth, 0);
+  const scale = width / totalColumnWidth;
+  columns.forEach(([label, columnWidth], index) => {
+    const x = margin + columns.slice(0, index).reduce((sum, [, value]) => sum + value * scale, 0);
+    drawCellText(document, x, top, columnWidth * scale, 30, label, {
+      size: 7.5,
+      align: 'center',
+      fill: [0.9, 0.94, 0.98],
+    });
+  });
+  top += 30;
+  for (let point = 0; point < 3; point += 1) {
+    columns.forEach(([, columnWidth], index) => {
+      const x = margin + columns.slice(0, index).reduce((sum, [, value]) => sum + value * scale, 0);
+      const text = index === 0 ? `L${point + 1}` : '';
+      drawCellText(document, x, top, columnWidth * scale, 54, text, {
+        size: 8,
+        align: 'center',
+        fill: index === 0 ? [0.96, 0.97, 0.98] : [1, 1, 1],
+      });
+    });
+    top += 54;
+  }
+
+  top += 14;
+  const signatureBlockWidth = width / 2;
+  drawCellText(document, margin, top, labelWidth, 54, '校验人员签名\n/ 日期', {
+    size: 7.8,
+    align: 'center',
+    fill: [0.94, 0.96, 0.97],
+  });
+  drawCellText(document, margin + labelWidth, top, signatureBlockWidth - labelWidth, 54, '', {
+    size: 8,
+  });
+  drawCellText(document, margin + signatureBlockWidth, top, labelWidth, 54, '复核确认人签名\n/ 日期', {
+    size: 7.8,
+    align: 'center',
+    fill: [0.94, 0.96, 0.97],
+  });
+  drawCellText(
+    document,
+    margin + signatureBlockWidth + labelWidth,
+    top,
+    signatureBlockWidth - labelWidth,
+    54,
+    '',
+    { size: 8 },
+  );
+  top += 65;
+
+  document.text(margin, page.height - top, '说明：九次称量应完整填写；判定和电子签名以系统记录为准。', {
+    size: 8,
+    color: [0.36, 0.42, 0.46],
+  });
+  return document.finish();
+}
+
+/**
  * 生成面向最终用户的标准操作流程 PDF。内容使用简短步骤和角色清单，
  * 避免操作人员必须阅读技术架构文档。
  */
@@ -1317,7 +1451,7 @@ export function generateSopPdf(options = {}) {
   bullet('核对视频、九次识别帧、限值、偏差、判定原因和修改前后值。');
   bullet('确认即电子签名并锁定记录；退回时必须写明需要修改的内容。');
   bullet('维护天平、砝码盒和记录模板。模板修改只影响之后新建的记录。');
-  bullet('在“二维码”页面按天平编号或唯一号查询，并导出设备身份卡。');
+  bullet('复核角色没有个人二维码；设备卡仍可按天平编号查询和补打。');
   heading('系统管理员', 1);
   bullet('管理账号、角色、天平档案、模板、分析队列、备份、容量和审计日志。');
   bullet('在运行状态页按“每台在用天平每天 1 次记录”查看容量和预计存储时长。');
@@ -1326,7 +1460,7 @@ export function generateSopPdf(options = {}) {
 
   layout = startPage('二维码、统计与问题处理');
   heading('二维码使用要求', 1);
-  bullet('人员卡：进入“二维码”，下载本人 SVG 或 PNG 卡片并打印。编号使用大号字体，说明文字简短清晰。');
+  bullet('人员卡：仅检验人员进入“二维码”，下载本人 SVG 或 PNG 卡片并打印。复核确认人员没有个人二维码。');
   bullet('设备卡：由检验人员查询后导出，贴在天平正面或侧面。设备卡可以长期出现在视频中。');
   bullet('人员卡与设备卡同屏是允许的。分析器支持同帧多二维码检测，并会跨多个抽样帧合并身份。');
   bullet('避免反光、折痕和遮挡；二维码本体建议不小于 40 mm × 40 mm，纠错等级为 H。');
@@ -1488,6 +1622,7 @@ export function getPdfExportStatus() {
 export const exportRecordPdf = generateRecordPdf;
 export const exportBatchPdf = generateBatchPdf;
 export const exportWeekPdf = generateWeekPdf;
+export const exportBlankFormPdf = generateBlankFormPdf;
 export const exportSopPdf = generateSopPdf;
 export const exportCsv = generateCsv;
 
@@ -1495,6 +1630,7 @@ export default {
   generateRecordPdf,
   generateBatchPdf,
   generateWeekPdf,
+  generateBlankFormPdf,
   generateSopPdf,
   generateCsv,
   generateRecordsCsv,

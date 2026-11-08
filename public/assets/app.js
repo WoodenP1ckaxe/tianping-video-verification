@@ -74,6 +74,7 @@ const state = {
     sidebarOpen: false,
     masterTab: 'devices',
     qrDevice: '',
+    deviceDirectoryQuery: '',
     recordPage: 1,
     auditPage: 1
   },
@@ -484,12 +485,6 @@ function renderLogin(message = '') {
   state.data = null;
   state.session = null;
   state.csrfToken = '';
-  const accounts = [
-    ['U000', '系统管理员', 'admin'],
-    ['U001', '李一', 'inspector'],
-    ['U002', '李二', 'inspector'],
-    ['U003', '齐一', 'verifier']
-  ];
   root.innerHTML = `
     <main class="login-page">
       <section class="login-visual">
@@ -500,24 +495,18 @@ function renderLogin(message = '') {
         <h1>以视频为证，让每一次<br><em>外部校验</em>都可追溯。</h1>
         <p>固定支架视频自动进入串行分析队列，提取人员卡、设备卡与九次称量示值；
           判定、电子确认、复核签名与 PDF 留档形成完整证据链。</p>
-        <div class="feature-grid">
-          <div class="feature"><b>01 · 本地离线</b><span>数据不出内网，不依赖在线识别或云存储。</span></div>
-          <div class="feature"><b>02 · 可复算判定</b><span>按容差系数、精度分度与九次读数唯一复算。</span></div>
-          <div class="feature"><b>03 · 全程留痕</b><span>修改前后值、操作者、时间、理由与来源终端完整记录。</span></div>
-        </div>
       </section>
       <section class="login-panel">
-        <h2>登录工作台</h2>
-        <p>使用账号与口令登录。初始账号首次登录后必须改密。</p>
+        <h2>账号登录</h2>
         ${message ? `<div class="alert danger">${esc(message)}</div>` : ''}
         <form class="mt16" data-form="login">
           <div class="field">
-            <label for="login-account" class="required">账号编号</label>
-            <input id="login-account" name="account" autocomplete="username" required maxlength="20" placeholder="例如 U001" value="${attr(lastLoginAccount)}">
+            <label for="login-account" class="required">账号</label>
+            <input id="login-account" name="account" autocomplete="username" required maxlength="20" placeholder="请输入账号" value="${attr(lastLoginAccount)}">
           </div>
           <div class="field mt12">
             <label for="login-password" class="required">口令</label>
-            <input id="login-password" name="password" type="password" autocomplete="current-password" required placeholder="请输入登录口令">
+            <input id="login-password" name="password" type="password" autocomplete="current-password" required placeholder="请输入口令">
           </div>
           <div class="captcha-block mt12 ${loginCaptcha ? '' : 'hidden'}" id="login-captcha-block">
             <label for="login-captcha" class="required">登录验证码</label>
@@ -531,16 +520,6 @@ function renderLogin(message = '') {
           </div>
           <button class="btn btn-primary btn-lg btn-block mt16" type="submit" data-submit-label>安全登录</button>
         </form>
-        <div class="login-divider">演示账号快捷填入</div>
-        <div class="account-cards">
-          ${accounts.map(([id, name, role]) => `
-            <button type="button" class="account-card" data-action="fill-account" data-account="${id}">
-              <span class="account-avatar">${esc(name.slice(0, 1))}</span>
-              <span><strong>${esc(name)} · ${esc(id)}</strong><span>${esc(roleLabel(role))}</span></span>
-              ${tag(roleLabel(role), role === 'admin' ? 'gray' : role === 'verifier' ? 'violet' : 'blue')}
-            </button>`).join('')}
-        </div>
-        <p class="account-note mt16">初始口令由部署人员提供。非容器方式全新安装时，可读取数据目录下受保护的 <code>initial-password.txt</code>；首次登录会强制设置至少 8 位、同时含字母和数字的新口令。口令错误可无限次重试，连续错误 5 次后每次需输入验证码。</p>
       </section>
     </main>`;
 }
@@ -590,7 +569,6 @@ function navigationItems() {
       items: [
         { path: '/dashboard', label: '工作台', icon: 'dashboard' },
         { path: '/records', label: '校验记录', icon: 'records' },
-        { path: '/qr', label: '二维码', icon: 'qr' },
         { path: '/help', label: '操作流程', icon: 'help' },
         { path: '/export', label: '导出与打印', icon: 'download' }
       ]
@@ -600,7 +578,9 @@ function navigationItems() {
     groups[0].items.splice(1, 0,
       { path: '/upload', label: '上传校验视频', icon: 'upload' },
       { path: '/tasks', label: '我的分析任务', icon: 'tasks', badge: queueCount || null },
-      { path: '/records', href: '/records?draft=1', label: '记录核对', icon: 'check', badge: myDrafts || null }
+      { path: '/records', href: '/records?draft=1', label: '记录核对', icon: 'check', badge: myDrafts || null },
+      { path: '/devices', label: '天平档案', icon: 'database' },
+      { path: '/qr', label: '二维码', icon: 'qr' }
     );
     groups[0].items = groups[0].items.filter((item, index, list) => (
       item.label !== '校验记录' || index === list.findIndex((candidate) => candidate.label === '记录核对')
@@ -609,7 +589,8 @@ function navigationItems() {
     groups[0].items.splice(1, 0,
       { path: '/verify', label: '待复核', icon: 'check', badge: pendingVerify || null },
       { path: '/masterdata', label: '天平与砝码盒', icon: 'database' },
-      { path: '/template', label: '记录模板', icon: 'template' }
+      { path: '/template', label: '记录模板', icon: 'template' },
+      { path: '/qr', label: '设备二维码', icon: 'qr' }
     );
   } else if (isRole('admin')) {
     groups[0].items.splice(1, 0, { path: '/tasks', label: '分析队列', icon: 'tasks', badge: queueCount || null });
@@ -1602,6 +1583,80 @@ function pageVerify() {
     </div>`;
 }
 
+function pageDeviceDirectory() {
+  const queryText = String(state.ui.deviceDirectoryQuery || '').trim().toUpperCase();
+  const allDevices = state.data.devices || [];
+  const devices = allDevices.filter((device) => !queryText || [
+    device.id,
+    device.uniqueNo,
+    device.dept,
+    device.defaultBox,
+    ...(device.points || [])
+  ].some((value) => String(value || '').toUpperCase().includes(queryText)));
+  const activeCount = allDevices.filter((device) => device.status === '在用').length;
+  const latestRecord = (deviceId) => (state.data.records || [])
+    .filter((record) => record.device === deviceId)
+    .sort((left, right) => String(right.startTime || right.date).localeCompare(String(left.startTime || left.date)))[0];
+  return `${pageHeader(
+    '天平档案',
+    '只读查询设备编号、量程、参考点、容差和最近校验记录。',
+    ''
+  )}
+    <div class="grid grid-4">
+      ${[
+        ['档案总数', allDevices.length, '已登记天平'],
+        ['在用设备', activeCount, '可用于新校验'],
+        ['停用设备', allDevices.length - activeCount, '仅供历史查询'],
+        ['查询结果', devices.length, queryText ? `关键词：${queryText}` : '当前显示全部']
+      ].map(([label, value, note]) => `<article class="card stat-card teal">
+        <div class="stat-label">${esc(label)}</div>
+        <div class="stat-value">${Number(value)}</div>
+        <div class="stat-note">${esc(note)}</div>
+      </article>`).join('')}
+    </div>
+    <form class="card filterbar mt16" data-form="device-directory-search">
+      <div class="field grow"><label for="device-directory-query">天平编号 / 唯一号 / 科室</label>
+        <input id="device-directory-query" name="query" value="${attr(state.ui.deviceDirectoryQuery)}" placeholder="输入编号、唯一号或科室进行查询">
+      </div>
+      <button class="btn btn-primary" type="submit">${icon('eye')}查询</button>
+      <button class="btn btn-secondary" type="button" data-action="device-directory-reset">清除</button>
+    </form>
+    <section class="card mt16">
+      <div class="card-head"><div><h2>设备列表</h2><p>检验人员可查看档案并进入历史曲线或设备二维码</p></div>${tag(`${devices.length} 台`, 'blue')}</div>
+      <div class="table-wrap desktop-table"><table>
+        <thead><tr><th>天平编号</th><th>唯一号 / 科室</th><th>量程与分度值</th><th>参考点</th><th>容差</th><th>默认砝码盒</th><th>最近校验</th><th>状态</th><th class="col-actions">操作</th></tr></thead>
+        <tbody>${devices.map((device) => {
+          const latest = latestRecord(device.id);
+          return `<tr class="${device.status === '停用' ? 'row-muted' : ''}">
+            <td><b class="mono">${esc(device.id)}</b><div class="muted small">${esc(device.qrContent)}</div></td>
+            <td>${esc(device.uniqueNo)}<div class="muted small">${esc(device.dept)}</div></td>
+            <td>${device.ranges === 2
+              ? `${esc(device.range1.max)}g / ${esc(device.range1.d)}mg<br><span class="muted small">${esc(device.range2.max)}g / ${esc(device.range2.d)}mg</span>`
+              : `${esc(device.range1.max)}g / ${esc(device.range1.d)}mg`}</td>
+            <td class="num">${(device.points || []).map((point) => `${esc(point)}g`).join(' / ')}</td>
+            <td class="num">±${esc(device.tol)}%</td>
+            <td class="mono">${esc(device.defaultBox || '—')}</td>
+            <td>${latest ? `${esc(latest.date)}<div class="muted small">${esc(latest.status)} · ${esc(latest.id)}</div>` : '<span class="muted">暂无记录</span>'}</td>
+            <td>${tag(device.status)}</td>
+            <td class="col-actions"><div class="btn-group">
+              <a class="btn btn-ghost btn-sm" href="#/history/${encodeURIComponent(device.id)}">历史曲线</a>
+              ${device.status === '在用' ? `<a class="btn btn-ghost btn-sm" href="#/qr?device=${encodeURIComponent(device.id)}">设备二维码</a>` : '<span class="muted small">停用设备不生成新卡</span>'}
+            </div></td>
+          </tr>`;
+        }).join('') || '<tr><td colspan="9"><div class="empty">没有符合查询条件的天平档案</div></td></tr>'}</tbody>
+      </table></div>
+      <div class="card-list">${devices.map((device) => {
+        const latest = latestRecord(device.id);
+        return `<article class="info-card">
+          <div class="row between"><strong>${esc(device.id)} · ${esc(device.dept)}</strong>${tag(device.status)}</div>
+          <p>${esc(device.uniqueNo)} · ${esc(device.points?.join(' / ') || '')}g · 容差 ±${esc(device.tol)}%</p>
+          <p>默认砝码盒：${esc(device.defaultBox || '—')} · 最近校验：${latest ? `${esc(latest.date)} ${esc(latest.status)}` : '暂无'}</p>
+          <div class="btn-group mt8"><a class="btn btn-ghost btn-sm" href="#/history/${encodeURIComponent(device.id)}">历史曲线</a>${device.status === '在用' ? `<a class="btn btn-ghost btn-sm" href="#/qr?device=${encodeURIComponent(device.id)}">设备二维码</a>` : '<span class="muted small">停用设备不生成新卡</span>'}</div>
+        </article>`;
+      }).join('') || '<div class="empty">没有符合查询条件的天平档案</div>'}</div>
+    </section>`;
+}
+
 function pageMasterData() {
   const devices = state.data.devices;
   const boxes = state.data.weightBoxes;
@@ -1627,6 +1682,7 @@ function pageMasterData() {
           <td>${tag(device.status)}</td>
           <td class="col-actions"><div class="btn-group">
             ${write ? `<button class="btn btn-ghost btn-sm" data-action="device-edit" data-id="${attr(device.id)}">编辑</button>` : ''}
+            ${isRole('admin') ? `<button class="btn btn-ghost btn-sm" data-action="qr-download-device" data-id="${attr(device.id)}">设备二维码</button>` : ''}
             <a class="btn btn-ghost btn-sm" href="#/history/${encodeURIComponent(device.id)}">历史</a>
           </div></td>
         </tr>`).join('')}</tbody>
@@ -1635,7 +1691,7 @@ function pageMasterData() {
       <div class="info-card">
         <div class="row between"><strong>${esc(device.id)} · ${esc(device.dept)}</strong>${tag(device.status)}</div>
         <p>${esc(device.uniqueNo)} · ${device.ranges === 2 ? '双量程' : '单量程'} · ${esc(device.points.join(' / '))}g</p>
-        <div class="btn-group mt8"><a class="btn btn-ghost btn-sm" href="#/history/${encodeURIComponent(device.id)}">历史</a>${write ? `<button class="btn btn-ghost btn-sm" data-action="device-edit" data-id="${attr(device.id)}">编辑</button>` : ''}</div>
+        <div class="btn-group mt8"><a class="btn btn-ghost btn-sm" href="#/history/${encodeURIComponent(device.id)}">历史</a>${write ? `<button class="btn btn-ghost btn-sm" data-action="device-edit" data-id="${attr(device.id)}">编辑</button>` : ''}${isRole('admin') ? `<button class="btn btn-ghost btn-sm" data-action="qr-download-device" data-id="${attr(device.id)}">设备二维码</button>` : ''}</div>
       </div>`).join('')}</div>`;
   const boxesContent = `
     <div class="cards-grid">
@@ -1788,10 +1844,10 @@ function pageExport() {
           ${devices.filter((device) => device.status === '在用').map((device) => `<option value="${attr(device.id)}">${esc(device.id)} · ${esc(device.uniqueNo)}</option>`).join('')}
         </select></div>
         <div class="field mt12"><label>校验周</label><input type="week" name="week" value="${attr(week.week)}" required>
-          <p class="muted small mt8">当前：${esc(week.from)} 至 ${esc(week.to)}（周一至周日）</p>
+          <p class="muted small mt8" data-week-range>当前：${esc(week.from)} 至 ${esc(week.to)}（周一至周日）</p>
         </div>
         <button class="btn btn-primary btn-block mt16" type="submit">${icon('printer')}生成周统计 PDF</button>
-        <a class="btn btn-secondary btn-block mt8" href="#/print/week?week=${attr(week.week)}">在浏览器中预览</a>
+        <button class="btn btn-secondary btn-block mt8" type="button" data-action="preview-week">${icon('eye')}预览选中的周</button>
       </form>
     </div>
     <section class="card mt16">
@@ -1809,9 +1865,9 @@ function pageExport() {
       </div>`).join('') || '<div class="empty">暂无导出历史</div>'}</div>
     </section>
     <section class="card mt16">
-      <div class="card-head"><div><h2>二维码与空白表</h2><p>人员下载本人卡片；检验人员查询并导出天平设备卡</p></div></div>
+      <div class="card-head"><div><h2>${isRole('inspector') ? '二维码与空白表' : isRole('verifier') ? '设备二维码与空白表' : '空白记录表'}</h2><p>${isRole('inspector') ? '下载本人卡片；按天平编号或唯一号查询设备卡' : isRole('verifier') ? '按天平编号或唯一号查询并打印设备卡' : '空白表预览与下载使用同一份 PDF'}</p></div></div>
       <div class="row row-wrap mt12">
-        <a class="btn btn-primary" href="#/qr">${icon('qr')}打开二维码中心</a>
+        ${isRole('inspector') || isRole('verifier') ? `<a class="btn btn-primary" href="#/qr">${icon('qr')}${isRole('inspector') ? '打开二维码中心' : '查询设备二维码'}</a>` : ''}
         <a class="btn btn-secondary" href="#/print/blank">${icon('printer')}打印空白记录表</a>
       </div>
     </section>`;
@@ -1819,16 +1875,22 @@ function pageExport() {
 
 function pageQr() {
   const user = state.data.user;
+  const showPersonalQr = isRole('inspector');
   const devices = state.data.devices.filter((device) => device.status === '在用');
-  const selectedId = devices.some((device) => device.id === state.ui.qrDevice)
-    ? state.ui.qrDevice
-    : devices[0]?.id;
+  const requestedDevice = parseRoute().query.get('device') || '';
+  const selectedId = devices.some((device) => device.id === requestedDevice)
+    ? requestedDevice
+    : devices.some((device) => device.id === state.ui.qrDevice)
+      ? state.ui.qrDevice
+      : devices[0]?.id;
   const device = devices.find((item) => item.id === selectedId) || null;
-  return `${pageHeader('二维码中心', '人员导出本人身份卡；检验人员按编号查询并导出天平设备卡。',
+  return `${pageHeader(
+    showPersonalQr ? '二维码中心' : '设备二维码',
+    showPersonalQr ? '检验人员导出本人身份卡，并按编号查询天平设备卡。' : '按天平编号或唯一号查询并打印设备二维码。',
     `<a class="btn btn-secondary" href="#/help">${icon('help')}查看操作流程</a>`)}
-    <div class="alert">二维码内容只包含人员账号或天平编号，不包含姓名、口令等敏感信息。卡片使用 H 级纠错，编号采用大号字体，便于长期张贴和视频识别。</div>
-    <div class="grid grid-2 mt16">
-      <section class="card qr-card-panel">
+    <div class="alert">二维码内容只包含${showPersonalQr ? '人员账号或' : ''}天平编号，不包含姓名、口令等敏感信息。卡片使用 H 级纠错，编号采用大号字体，便于长期张贴和视频识别。</div>
+    <div class="grid ${showPersonalQr ? 'grid-2' : 'grid-1'} mt16">
+      ${showPersonalQr ? `<section class="card qr-card-panel">
         <div class="card-head"><div><h2>我的人员二维码</h2><p>每名人员只能下载自己的身份卡</p></div>${tag('本人专用', 'green')}</div>
         <div class="identity-badge person">
           <img class="qr-card-image" src="/api/qr/person.svg?account=${encodeURIComponent(user.id)}" alt="${attr(user.id)} 人员二维码">
@@ -1839,7 +1901,7 @@ function pageQr() {
           <button class="btn btn-secondary" data-action="qr-download-person-png">${icon('download')}下载 PNG</button>
           <a class="btn btn-secondary" href="#/print/qr?type=person">${icon('printer')}打印卡片</a>
         </div>
-      </section>
+      </section>` : ''}
       <section class="card qr-card-panel">
         <div class="card-head"><div><h2>天平设备二维码</h2><p>按天平编号或唯一号查询，再导出用于张贴</p></div>${tag('长期张贴', 'blue')}</div>
         <form class="qr-search" data-form="qr-device-search">
@@ -1872,7 +1934,7 @@ function pageHelp() {
   const role = state.data.user.role;
   return `${pageHeader('标准操作流程', '建议首次使用前完整阅读；可下载 PDF 或直接打印。',
     `<button class="btn btn-primary" data-action="download-sop">${icon('download')}下载 PDF</button>
-     <button class="btn btn-secondary" data-action="print-window">${icon('printer')}打印</button>`)}
+     <a class="btn btn-secondary" href="#/print/sop">${icon('printer')}预览与打印 PDF</a>`)}
     <section class="card sop-intro">
       <div class="sop-number">01</div>
       <div><h2>开始前准备</h2><p>确认电脑已连接内网，摄像头或固定手机支架已就位，天平开机并完成水平调节。人员二维码由本人保存；设备二维码应长期贴在天平上。</p></div>
@@ -1899,7 +1961,7 @@ function pageHelp() {
           : role === 'verifier' ? `
             <li>优先核对视频、九次识别帧、限值、偏差和修改理由。</li>
             <li>确认即电子签名并锁定记录；退回时必须写明修改要求。</li>
-            <li>在“二维码”中查询天平编号，导出并张贴设备卡。</li>
+            <li>维护天平、砝码盒和记录模板；设备二维码由检验人员按需导出。</li>
             <li>周统计表直接选择一个自然周，避免手工填写起止日期。</li>`
           : `
             <li>管理账号、天平档案、模板、队列、备份、容量和审计日志。</li>
@@ -1924,6 +1986,9 @@ function pagePrintQr() {
   const query = parseRoute().query;
   const type = query.get('type') === 'device' ? 'device' : 'person';
   const user = state.data.user;
+  if (type === 'person' && !isRole('inspector')) {
+    return '<div class="print-toolbar app-only"><a class="btn btn-secondary" href="#/qr">返回设备二维码</a></div><section class="card"><div class="empty"><strong>复核确认人员没有个人二维码</strong>可直接返回设备二维码页查询或补打设备卡。</div></section>';
+  }
   const device = type === 'device' ? deviceById(query.get('id') || '') : null;
   if (type === 'device' && !device) {
     return '<div class="print-toolbar app-only"><a class="btn btn-secondary" href="#/qr">返回二维码</a></div><section class="card"><div class="empty">未找到天平设备卡</div></section>';
@@ -1938,7 +2003,7 @@ function pagePrintQr() {
 
 function pageAccounts() {
   const accounts = state.data.accounts;
-  return `${pageHeader('账号与角色', '一个账号只属于一种角色；账号编号同时作为人员卡二维码内容。',
+  return `${pageHeader('账号与角色', '一个账号只属于一种角色；检验人员账号编号用于人员身份证。',
     `<button class="btn btn-primary" data-action="account-new">${icon('plus')}新增账号</button>`)}
     <section class="card">
       <div class="alert">账号初始口令由部署配置或安全随机生成，不在审计日志中显示。新建或重置账号后会仅在当前对话框展示一次临时口令，首次登录强制改密。</div>
@@ -1952,7 +2017,7 @@ function pageAccounts() {
           <td class="num">${esc(formatDate(account.lastLoginAt))}</td>
           <td class="col-actions"><div class="btn-group">
             <button class="btn btn-ghost btn-sm" data-action="account-edit" data-id="${attr(account.id)}">编辑</button>
-            <button class="btn btn-ghost btn-sm" data-action="qr-download-person-admin" data-id="${attr(account.id)}">二维码</button>
+            ${account.role !== 'verifier' ? `<button class="btn btn-ghost btn-sm" data-action="qr-download-person-admin" data-id="${attr(account.id)}">人员二维码</button>` : '<span class="muted small">无个人二维码</span>'}
             <button class="btn btn-ghost btn-sm" data-action="account-reset" data-id="${attr(account.id)}">重置口令</button>
             ${account.id !== state.data.user.id && account.status !== '已删除' ? `<button class="btn btn-ghost btn-sm danger-text" data-action="account-delete" data-id="${attr(account.id)}">删除</button>` : ''}
           </div></td>
@@ -2215,10 +2280,46 @@ function printRecordContent(record) {
     <div class="print-note">${esc(template.footerNote || '注：出现异常时应在备注栏准确记录，必要时及时报修。')}<br>${esc(template.footerExtra || '')}<br>导出时间：${esc(currentDateTimeText())} · 模板 ${esc(record.templateVersion || '')}</div>`;
 }
 
+function pdfPreviewPage({
+  title,
+  subtitle,
+  pdfUrl,
+  imageUrl,
+  pages = 1,
+  downloadMarkup,
+  backHref,
+  backLabel
+}) {
+  const separator = imageUrl.includes('?') ? '&' : '?';
+  const pageImages = Array.from({ length: pages }, (_, index) => `
+    <figure class="pdf-page-preview">
+      <figcaption>PDF 第 ${index + 1} 页</figcaption>
+      <a href="${attr(`${imageUrl}${separator}page=${index + 1}`)}" target="_blank" rel="noopener" title="打开原尺寸预览">
+        <img src="${attr(`${imageUrl}${separator}page=${index + 1}`)}" alt="${attr(`${title} 第 ${index + 1} 页`)}" loading="${index === 0 ? 'eager' : 'lazy'}">
+      </a>
+    </figure>`).join('');
+  return `<div class="print-toolbar app-only">
+      <div><strong>${esc(title)}</strong><div class="muted small">${esc(subtitle)}</div></div>
+      <div class="row row-wrap">
+        <a class="btn btn-secondary" href="${attr(backHref)}">${esc(backLabel)}</a>
+        ${downloadMarkup}
+        <a class="btn btn-primary" href="${attr(pdfUrl)}" target="_blank" rel="noopener">${icon('printer')}打开 PDF 打印</a>
+      </div>
+    </div>
+    <div class="pdf-preview-notice app-only">${icon('file')}下方图像由最终 PDF 逐页渲染；预览、下载和打印使用同一份服务端文件。</div>
+    <div class="pdf-page-stack">${pageImages}</div>`;
+}
+
 function pagePrintRecord(record) {
-  return `<div class="print-toolbar app-only"><div><strong>单日校验记录表 · A4 打印预览</strong><div class="muted small">${esc(record.id)}</div></div>
-      <div class="row"><a class="btn btn-secondary" href="#/records/${encodeURIComponent(record.id)}">返回详情</a><button class="btn btn-primary" data-action="print-window">${icon('printer')}打印</button></div></div>
-    <article class="print-paper">${printRecordContent(record)}</article>`;
+  return pdfPreviewPage({
+    title: '单日校验记录表 · 实际 PDF 预览',
+    subtitle: record.id,
+    pdfUrl: `/api/previews/record/${encodeURIComponent(record.id)}.pdf`,
+    imageUrl: `/api/previews/record/${encodeURIComponent(record.id)}.png`,
+    downloadMarkup: `<button class="btn btn-secondary" data-action="export-record" data-id="${attr(record.id)}">${icon('download')}下载 PDF</button>`,
+    backHref: `#/records/${encodeURIComponent(record.id)}`,
+    backLabel: '返回详情'
+  });
 }
 
 async function loadWeekPrint(deviceId, weekValue) {
@@ -2286,84 +2387,55 @@ function pagePrintWeek() {
   const records = (state.weekPrint?.items || []).filter((record) => (
     record.device === deviceId && record.status === '已复核确认' && record.date >= from && record.date <= to
   ));
-  const dates = [...new Set(records.map((record) => record.date))].sort();
-  const evals = records.map(recordEvaluation);
-  const recordsForDate = (date) => records.filter((record) => record.date === date);
-  return `<div class="print-toolbar app-only"><div><strong>每周天平校验统计记录 · A4 横向预览</strong><div class="muted small">${esc(deviceId)} · ${esc(selectedWeek.week || '')} · ${esc(from)} ~ ${esc(to)}</div></div>
-      <div class="row"><a class="btn btn-secondary" href="#/export">返回导出</a><button class="btn btn-primary" data-action="print-window">${icon('printer')}打印</button></div></div>
-    <article class="print-paper week">
-      <div class="print-title">每周天平校验统计记录表</div>
-      <div class="print-sub">单位：${esc(device?.dept || '')} · 天平编号：${esc(deviceId)} · 周期：${esc(from)} ~ ${esc(to)}</div>
-      <table class="print-grid">
-        <tr><td class="label">天平唯一号</td><td>${esc(device?.uniqueNo || '')}</td><td class="label">Max / d</td><td>${esc(device?.max || '')}g / ${esc(device?.d || '')}mg</td><td class="label">参考砝码</td><td>${esc(device?.points?.join(' / ') || '')}g</td></tr>
-        <tr><td class="label">统计结论</td><td colspan="${Math.max(3, dates.length * 2 + 3)}">${records.length ? `${records.filter((record) => recordEvaluation(record)?.pass).length} 次通过 / ${evals.filter((evaluation) => !evaluation?.pass).length} 次不通过` : '本日期段无已复核确认记录'}</td></tr>
-        <tr><th>项目</th>${(dates.length ? dates : ['无记录']).map((date) => `<th colspan="2">${esc(date)}</th>`).join('')}</tr>
-        ${[
-          ['清洁', (record) => record.cleanliness],
-          ['水平调节', (record) => record.level],
-          ['内部校正', (record) => record.internalCal],
-          ['砝码盒', (record) => record.box],
-          ['备注', (record) => record.remark],
-          ['外部校正', (record) => recordEvaluation(record)?.conclusion]
-        ].map(([label, getter]) => `<tr><td class="label">${esc(label)}</td>${dates.length ? dates.map((date) => {
-          const sameDay = recordsForDate(date);
-          return `<td colspan="2">${esc(sameDay.map((record) => getter(record)).join(' / '))}</td>`;
-        }).join('') : '<td colspan="2">—</td>'}</tr>`).join('')}
-        ${[0, 1, 2].map((point) => `<tr><td class="label">L${point + 1} 示值 / 结论</td>${dates.length ? dates.map((date) => {
-          const value = recordsForDate(date).map((record) => {
-            const items = (recordEvaluation(record)?.items || []).filter((item) => item.point === point);
-            return items.map((item) => `${formatNumber(item.value, item.dec)}${item.inLimit ? '✓' : '!'}`).join(' / ');
-          }).filter(Boolean).join('；');
-          return `<td colspan="2">${value || '—'}</td>`;
-        }).join('') : '<td colspan="2">—</td>'}</tr>`).join('')}
-        <tr><td class="label">校验人员</td>${dates.length ? dates.map((date) => {
-          const value = recordsForDate(date).map((record) => accountName(record.inspector)).join(' / ');
-          return `<td colspan="2">${esc(value)}</td>`;
-        }).join('') : '<td colspan="2">—</td>'}</tr>
-        <tr><td class="label">复核确认人</td>${dates.length ? dates.map((date) => {
-          const value = recordsForDate(date).map((record) => accountName(record.verifiedBy)).join(' / ');
-          return `<td colspan="2">${esc(value)}</td>`;
-        }).join('') : '<td colspan="2">—</td>'}</tr>
-      </table>
-      <div class="print-note">本统计仅使用已复核确认且未作废记录。无记录日期不生成列。导出时间：${esc(currentDateTimeText())}</div>
-    </article>`;
+  if (!records.length) {
+    return `<div class="print-toolbar app-only"><a class="btn btn-secondary" href="#/export">返回导出</a></div>
+      <section class="card"><div class="empty"><strong>所选周没有可打印记录</strong>仅已复核确认且未作废记录参与周统计。</div></section>`;
+  }
+  const previewPdfUrl = `/api/previews/week.pdf?device=${encodeURIComponent(deviceId)}&week=${encodeURIComponent(selectedWeek.week)}`;
+  const previewImageUrl = `/api/previews/week.png?device=${encodeURIComponent(deviceId)}&week=${encodeURIComponent(selectedWeek.week)}`;
+  return pdfPreviewPage({
+    title: '每周天平校验统计记录 · 实际 PDF 预览',
+    subtitle: `${deviceId} · ${selectedWeek.week} · ${from} ~ ${to}`,
+    pdfUrl: previewPdfUrl,
+    imageUrl: previewImageUrl,
+    downloadMarkup: `<button class="btn btn-secondary" data-action="download-week-pdf">${icon('download')}下载 PDF</button>`,
+    backHref: '#/export',
+    backLabel: '返回导出'
+  });
 }
 
 function pagePrintBlank() {
-  const accounts = state.data.accounts.filter((account) => ['inspector', 'verifier'].includes(account.role) && account.status === '启用');
-  const devices = state.data.devices.filter((device) => device.status === '在用');
-  return `<div class="print-toolbar app-only"><div><strong>空白表与卡片内容清单</strong><div class="muted small">客户可自行打印并张贴固定设备卡</div></div>
-      <div class="row"><a class="btn btn-secondary" href="#/export">返回导出</a><button class="btn btn-primary" data-action="print-window">${icon('printer')}打印</button></div></div>
-    <article class="print-paper">
-      <div class="print-title">电子天平日常校验空白记录表</div>
-      <div class="print-sub">打印后与现行纸质记录并行留档</div>
-      <table class="print-grid">
-        <tr><td class="label">科室</td><td></td><td class="label">天平唯一号</td><td></td><td class="label">Max / d</td><td>　　　g / 　　　mg</td></tr>
-        <tr><td class="label">内部校正方式</td><td>□自动　□手动　□NA</td><td class="label">校验日期</td><td></td><td class="label">砝码盒编号</td><td></td></tr>
-        <tr><td class="label">清洁</td><td>□是　□否　□NA</td><td class="label">水平调节</td><td>□是　□否　□NA</td><td class="label">内部校正通过</td><td>□是　□否　□NA</td></tr>
-        <tr><td class="label">备注</td><td colspan="5" style="height:36px"></td></tr>
-      </table>
-      <table class="print-grid" style="margin-top:8px">
-        <tr><th>读数</th>${[1,2,3].map((n) => `<th>L${n}(g)</th><th>上限 / 下限</th><th>第1次</th><th>第2次</th><th>第3次</th>`).join('')}</tr>
-        ${[1,2,3].map((n) => `<tr><td>L${n}</td>${[1,2,3].map(() => '<td></td><td></td><td></td><td></td><td></td>').join('')}</tr>`).join('')}
-      </table>
-      <div class="print-sign"><div>校验人员签名：____________　日期：____________</div><div>复核确认人签名：____________　日期：____________</div></div>
-      <div class="print-note">判定依据：|I−L| ≤ 0.05%×L；九次读数全部在限内且流程完整时判为通过。</div>
-      <div class="print-title" style="margin-top:24px;font-size:16px">人员卡与设备卡内容清单</div>
-      <div class="blank-card-grid">
-        <div><b>人员卡</b>${accounts.map((account) => `<div class="qr-box">${esc(account.id)} · ${esc(account.name)} · ${esc(roleLabel(account.role))}</div>`).join('')}</div>
-        <div><b>设备卡</b>${devices.map((device) => `<div class="qr-box">${esc(device.qrContent === '天平唯一号' ? device.uniqueNo : device.id)} · ${esc(device.id)}</div>`).join('')}</div>
-      </div>
-      <div class="print-note">二维码内容仅包含账号编号或天平编号，不含敏感人员信息。建议尺寸不小于 40mm×40mm，纠错等级 H。</div>
-    </article>`;
+  return pdfPreviewPage({
+    title: '电子天平日常校验空白记录表',
+    subtitle: 'A4 空白表 · 预览与实际下载使用同一份 PDF',
+    pdfUrl: '/api/previews/blank.pdf',
+    imageUrl: '/api/previews/blank.png',
+    downloadMarkup: `<a class="btn btn-secondary" href="/api/docs/blank.pdf">${icon('download')}下载 PDF</a>`,
+    backHref: '#/export',
+    backLabel: '返回导出'
+  });
+}
+
+function pagePrintSop() {
+  return pdfPreviewPage({
+    title: '标准操作流程 · 实际 PDF 预览',
+    subtitle: 'A4 四页文档 · 预览、打印和下载使用同一份 PDF',
+    pdfUrl: '/api/previews/sop.pdf',
+    imageUrl: '/api/previews/sop.png',
+    pages: 4,
+    downloadMarkup: `<button class="btn btn-secondary" data-action="download-sop">${icon('download')}下载 PDF</button>`,
+    backHref: '#/help',
+    backLabel: '返回操作流程'
+  });
 }
 
 function routeAllowed(path) {
   if (path === '/upload') return isRole('inspector');
   if (path === '/verify') return isRole('verifier');
+  if (path === '/devices') return isRole('inspector');
+  if (['/qr', '/print/qr'].includes(path)) return isRole('inspector') || isRole('verifier');
   if (['/masterdata', '/template'].includes(path)) return can('masterdata.write') || can('template.write');
   if (['/accounts', '/audit', '/system'].includes(path)) return isRole('admin');
-  if (path === '/print/blank') return isRole('admin') || isRole('verifier');
   return true;
 }
 
@@ -2453,6 +2525,10 @@ function render() {
     shell('待复核', '检查证据并完成电子签名', pageVerify(), { pathname: path });
     return;
   }
+  if (path === '/devices') {
+    shell('天平档案', '设备量程、参考点和历史记录只读查询', pageDeviceDirectory(), { pathname: path });
+    return;
+  }
   if (path === '/masterdata') {
     shell('主数据', '天平档案与砝码盒字典', pageMasterData(), { pathname: path });
     return;
@@ -2466,7 +2542,12 @@ function render() {
     return;
   }
   if (path === '/qr') {
-    shell('二维码中心', '人员身份卡与天平设备卡', pageQr(), { pathname: path });
+    shell(
+      isRole('inspector') ? '二维码中心' : '设备二维码',
+      isRole('inspector') ? '人员身份卡与天平设备卡' : '天平设备卡查询与打印',
+      pageQr(),
+      { pathname: path }
+    );
     return;
   }
   if (path === '/help') {
@@ -2487,10 +2568,18 @@ function render() {
   }
   const printMatch = /^\/print\/record\/([^/]+)$/.exec(path);
   if (printMatch) {
-    const record = recordById(decodeURIComponent(printMatch[1]));
-    root.innerHTML = `<main class="main" style="margin-left:0"><div class="content">${record
-      ? pagePrintRecord(record)
-      : '<section class="card"><div class="empty"><strong>未找到记录</strong><a href="#/records">返回记录列表</a></div></section>'}</div></main>`;
+    const recordId = decodeURIComponent(printMatch[1]);
+    const record = recordById(recordId);
+    if (!record) {
+      root.innerHTML = '<main class="main" style="margin-left:0"><div class="content"><section class="card"><div class="empty"><span class="spinner"></span>正在读取记录并生成 PDF…</div></section></div></main>';
+      loadRecordDetail(recordId)
+        .then(() => render())
+        .catch((error) => {
+          root.innerHTML = `<main class="main" style="margin-left:0"><div class="content"><section class="card"><div class="empty"><strong>无法生成 PDF</strong>${esc(errorMessage(error))}<div class="mt16"><a class="btn btn-secondary" href="#/records">返回记录列表</a></div></div></section></div></main>`;
+        });
+      return;
+    }
+    root.innerHTML = `<main class="main" style="margin-left:0"><div class="content">${pagePrintRecord(record)}</div></main>`;
     wireDynamic();
     return;
   }
@@ -2508,6 +2597,11 @@ function render() {
   }
   if (path === '/print/blank') {
     root.innerHTML = `<main class="main" style="margin-left:0"><div class="content">${pagePrintBlank()}</div></main>`;
+    wireDynamic();
+    return;
+  }
+  if (path === '/print/sop') {
+    root.innerHTML = `<main class="main" style="margin-left:0"><div class="content">${pagePrintSop()}</div></main>`;
     wireDynamic();
     return;
   }
@@ -2891,7 +2985,7 @@ function showAccountModal(account = null) {
   const editing = Boolean(account);
   openModal({
     title: editing ? `编辑账号 ${account.id}` : '新增账号',
-    subtitle: '一个账号只能承担一种角色；账号编号同时作为人员二维码内容',
+    subtitle: '一个账号只能承担一种角色；检验人员账号编号用于人员二维码',
     body: `<div class="form-grid">
       <div class="field"><label class="${editing ? '' : 'required'}">账号编号</label><input name="id" value="${attr(account?.id || '')}" maxlength="20" ${editing ? 'disabled' : ''}></div>
       <div class="field"><label class="required">姓名</label><input name="name" value="${attr(account?.name || '')}" maxlength="100" required></div>
@@ -3448,13 +3542,6 @@ async function handleAction(action, element) {
     case 'retry-boot':
       boot();
       return;
-    case 'fill-account': {
-      const account = document.getElementById('login-account');
-      const password = document.getElementById('login-password');
-      if (account) account.value = element.dataset.account || '';
-      if (password) password.focus();
-      return;
-    }
     case 'refresh-login-captcha': {
       const account = document.getElementById('login-account')?.value?.trim() || lastLoginAccount;
       if (!account) {
@@ -3681,6 +3768,31 @@ async function handleAction(action, element) {
       });
       toast('标准操作流程 PDF 已下载', 'success');
       return;
+    case 'download-week-pdf': {
+      const query = parseRoute().query;
+      const device = query.get('device') || '';
+      const week = query.get('week') || naturalWeekRange().week;
+      await withBusy(element, async () => {
+        await downloadFromApi(
+          '/api/exports/week',
+          { device, week },
+          `天平校验周统计_${device}_${week.replaceAll('-', '')}.pdf`
+        );
+      });
+      toast('周统计 PDF 已下载', 'success');
+      return;
+    }
+    case 'preview-week': {
+      const form = element.closest('form[data-form="export-week"]');
+      if (!form) return;
+      const data = formObject(form);
+      if (!data.device || !data.week) {
+        toast('请选择天平和校验周', 'warn');
+        return;
+      }
+      navigate(`/print/week?device=${encodeURIComponent(data.device)}&week=${encodeURIComponent(data.week)}`);
+      return;
+    }
     case 'export-records-csv':
       await withBusy(element, async () => {
         await downloadFromApi('/api/exports/csv', {
@@ -3712,6 +3824,10 @@ async function handleAction(action, element) {
       state.ui.masterTab = ['boxes', 'dictionaries'].includes(element.dataset.tab)
         ? element.dataset.tab
         : 'devices';
+      render();
+      return;
+    case 'device-directory-reset':
+      state.ui.deviceDirectoryQuery = '';
       render();
       return;
     case 'device-new':
@@ -4061,6 +4177,12 @@ async function handleForm(form) {
     toast(`已查询天平 ${device.id}`, 'success');
     return;
   }
+  if (type === 'device-directory-search') {
+    const data = formObject(form);
+    state.ui.deviceDirectoryQuery = String(data.query || '').trim();
+    render();
+    return;
+  }
   if (type === 'change-password') {
     const submit = form.querySelector('[data-submit-label]');
     const errorBox = document.getElementById('change-error');
@@ -4227,6 +4349,17 @@ async function handleForm(form) {
 }
 
 function wireDynamic() {
+  const weekInput = document.querySelector('[data-form="export-week"] input[name="week"]');
+  if (weekInput) {
+    const rangeText = weekInput.closest('form')?.querySelector('[data-week-range]');
+    const updateWeekRange = () => {
+      const range = weekRangeFromIso(weekInput.value);
+      if (rangeText) rangeText.textContent = `当前：${range.from} 至 ${range.to}（周一至周日）`;
+    };
+    weekInput.addEventListener('input', updateWeekRange);
+    weekInput.addEventListener('change', updateWeekRange);
+    updateWeekRange();
+  }
   const dropzone = document.getElementById('upload-dropzone');
   if (dropzone) {
     dropzone.addEventListener('click', () => document.getElementById('video-file')?.click());

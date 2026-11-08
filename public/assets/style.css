@@ -593,6 +593,14 @@ tr.row-muted td { color: #7a8e9e; background: #fafbfc; }
 .print-watermark { text-align: center; color: #b42318; font-weight: 700; letter-spacing: 5px; margin-bottom: 7px; }
 .blank-card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 13px; }
 .qr-box { min-height: 80px; display: grid; place-items: center; border: 1px dashed #777; font-family: monospace; }
+.pdf-preview-notice { display: flex; align-items: center; gap: 8px; margin: 12px 0 8px; padding: 9px 12px; color: #365566; border: 1px solid #cbdbe3; border-radius: 8px; background: #f3f8fa; font-size: 10px; }
+.pdf-preview-notice svg { flex: 0 0 auto; color: var(--teal); }
+.pdf-preview-frame { display: block; width: 100%; height: calc(100vh - 148px); min-height: 620px; border: 1px solid var(--line); border-radius: 10px; background: #e8edf0; box-shadow: var(--shadow-sm); }
+.pdf-page-stack { display: grid; gap: 18px; padding-bottom: 26px; }
+.pdf-page-preview { margin: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: #e9eef1; box-shadow: var(--shadow-sm); }
+.pdf-page-preview figcaption { padding: 7px 12px; color: #526b7a; background: #f5f8fa; font-size: 9px; border-bottom: 1px solid var(--line-soft); }
+.pdf-page-preview a { display: block; }
+.pdf-page-preview img { display: block; width: 100%; height: auto; background: #fff; }
 .hidden { display: none !important; }
 .captcha-block { padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: #f8fbfc; }
 .captcha-row { display: flex; align-items: center; gap: 10px; margin: 7px 0; }
@@ -810,6 +818,7 @@ tr.row-muted td { color: #7a8e9e; background: #fafbfc; }
   .modal { max-height: calc(100vh - 20px); }
   .modal-backdrop { padding: 10px; }
   .print-paper { padding: 10mm 6mm; }
+  .pdf-preview-frame { min-height: 520px; height: calc(100vh - 180px); }
   .qr-search { flex-direction: column; align-items: stretch; }
   .captcha-row { align-items: flex-start; flex-direction: column; }
 }
@@ -817,7 +826,8 @@ tr.row-muted td { color: #7a8e9e; background: #fafbfc; }
 @media print {
   @page { size: A4 portrait; margin: 8mm; }
   body { background: #fff !important; color: #000 !important; }
-  .sidebar, .topbar, .status-banner, .print-toolbar, .toast-root, .app-only { display: none !important; }
+  .sidebar, .topbar, .status-banner, .print-toolbar, .toast-root, .app-only,
+  .pdf-preview-frame, .pdf-preview-notice, .pdf-page-stack { display: none !important; }
   .head-actions, .qr-search, .qr-card-panel .row, .sop-intro .btn { display: none !important; }
   .main { margin: 0 !important; }
   .content { padding: 0 !important; max-width: none !important; }

@@ -243,9 +243,14 @@ HTTP 状态使用 400/401/403/404/409/413/415/429/500。接口不得把堆栈返
 - `GET /api/audit`
 - `GET /api/system`
 - `POST /api/system/backup`
-- `GET /api/qr/person.svg?account=U001`
-- `GET /api/qr/device/F001.svg`
+- `GET /api/qr/person.svg?account=U001`：仅检验人员本人及管理员导出人员使用
+- `GET /api/qr/device/F001.svg`：检验、复核确认和管理员角色可查询；复核角色无个人二维码
 - `GET /api/docs/sop.pdf`
+- `GET /api/docs/blank.pdf`
+- `GET /api/previews/record/:id.pdf|png`
+- `GET /api/previews/week.pdf|png`
+- `GET /api/previews/blank.pdf|png`
+- `GET /api/previews/sop.pdf|png`
 
 ### 导出
 
@@ -345,4 +350,6 @@ async function analyzeVideo(context)
 - 验证码登录在连续 5 次口令错误后启用，但不锁定账号。
 - 周统计通过 HTML `week` 输入直接选择自然周，服务端换算周一至周日。
 - 曲线图以标称点差值的毫克数绘制，并针对实测波动自动缩放纵轴。
+- 检验人员具有只读“天平档案”入口；复核确认人员只显示设备二维码，不显示个人二维码。
+- 打印预览由服务端最终 PDF 通过 Poppler 渲染为 PNG，预览、下载与打印共用同一版式。
 

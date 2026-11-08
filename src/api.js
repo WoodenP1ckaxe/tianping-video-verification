@@ -674,6 +674,7 @@ export class ApiRouter {
       }
 
       if (req.method === 'GET' && pathname === '/api/qr/person.svg') {
+        requireRole(actor, ['inspector', 'admin']);
         const requestedId = String(url.searchParams.get('account') || actor.user.id).trim();
         if (requestedId !== actor.user.id && actor.user.role !== 'admin') {
           throw new HttpError(403, 'FORBIDDEN', '检验人员只能导出本人员工二维码');
@@ -681,6 +682,9 @@ export class ApiRouter {
         const account = getAccount(this.db, requestedId);
         if (!account || account.status !== '启用') {
           throw new HttpError(404, 'ACCOUNT_NOT_FOUND', '人员账号不存在或已停用');
+        }
+        if (account.role === 'verifier') {
+          throw new HttpError(409, 'PERSON_QR_NOT_APPLICABLE', '复核确认人员不生成个人二维码');
         }
         const { generatePersonCardSvg } = await import('./services/qr.js');
         const fileLabel = `人员二维码_${account.id}.svg`;
@@ -723,7 +727,7 @@ export class ApiRouter {
             objectType: '天平二维码',
             objectId: device.id,
             after: fileLabel,
-            reason: '检验人员查询并导出设备二维码卡片',
+            reason: '用户查询并导出设备二维码卡片',
             result: '成功'
           });
         }
@@ -1259,6 +1263,144 @@ export class ApiRouter {
           result: '成功'
         });
         sendBuffer(res, Buffer.from(buffer), 'application/pdf', fileName);
+        return true;
+      }
+
+      if (pathname === '/api/docs/blank.pdf' && req.method === 'GET') {
+        const exporter = await import('./services/exporter.js');
+        const fileName = '电子天平日常校验空白记录表.pdf';
+        const buffer = exporter.generateBlankFormPdf({ exportedAt: new Date() });
+        audit(this.db, actor, {
+          type: '导出',
+          objectType: '空白记录表',
+          objectId: 'BLANK',
+          after: fileName,
+          reason: '用户下载空白校验记录表',
+          result: '成功'
+        });
+        sendBuffer(res, Buffer.from(buffer), 'application/pdf', fileName);
+        return true;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/previews/sop.png') {
+        const exporter = await import('./services/exporter.js');
+        const { renderPdfPagePng } = await import('./services/pdf-preview.js');
+        const png = renderPdfPagePng(
+          exporter.generateSopPdf({ exportedAt: new Date() }),
+          url.searchParams.get('page'),
+          this.config
+        );
+        sendBuffer(res, png, 'image/png', '标准操作流程_预览.png', true);
+        return true;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/previews/blank.png') {
+        const exporter = await import('./services/exporter.js');
+        const { renderPdfPagePng } = await import('./services/pdf-preview.js');
+        const png = renderPdfPagePng(
+          exporter.generateBlankFormPdf({ exportedAt: new Date() }),
+          url.searchParams.get('page'),
+          this.config
+        );
+        sendBuffer(res, png, 'image/png', '空白记录表_预览.png', true);
+        return true;
+      }
+
+      const previewRecordPngMatch = /^\/api\/previews\/record\/([^/]+)\.png$/.exec(pathname);
+      if (req.method === 'GET' && previewRecordPngMatch) {
+        requirePermission(actor, 'export.record');
+        const generated = await this.handleExport(
+          actor,
+          res,
+          `/api/exports/record/${encodeURIComponent(decodeURIComponent(previewRecordPngMatch[1]))}`,
+          {},
+          { preview: true, capture: true }
+        );
+        const { renderPdfPagePng } = await import('./services/pdf-preview.js');
+        const png = renderPdfPagePng(
+          generated.buffer,
+          url.searchParams.get('page'),
+          this.config
+        );
+        sendBuffer(res, png, 'image/png', '校验记录_预览.png', true);
+        return true;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/previews/week.png') {
+        requirePermission(actor, 'export.record');
+        const generated = await this.handleExport(
+          actor,
+          res,
+          '/api/exports/week',
+          {
+            device: url.searchParams.get('device'),
+            week: url.searchParams.get('week'),
+            from: url.searchParams.get('from'),
+            to: url.searchParams.get('to')
+          },
+          { preview: true, capture: true }
+        );
+        const { renderPdfPagePng } = await import('./services/pdf-preview.js');
+        const png = renderPdfPagePng(
+          generated.buffer,
+          url.searchParams.get('page'),
+          this.config
+        );
+        sendBuffer(res, png, 'image/png', '周统计_预览.png', true);
+        return true;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/previews/sop.pdf') {
+        const exporter = await import('./services/exporter.js');
+        sendBuffer(
+          res,
+          Buffer.from(exporter.generateSopPdf({ exportedAt: new Date() })),
+          'application/pdf',
+          '天平校验视频分析系统_标准操作流程.pdf',
+          true
+        );
+        return true;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/previews/blank.pdf') {
+        const exporter = await import('./services/exporter.js');
+        sendBuffer(
+          res,
+          Buffer.from(exporter.generateBlankFormPdf({ exportedAt: new Date() })),
+          'application/pdf',
+          '电子天平日常校验空白记录表.pdf',
+          true
+        );
+        return true;
+      }
+
+      const previewRecordMatch = /^\/api\/previews\/record\/([^/]+)\.pdf$/.exec(pathname);
+      if (req.method === 'GET' && previewRecordMatch) {
+        requirePermission(actor, 'export.record');
+        await this.handleExport(
+          actor,
+          res,
+          `/api/exports/record/${encodeURIComponent(decodeURIComponent(previewRecordMatch[1]))}`,
+          {},
+          { preview: true }
+        );
+        return true;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/previews/week.pdf') {
+        requirePermission(actor, 'export.record');
+        await this.handleExport(
+          actor,
+          res,
+          '/api/exports/week',
+          {
+            device: url.searchParams.get('device'),
+            week: url.searchParams.get('week'),
+            from: url.searchParams.get('from'),
+            to: url.searchParams.get('to')
+          },
+          { preview: true }
+        );
         return true;
       }
 
@@ -2250,7 +2392,8 @@ export class ApiRouter {
     return this.systemState(actor, true);
   }
 
-  async handleExport(actor, res, pathname, body) {
+  async handleExport(actor, res, pathname, body, options = {}) {
+    const preview = options.preview === true;
     const exporter = await import('./services/exporter.js');
     const single = /^\/api\/exports\/record\/([^/]+)$/.exec(pathname);
     if (single) {
@@ -2273,27 +2416,36 @@ export class ApiRouter {
         inspectorName: getAccount(this.db, record.inspector)?.name,
         verifierName: getAccount(this.db, record.verifiedBy)?.name
       });
-      this.storage.recordExport(actor, {
-        type: '单条 PDF',
-        scope: record.id,
-        count: 1,
-        fileName,
-        watermark
-      });
-      audit(this.db, actor, {
-        type: '导出',
-        objectType: '校验记录',
-        objectId: record.id,
-        after: fileName,
-        reason: `单条 PDF；水印：${watermark || '无'}`,
-        result: '成功'
-      });
+      if (!preview) {
+        this.storage.recordExport(actor, {
+          type: '单条 PDF',
+          scope: record.id,
+          count: 1,
+          fileName,
+          watermark
+        });
+        audit(this.db, actor, {
+          type: '导出',
+          objectType: '校验记录',
+          objectId: record.id,
+          after: fileName,
+          reason: `单条 PDF；水印：${watermark || '无'}`,
+          result: '成功'
+        });
+      }
+      if (options.capture === true) {
+        return {
+          buffer: Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer),
+          fileName,
+          contentType: 'application/pdf'
+        };
+      }
       sendBuffer(
         res,
         Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer),
         'application/pdf',
         fileName,
-        Boolean(body.inline)
+        preview || Boolean(body.inline)
       );
       return;
     }
@@ -2419,21 +2571,30 @@ export class ApiRouter {
         exportedAt: new Date(),
         generatedBy: actor.user.name
       });
-      this.storage.recordExport(actor, {
-        type: '周统计 PDF',
-        scope: `${device.id} / ${selectedWeek.week || `${from} ~ ${to}`}`,
-        count: records.length,
-        fileName
-      });
-      audit(this.db, actor, {
-        type: '导出',
-        objectType: '校验记录',
-        objectId: device.id,
-        after: fileName,
-        reason: `周统计 PDF；日期 ${from} ~ ${to}`,
-        result: '成功'
-      });
-      sendBuffer(res, Buffer.from(buffer), 'application/pdf', fileName);
+      if (!preview) {
+        this.storage.recordExport(actor, {
+          type: '周统计 PDF',
+          scope: `${device.id} / ${selectedWeek.week || `${from} ~ ${to}`}`,
+          count: records.length,
+          fileName
+        });
+        audit(this.db, actor, {
+          type: '导出',
+          objectType: '校验记录',
+          objectId: device.id,
+          after: fileName,
+          reason: `周统计 PDF；日期 ${from} ~ ${to}`,
+          result: '成功'
+        });
+      }
+      if (options.capture === true) {
+        return {
+          buffer: Buffer.from(buffer),
+          fileName,
+          contentType: 'application/pdf'
+        };
+      }
+      sendBuffer(res, Buffer.from(buffer), 'application/pdf', fileName, preview);
       return;
     }
 
