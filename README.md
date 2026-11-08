@@ -48,9 +48,10 @@ npm run repo:backup -- -m "描述本次变更"
 ```
 
 `repo:create` 使用本机 Git Credential Manager 中的 GitHub 登录身份确认或创建
-公开仓库。`repo:backup` 会在提交前运行源码校验和发布策略检查，然后提交允许发布
-的文件并推送到 GitHub。策略采用明确允许清单，检测到文档、测试、媒体、数据库、
-日志或敏感凭据时会拒绝提交或推送。
+公开仓库。`repo:commit` 是一键发布命令：运行源码校验和发布策略检查、提交允许
+发布的文件、推送 `main`，并同时推送可达的版本标签。`repo:backup` 是同一流程的
+别名。策略采用明确允许清单，检测到文档、测试、媒体、数据库、日志或敏感凭据时
+会拒绝提交或推送。
 
 有源码变化时，`repo:commit` 和 `repo:backup` 会自动递增 patch 版本并对齐
 `package.json`、`package-lock.json` 与 Compose 镜像标签，同时创建 `vX.Y.Z`

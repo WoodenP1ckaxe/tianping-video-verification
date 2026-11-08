@@ -36,9 +36,10 @@
 
 ## 版本管理
 
-`repo:commit` 和 `repo:backup` 发现源码变化时会自动递增 patch 版本、创建
-`vX.Y.Z` 标签并一起提交；需要提升 minor 或 major 时分别追加
-`-- --bump minor` 或 `-- --bump major`。不要手工只改其中一个版本字段。
+`repo:commit` 和 `repo:backup` 是一键发布流程：发现源码变化时自动递增 patch
+版本、创建 `vX.Y.Z` 标签并一起提交，随后推送 `main` 与可达标签到 GitHub。需要
+提升 minor 或 major 时分别追加 `-- --bump minor` 或 `-- --bump major`。不要
+手工只改其中一个版本字段。
 
 ## 修改后的检查
 

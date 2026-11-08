@@ -533,8 +533,7 @@ function exactTagAtHead() {
 }
 
 function commit() {
-  check();
-  commitIfNeeded(messageFromArgs());
+  backup();
 }
 
 function backup() {
@@ -546,7 +545,14 @@ function backup() {
   const release = commitIfNeeded(messageFromArgs());
   const releaseTag = release?.tag || exactTagAtHead();
 
-  git(['push', '--porcelain', '--set-upstream', 'origin', branch], { stdio: 'inherit' });
+  git([
+    'push',
+    '--porcelain',
+    '--follow-tags',
+    '--set-upstream',
+    'origin',
+    branch,
+  ], { stdio: 'inherit' });
   if (releaseTag) {
     git(['push', '--porcelain', 'origin', `refs/tags/${releaseTag}`], { stdio: 'inherit' });
   }
@@ -564,7 +570,7 @@ function backup() {
       throw new Error(`推送后远端标签 ${releaseTag} 与本地不一致`);
     }
   }
-  console.log(`GitHub 备份已同步：${localHead}`);
+  console.log(`GitHub 已同步提交与版本标签：${localHead}`);
 }
 
 try {

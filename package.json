@@ -1,6 +1,6 @@
 {
   "name": "tianping-video-verification",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "description": "电子天平日常校验视频分析系统",
