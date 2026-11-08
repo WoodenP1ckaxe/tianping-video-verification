@@ -272,6 +272,7 @@ class PdfDocument {
   constructor(options = {}) {
     this.font = loadFont();
     this.pages = [];
+    this.pageIndex = -1;
     this.usedGlyphs = new Map();
     this.title = options.title || '天平校验记录';
     this.author = options.author || '天平校验视频分析系统';
@@ -280,11 +281,20 @@ class PdfDocument {
 
   addPage(width = A4_PORTRAIT.width, height = A4_PORTRAIT.height) {
     this.pages.push({ width, height, commands: [] });
+    this.pageIndex = this.pages.length - 1;
     return this.pages.length - 1;
   }
 
   get currentPage() {
-    return this.pages.at(-1);
+    return this.pages[this.pageIndex] || null;
+  }
+
+  selectPage(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= this.pages.length) {
+      throw new RangeError('PDF 页码无效');
+    }
+    this.pageIndex = index;
+    return this.currentPage;
   }
 
   glyphFor(codePoint) {
@@ -504,8 +514,8 @@ class PdfDocument {
     }
     objects.set(
       infoObject,
-      `<< /Title <${Buffer.from(this.title, 'utf16le').swap16().toString('hex')}> ` +
-      `/Author <${Buffer.from(this.author, 'utf16le').swap16().toString('hex')}> /Creator (Tianping System) ` +
+      `<< /Title <${pdfUnicodeHex(this.title)}> ` +
+      `/Author <${pdfUnicodeHex(this.author)}> /Creator (Tianping System) ` +
       `/CreationDate (${safeDate}) >>`,
     );
 
@@ -592,6 +602,11 @@ function formatPdfDate(value) {
   return `D:${yyyy}${mm}${dd}${hh}${mi}00+00'00'`;
 }
 
+function pdfUnicodeHex(value) {
+  const body = Buffer.from(String(value ?? ''), 'utf16le').swap16().toString('hex');
+  return `FEFF${body.toUpperCase()}`;
+}
+
 function safeText(value, fallback = '—') {
   if (value === null || value === undefined || value === '') return fallback;
   return String(value);
@@ -646,12 +661,12 @@ function drawTitle(document, title, subtitle = '') {
     color: [0.08, 0.15, 0.20],
   });
   if (subtitle) {
-    document.centeredText(42, page.width - 84, page.height - 72, subtitle, {
+    document.centeredText(42, page.width - 84, page.height - 70, subtitle, {
       size: 8.5,
       color: [0.34, 0.38, 0.42],
     });
   }
-  document.line(42, page.height - 80, page.width - 42, page.height - 80, {
+  document.line(42, page.height - 84, page.width - 42, page.height - 84, {
     color: [0.12, 0.32, 0.57],
     width: 1.4,
   });
@@ -1054,40 +1069,68 @@ export function generateWeekPdf(recordsOrOptions, devices = [], options = {}) {
   const page = document.currentPage;
   const margin = 36;
   const width = page.width - margin * 2;
+  const weekDevice = config.device
+    || records.map((record) => resolveDeviceForRecord(
+      record,
+      config.devices || config.deviceMap
+    )).find(Boolean);
   drawTitle(document, config.title || '每周天平校验统计记录',
-    `${config.weekLabel || (config.from && config.to ? `${config.from} ~ ${config.to}` : records[0].date)} · 同一台天平同一自然周`);
+    `${config.weekLabel || (config.from && config.to ? `${config.from} ~ ${config.to}` : records[0].date)} · ` +
+    `${weekDevice?.dept || '—'} · ${weekDevice?.id || records[0].device} · ` +
+    `Max ${safeText(weekDevice?.max)} g / d ${safeText(weekDevice?.d)} mg`);
   let top = 90;
   const uniqueDates = [...new Set(records.map((record) => record.date))].slice(0, 7);
   const labelWidth = 76;
   const dateWidth = (width - labelWidth) / Math.max(1, uniqueDates.length);
-  drawCellText(document, margin, top, labelWidth, 58, '记录日期', {
+  drawCellText(document, margin, top, labelWidth, 44, '记录日期', {
     size: 8.2,
     align: 'center',
     fill: [0.9, 0.94, 0.98],
   });
   uniqueDates.forEach((date, index) => {
-    drawCellText(document, margin + labelWidth + dateWidth * index, top, dateWidth, 58, date, {
+    drawCellText(document, margin + labelWidth + dateWidth * index, top, dateWidth, 44, date, {
       size: 8.4,
       align: 'center',
       fill: [0.9, 0.94, 0.98],
     });
   });
-  top += 58;
+  top += 44;
   const fields = [
-    ['砝码盒编号', (record) => record.box],
-    ['外部校正', (record) => {
+    ['清洁 / 水平 / 内部校正', (record) => (
+      `清洁：${safeText(record.cleanliness)}\n水平：${safeText(record.level)}\n内部校正：${safeText(record.internalCal)}`
+    ), 36],
+    ['砝码盒 / 外部校正', (record) => {
       const device = resolveDeviceForRecord(record, config.devices || config.deviceMap);
-      return device ? evaluateRecord(record, device).conclusion : '—';
-    }],
-    ['L1 示值', (record) => valuesText(record, 0)],
-    ['L2 示值', (record) => valuesText(record, 1)],
-    ['L3 示值', (record) => valuesText(record, 2)],
-    ['校验人员', (record, context) => context.inspectorNames?.[record.inspector] || record.inspector],
-    ['复核确认人', (record, context) => context.verifierNames?.[record.verifiedBy] || record.verifiedBy || '—'],
-    ['记录状态', (record) => record.status],
+      return `砝码盒：${safeText(record.box)}\n外部校正：${device ? evaluateRecord(record, device).conclusion : '—'}`;
+    }, 30],
+    ...[0, 1, 2].map((point) => [
+      `L${point + 1} 限度 / 示值 / 时间`,
+      (record) => {
+        const device = resolveDeviceForRecord(record, config.devices || config.deviceMap);
+        const evaluation = device ? evaluateRecord(record, device) : null;
+        const items = evaluation?.items?.filter((item) => Number(item.point) === point) || [];
+        const limit = items[0]
+          ? `L=${safeText(items[0].L, '—')} g；限度 ${safeText(items[0].lim?.lo)}～${safeText(items[0].lim?.hi)} g`
+          : 'L=—；限度 —';
+        const readings = items.length
+          ? items.map((item) => safeText(item.value)).join(' / ')
+          : valuesText(record, point);
+        const times = items.length
+          ? items.map((item) => safeText(item.time)).join(' / ')
+          : '—';
+        return `${limit}\n示值：${readings}\n时间：${times}`;
+      },
+      52,
+    ]),
+    ['备注', (record) => safeText(record.remark), 30],
+    ['人员 / 状态', (record, context) => (
+      `校验：${context.inspectorNames?.[record.inspector] || record.inspector}\n` +
+      `复核：${context.verifierNames?.[record.verifiedBy] || record.verifiedBy || '—'}\n` +
+      `状态：${record.status}`
+    ), 34],
   ];
-  for (const [label, getter] of fields) {
-    drawCellText(document, margin, top, labelWidth, 32, label, {
+  for (const [label, getter, rowHeight = 30] of fields) {
+    drawCellText(document, margin, top, labelWidth, rowHeight, label, {
       size: 7.8,
       align: 'center',
       fill: [0.95, 0.96, 0.97],
@@ -1097,18 +1140,223 @@ export function generateWeekPdf(recordsOrOptions, devices = [], options = {}) {
       const value = candidates.length
         ? candidates.map((record) => safeText(getter(record, config))).join(' / ')
         : '';
-      drawCellText(document, margin + labelWidth + dateWidth * index, top, dateWidth, 32, value, {
-        size: 7.4,
+      drawCellText(document, margin + labelWidth + dateWidth * index, top, dateWidth, rowHeight, value, {
+        size: 6.9,
         align: 'center',
       });
     });
-    top += 32;
+    top += rowHeight;
   }
-  document.text(margin, 54,
-    `导出时间：${formatDateTime(config.exportedAt || config.generatedAt || new Date())}；作废记录不参与统计；同一天多条记录以“ / ”分隔并列展示。`, {
+  document.text(margin, 42,
+    `导出时间：${formatDateTime(config.exportedAt || config.generatedAt || new Date())}；仅统计已复核确认且未作废记录；同一天多条记录并列展示。`, {
       size: 7.2,
       color: [0.38, 0.42, 0.46],
     });
+  return document.finish();
+}
+
+/**
+ * 生成面向最终用户的标准操作流程 PDF。内容使用简短步骤和角色清单，
+ * 避免操作人员必须阅读技术架构文档。
+ */
+export function generateSopPdf(options = {}) {
+  const document = new PdfDocument({
+    title: '天平校验视频分析系统标准操作流程',
+    author: '天平校验视频分析系统',
+    createdAt: options.exportedAt || new Date(),
+  });
+  const margin = 48;
+  const width = A4_PORTRAIT.width - margin * 2;
+
+  const startPage = (section = '') => {
+    document.addPage();
+    const page = document.currentPage;
+    const top = page.height - 42;
+    document.text(margin, top, '天平校验视频分析系统', {
+      size: 8.5,
+      color: [0.38, 0.45, 0.5],
+    });
+    if (section) {
+      document.centeredText(margin, width, top, section, {
+        size: 8.5,
+        color: [0.38, 0.45, 0.5],
+      });
+    }
+    document.line(margin, page.height - 54, page.width - margin, page.height - 54, {
+      width: 0.7,
+      color: [0.55, 0.62, 0.67],
+    });
+    return { top: 74, section };
+  };
+
+  let layout = startPage('使用说明');
+  const ensure = (height) => {
+    if (layout.top + height <= document.currentPage.height - 54) return;
+    const section = layout.section;
+    layout = startPage(section);
+  };
+  const heading = (text, level = 1) => {
+    const size = level === 1 ? 17 : 12;
+    const height = level === 1 ? 34 : 25;
+    ensure(height);
+    if (level > 1) layout.top += 4;
+    if (level === 1) {
+      document.rect(margin, document.currentPage.height - layout.top - 23, 4, 21, {
+        fill: [0.05, 0.52, 0.47],
+        stroke: false,
+      });
+      document.text(margin + 12, document.currentPage.height - layout.top - 17, text, {
+        size,
+        color: [0.07, 0.18, 0.27],
+      });
+    } else {
+      document.text(margin, document.currentPage.height - layout.top - 12, text, {
+        size,
+        color: [0.08, 0.35, 0.49],
+      });
+    }
+    layout.top += height;
+  };
+  const paragraph = (text, style = {}) => {
+    const size = style.size || 9.4;
+    const indent = style.indent || 0;
+    const lines = document.wrap(text, width - indent, size);
+    const lineHeight = size * 1.62;
+    for (const line of lines) {
+      ensure(lineHeight + 3);
+      const baseline = document.currentPage.height - layout.top - size;
+      document.text(margin + indent, baseline, line, {
+        size,
+        color: style.color || [0.17, 0.24, 0.29],
+      });
+      layout.top += lineHeight;
+    }
+  };
+  const bullet = (text) => {
+    ensure(24);
+    document.text(margin + 4, document.currentPage.height - layout.top - 9.4, '•', {
+      size: 10,
+      color: [0.04, 0.53, 0.47],
+    });
+    paragraph(text, { indent: 18, size: 9.2 });
+  };
+  const note = (text, color = [0.1, 0.35, 0.45]) => {
+    const lines = document.wrap(text, width - 24, 8.8);
+    const height = lines.length * 14 + 20;
+    ensure(height);
+    const y = document.currentPage.height - layout.top - height;
+    document.rect(margin, y, width, height, {
+      fill: [0.93, 0.97, 0.98],
+      stroke: [0.73, 0.83, 0.87],
+    });
+    lines.forEach((line, index) => {
+      document.text(margin + 12, y + height - 19 - index * 14, line, {
+        size: 8.8,
+        color,
+      });
+    });
+    layout.top += height + 10;
+  };
+
+  // Cover area on first page.
+  document.rect(margin, 580, width, 222, {
+    fill: [0.035, 0.17, 0.27],
+    stroke: false,
+  });
+  document.text(margin + 22, 752, '天平校验视频分析系统', {
+    size: 22,
+    color: [0.95, 0.99, 1],
+  });
+  document.text(margin + 22, 718, '标准操作流程', {
+    size: 30,
+    color: [0.38, 0.86, 0.78],
+  });
+  document.text(margin + 22, 683, 'STANDARD OPERATING PROCEDURE', {
+    size: 9,
+    color: [0.67, 0.79, 0.86],
+  });
+  document.text(margin + 22, 655, `版本 1.1 · ${formatDateTime(options.exportedAt || new Date()).slice(0, 10)}`, {
+    size: 8.5,
+    color: [0.67, 0.79, 0.86],
+  });
+  layout.top = 300;
+  heading('目的与适用范围', 1);
+  paragraph('本流程用于指导检验人员、复核确认人员和管理员完成电子天平日常校验视频的拍摄、上传、自动分析、人工核对、电子确认、复核与归档。系统以本地视觉识别为主，不使用语音识别。');
+  note('最重要的原则：正式记录必须同时具备唯一人员身份、唯一设备身份、九次可核验读数及其真实视频帧证据。');
+  heading('开始前准备', 2);
+  bullet('确认浏览器可访问内网系统地址，屏幕分辨率建议不低于 1280 × 720。');
+  bullet('按现场要求安装固定支架，确保天平显示屏、称重区域和二维码卡片清晰可见。');
+  bullet('设备二维码打印后长期固定在天平正面或侧面；人员二维码由本人妥善保存，不得转借。');
+  bullet('天平先完成必要清洁和水平调节，并确认砝码盒编号。');
+
+  const page2 = startPage('标准流程');
+  layout = page2;
+  heading('七步完成一次校验', 1);
+  const steps = [
+    ['1. 出示身份卡', '开始拍摄后先出示本人人员卡至少 2 秒。设备卡已长期贴在设备上时可同时出现在同一画面。'],
+    ['2. 拍摄九次称量', '按 L1 三次、L2 三次、L3 称量完成九次读数。每次示值稳定停留至少 3 秒，镜头不要晃动或遮挡。'],
+    ['3. 上传视频', '进入“上传校验视频”，确认文件、大小与拍摄开始时间。支持 MP4 / MOV，单个文件不超过 500 MB。'],
+    ['4. 等待自动分析', '任务按上传顺序串行处理。完成后可从“我的分析任务”打开记录；失败时阅读任务原因，不要重复提交同一视频。'],
+    ['5. 核对识别结果', '逐项查看读数值、识别帧、时间、置信度和异常提示。发现识别错误时修正并填写理由。'],
+    ['6. 人工观察确认', '根据现场实际观察选择“清洁”“水平调节”“内部校正是否通过”，填写砝码盒编号和备注。'],
+    ['7. 提交、复核与归档', '提交即形成电子签名。复核确认人员检查证据后确认或退回；确认后的正式 PDF 用于打印留档。'],
+  ];
+  for (const [title, text] of steps) {
+    heading(title, 2);
+    paragraph(text);
+  }
+  note('不通过记录同样必须提交并复核，作为异常记录归档。不得通过修改结论绕过规则；只能修正确有错误的识别读数并让系统重新判定。');
+
+  layout = startPage('角色操作');
+  heading('检验人员', 1);
+  bullet('只上传本人完成的校验；视频中的人员卡必须与当前登录账号一致。');
+  bullet('双量程天平先完成高量程三次，再切换量程完成低量程六次。');
+  bullet('处理全部低置信、缺次、不稳定提示后再提交；每个有效读数必须保留真实识别帧。');
+  bullet('在“校验记录”选择天平查看历史汇总、示值明细和自动放大的误差曲线。');
+  heading('复核确认人员', 1);
+  bullet('核对视频、九次识别帧、限值、偏差、判定原因和修改前后值。');
+  bullet('确认即电子签名并锁定记录；退回时必须写明需要修改的内容。');
+  bullet('维护天平、砝码盒和记录模板。模板修改只影响之后新建的记录。');
+  bullet('在“二维码”页面按天平编号或唯一号查询，并导出设备身份卡。');
+  heading('系统管理员', 1);
+  bullet('管理账号、角色、天平档案、模板、分析队列、备份、容量和审计日志。');
+  bullet('在运行状态页按“每台在用天平每天 1 次记录”查看容量和预计存储时长。');
+  bullet('账号口令允许无限次重试；错误达到 5 次后，后续每次登录必须输入验证码。');
+  bullet('组织操作培训，并将本流程 PDF 提供给全部使用人员。');
+
+  layout = startPage('二维码、统计与问题处理');
+  heading('二维码使用要求', 1);
+  bullet('人员卡：进入“二维码”，下载本人 SVG 或 PNG 卡片并打印。编号使用大号字体，说明文字简短清晰。');
+  bullet('设备卡：由检验人员查询后导出，贴在天平正面或侧面。设备卡可以长期出现在视频中。');
+  bullet('人员卡与设备卡同屏是允许的。分析器支持同帧多二维码检测，并会跨多个抽样帧合并身份。');
+  bullet('避免反光、折痕和遮挡；二维码本体建议不小于 40 mm × 40 mm，纠错等级为 H。');
+  heading('周统计表导出', 1);
+  paragraph('进入“导出与打印”，在周统计表中选择一台天平和“校验周”。系统自动换算为周一至周日，并导出同一自然周的 A4 横向 PDF。若所选周没有已复核记录，系统会明确提示。');
+  heading('曲线图阅读', 1);
+  paragraph('历史页将 L1、L2、L3 分别绘制为“示值误差（mg）”曲线。纵轴按当前数据自动缩放，零线表示标称值；小圆点表示每组三次称量，折线表示均值。不要将不同量程或不同标称点的曲线直接叠加比较。');
+  heading('常见问题', 1);
+  bullet('提示人员卡或设备卡无效：检查卡片是否清晰、是否与登录人员/天平档案一致，必要时重新打印并补拍。');
+  bullet('任务提示待人工处理：查看错误原因。管理员只能在核实原始视频后执行人工补录，并保留补录理由。');
+  bullet('PDF 无法下载：确认浏览器允许下载，当前账号具备导出权限，且所选日期范围内存在符合状态要求的记录。');
+  bullet('存储预计时长不足：管理员可在运行状态页查看平均视频大小、每日预计新增和限制因素，再决定扩容或清理策略。');
+  note('技术支持：请提供任务编号、记录编号、操作时间和页面提示。不要通过聊天或邮件发送含口令、人员敏感信息或原始视频的截图。');
+
+  const totalPages = document.pages.length;
+  document.pages.forEach((page, index) => {
+    document.selectPage(index);
+    document.line(margin, 34, page.width - margin, 34, {
+      width: 0.45,
+      color: [0.74, 0.8, 0.83],
+    });
+    document.text(margin, 21, '天平校验视频分析系统 · 标准操作流程', {
+      size: 7.2,
+      color: [0.45, 0.52, 0.56],
+    });
+    document.centeredText(margin, width, 21, `第 ${index + 1} 页 / 共 ${totalPages} 页`, {
+      size: 7.2,
+      color: [0.45, 0.52, 0.56],
+    });
+  });
   return document.finish();
 }
 
@@ -1240,12 +1488,14 @@ export function getPdfExportStatus() {
 export const exportRecordPdf = generateRecordPdf;
 export const exportBatchPdf = generateBatchPdf;
 export const exportWeekPdf = generateWeekPdf;
+export const exportSopPdf = generateSopPdf;
 export const exportCsv = generateCsv;
 
 export default {
   generateRecordPdf,
   generateBatchPdf,
   generateWeekPdf,
+  generateSopPdf,
   generateCsv,
   generateRecordsCsv,
   generateReadoutSummaryCsv,

@@ -1,6 +1,6 @@
 services:
   tianping:
-    image: tianping-system:1.0.0
+    image: tianping-system:1.0.1
     build:
       context: .
       dockerfile: Dockerfile

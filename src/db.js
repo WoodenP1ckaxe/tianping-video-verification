@@ -172,6 +172,17 @@ export function initSchema(db) {
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
 
+    CREATE TABLE IF NOT EXISTS login_captchas (
+      token_hash TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL,
+      answer_hash TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      used_at INTEGER,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_login_captchas_expiry
+      ON login_captchas(expires_at);
+
     CREATE TABLE IF NOT EXISTS devices (
       id TEXT PRIMARY KEY,
       unique_no TEXT NOT NULL UNIQUE,
@@ -404,6 +415,9 @@ export function initSchema(db) {
   ensureColumn(db, 'records', 'device_snapshot_json', "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(db, 'records', 'template_snapshot_json', "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(db, 'uploads', 'time_confirmed', 'INTEGER NOT NULL DEFAULT 0');
+  // Legacy databases may still have locked_until. New login policy never sets it;
+  // clearing stale values prevents older accounts from remaining locked.
+  db.prepare('UPDATE users SET locked_until = NULL WHERE locked_until IS NOT NULL').run();
 }
 
 function insertAudit(db, entry) {
@@ -597,7 +611,7 @@ function seedRecord(db, record) {
     record.internalCal,
     record.remark,
     jsonString(record.readouts),
-    jsonString(record.speech || {}),
+    '{}',
     jsonString(record.personCard || { account: record.inspector, conf: 1 }),
     jsonString(record.deviceCard || { code: record.device, conf: 1 }),
     boolInt(record.rangeSwitch !== false),
@@ -764,7 +778,6 @@ export function seedDatabase(db, config = {}) {
       logRetentionDays: 30,
       recordRetentionYears: 5,
       sessionIdleMinutes: 30,
-      appVersion: '1.0.0',
       analyzerMode: 'local-display-ocr'
     };
     const insertSetting = db.prepare(`
@@ -838,11 +851,6 @@ export function seedDatabase(db, config = {}) {
       internalCal: '是',
       remark: '无',
       readouts: singlePassReadouts(),
-      speech: {
-        cleanliness: { value: '是', conf: 0.96 },
-        level: { value: '是', conf: 0.95 },
-        internalCal: { value: '是', conf: 0.94 }
-      },
       personCard: { account: 'U001', conf: 0.997 },
       deviceCard: { code: 'F001', conf: 0.996 },
       analyzedAt: '2026-09-28 08:46',
@@ -872,11 +880,6 @@ export function seedDatabase(db, config = {}) {
       internalCal: '是',
       remark: '高量程 3 次 → 切换至低量程 6 次',
       readouts: dualPassReadouts(),
-      speech: {
-        cleanliness: { value: '是', conf: 0.94 },
-        level: { value: '是', conf: 0.93 },
-        internalCal: { value: '是', conf: 0.92 }
-      },
       personCard: { account: 'U002', conf: 0.997 },
       deviceCard: { code: 'SJS2605002', conf: 0.996 },
       analyzedAt: '2026-09-28 08:15',
@@ -903,11 +906,6 @@ export function seedDatabase(db, config = {}) {
       internalCal: 'NA',
       remark: '无',
       readouts: lowConfidenceReadouts(),
-      speech: {
-        cleanliness: { value: '是', conf: 0.94 },
-        level: { value: '是', conf: 0.91 },
-        internalCal: { value: 'NA', conf: 0.58 }
-      },
       personCard: { account: 'U001', conf: 0.996 },
       deviceCard: { code: 'F001', conf: 0.995 },
       analyzedAt: '2026-09-26 08:29',
@@ -972,8 +970,9 @@ export function mapAccount(row) {
     status: row.status,
     mustChangePassword: truthy(row.must_change_password),
     failedAttempts: row.failed_attempts,
-    lockedUntil: row.locked_until,
+    captchaRequired: Number(row.failed_attempts || 0) >= 5,
     lastLogin: row.last_login,
+    lastLoginAt: row.last_login,
     permissions: PERMISSIONS[row.role] || []
   };
 }
@@ -1176,7 +1175,6 @@ export function mapRecord(row) {
     internalCal: row.internal_cal,
     remark: row.remark,
     readouts: jsonParse(row.readouts_json, []),
-    speech: jsonParse(row.speech_json, {}),
     personCard: jsonParse(row.person_card_json, {}),
     deviceCard: jsonParse(row.device_card_json, {}),
     rangeSwitch: truthy(row.range_switch),

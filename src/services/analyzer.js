@@ -71,7 +71,8 @@ export function getAnalyzerStatus(config = {}) {
     },
     supportsDisplayOcr: true,
     supportsArbitraryVideoOcr: true,
-    supportsArbitraryVideoAsr: false,
+    supportsMultipleQrCodesPerFrame: true,
+    speechRecognition: 'removed',
     displayRegionConfigurable: true,
     supportsAutomaticDisplayRegion: true,
     unsupportedVideoBehavior: 'OCR 无法提取稳定示值时转待人工处理，人工核对或补录后进入判定流程',
@@ -522,19 +523,6 @@ function screenshotRoot(context) {
   return root ? resolve(root) : null;
 }
 
-function normalizeSpeech(speech) {
-  const result = structuredClone(speech || {});
-  for (const [key, value] of Object.entries(result)) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
-    if (value.value === undefined && value.v !== undefined) value.value = value.v;
-    if (value.v === undefined && value.value !== undefined) value.v = value.value;
-    if (value.value === undefined && key === 'cleanliness') value.value = '是';
-    if (value.value === undefined && key === 'level') value.value = '是';
-    if (value.value === undefined && key === 'internalCal') value.value = '是';
-  }
-  return result;
-}
-
 function validateFrameEvidence(readout, bbox, media, device) {
   if (!bbox) {
     throw new AnalyzerError(
@@ -821,15 +809,6 @@ export async function analyzeVideo(context = {}) {
     rangeSwitch: recognition.rangeSwitch,
     rangeTransition: recognition.rangeTransition || null,
     readouts,
-    speech: normalizeSpeech({
-      cleanliness: { v: '是', conf: 0.6, source: 'asr-unavailable' },
-      level: { v: '是', conf: 0.6, source: 'asr-unavailable' },
-      internalCal: {
-        v: device.internalCal === 'NA' ? 'NA' : '是',
-        conf: 0.6,
-        source: 'asr-unavailable',
-      },
-    }),
     screenshots,
     warnings,
     ocr: {

@@ -1,9 +1,10 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { APP_VERSION } from '../src/version.js';
 
 const root = resolve(import.meta.dirname, '..');
-const image = process.env.IMAGE_TAG || 'tianping-system:1.0.0';
+const image = process.env.IMAGE_TAG || `tianping-system:${APP_VERSION}`;
 const dist = resolve(process.env.DIST_DIR || join(root, 'dist'));
 mkdirSync(dist, { recursive: true });
 

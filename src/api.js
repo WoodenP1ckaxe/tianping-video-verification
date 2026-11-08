@@ -45,6 +45,7 @@ import {
   HttpError,
   SESSION_COOKIE,
   authenticate,
+  createLoginCaptcha,
   changePassword,
   clearSessionCookie,
   clientIp,
@@ -59,6 +60,7 @@ import {
   verifyCsrf
 } from './auth.js';
 import { getAnalyzerStatus } from './services/analyzer.js';
+import { APP_VERSION } from './version.js';
 
 const JSON_LIMIT = 2 * 1024 * 1024;
 const EXPORT_LIMIT = 1000;
@@ -179,6 +181,35 @@ function requireNaturalWeek(from, to) {
     );
   }
   return { from, to };
+}
+
+function isoDate(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function requireIsoWeek(value) {
+  const match = /^(\d{4})-W(\d{2})$/.exec(String(value || ''));
+  if (!match) {
+    throw new HttpError(400, 'INVALID_WEEK', '请选择有效周，格式应为 YYYY-Www');
+  }
+  const year = Number(match[1]);
+  const week = Number(match[2]);
+  const januaryFourth = new Date(Date.UTC(year, 0, 4));
+  const mondayOffset = (januaryFourth.getUTCDay() + 6) % 7;
+  const monday = new Date(januaryFourth);
+  monday.setUTCDate(januaryFourth.getUTCDate() - mondayOffset + (week - 1) * 7);
+  const thursday = new Date(monday);
+  thursday.setUTCDate(monday.getUTCDate() + 3);
+  if (week < 1 || week > 53 || thursday.getUTCFullYear() !== year) {
+    throw new HttpError(400, 'INVALID_WEEK', '该年份不存在所选周');
+  }
+  const sunday = new Date(monday);
+  sunday.setUTCDate(monday.getUTCDate() + 6);
+  return {
+    from: isoDate(monday),
+    to: isoDate(sunday),
+    week: `${year}-W${String(week).padStart(2, '0')}`,
+  };
 }
 
 function detectNtpSync() {
@@ -536,7 +567,7 @@ export class ApiRouter {
         sendJson(res, healthy ? 200 : 503, {
           status: healthy ? 'ok' : 'error',
           service: 'tianping-video-verification',
-          version: getSetting(this.db, 'appVersion', '1.0.0'),
+          version: APP_VERSION,
           database,
           time: nowDateTime(),
           timezone: 'Asia/Shanghai'
@@ -551,7 +582,11 @@ export class ApiRouter {
           req,
           body.account,
           body.password,
-          { trustProxy: this.config.trustProxy }
+          {
+            trustProxy: this.config.trustProxy,
+            captchaToken: body.captchaToken,
+            captchaAnswer: body.captchaAnswer
+          }
         );
         const secure = this.config.secureCookie === true
           || (
@@ -564,6 +599,15 @@ export class ApiRouter {
         }, {
           'Set-Cookie': serializeSessionCookie(actor.session.id, secure)
         });
+        return true;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/auth/captcha') {
+        const account = String(url.searchParams.get('account') || '').trim();
+        if (!account) {
+          throw new HttpError(400, 'CAPTCHA_ACCOUNT_REQUIRED', '请先填写账号编号');
+        }
+        sendJson(res, 200, createLoginCaptcha(this.db, account));
         return true;
       }
 
@@ -629,6 +673,70 @@ export class ApiRouter {
         return true;
       }
 
+      if (req.method === 'GET' && pathname === '/api/qr/person.svg') {
+        const requestedId = String(url.searchParams.get('account') || actor.user.id).trim();
+        if (requestedId !== actor.user.id && actor.user.role !== 'admin') {
+          throw new HttpError(403, 'FORBIDDEN', '检验人员只能导出本人员工二维码');
+        }
+        const account = getAccount(this.db, requestedId);
+        if (!account || account.status !== '启用') {
+          throw new HttpError(404, 'ACCOUNT_NOT_FOUND', '人员账号不存在或已停用');
+        }
+        const { generatePersonCardSvg } = await import('./services/qr.js');
+        const fileLabel = `人员二维码_${account.id}.svg`;
+        if (url.searchParams.get('download') === '1') {
+          audit(this.db, actor, {
+            type: '导出',
+            objectType: '人员二维码',
+            objectId: account.id,
+            after: fileLabel,
+            reason: requestedId === actor.user.id
+              ? '人员导出本人身份二维码卡片'
+              : '管理员导出人员身份二维码卡片',
+            result: '成功'
+          });
+        }
+        sendBuffer(
+          res,
+          Buffer.from(generatePersonCardSvg({
+            ...account,
+            roleLabel: roleLabel(account.role)
+          }), 'utf8'),
+          'image/svg+xml; charset=utf-8',
+          fileLabel,
+          url.searchParams.get('download') !== '1'
+        );
+        return true;
+      }
+
+      let match;
+      match = /^\/api\/qr\/device\/([^/]+)\.svg$/.exec(pathname);
+      if (req.method === 'GET' && match) {
+        requireRole(actor, ['inspector', 'verifier', 'admin']);
+        const device = getDevice(this.db, decodeURIComponent(match[1]));
+        if (!device) throw new HttpError(404, 'DEVICE_NOT_FOUND', '天平档案不存在');
+        const { generateDeviceCardSvg } = await import('./services/qr.js');
+        const fileLabel = `天平二维码_${device.id}.svg`;
+        if (url.searchParams.get('download') === '1') {
+          audit(this.db, actor, {
+            type: '导出',
+            objectType: '天平二维码',
+            objectId: device.id,
+            after: fileLabel,
+            reason: '检验人员查询并导出设备二维码卡片',
+            result: '成功'
+          });
+        }
+        sendBuffer(
+          res,
+          Buffer.from(generateDeviceCardSvg(device), 'utf8'),
+          'image/svg+xml; charset=utf-8',
+          fileLabel,
+          url.searchParams.get('download') !== '1'
+        );
+        return true;
+      }
+
       if (req.method === 'POST' && pathname === '/api/uploads/init') {
         requirePermission(actor, 'upload.own');
         const body = await readJson(req);
@@ -636,7 +744,7 @@ export class ApiRouter {
         return true;
       }
 
-      let match = /^\/api\/uploads\/([^/]+)\/content$/.exec(pathname);
+      match = /^\/api\/uploads\/([^/]+)\/content$/.exec(pathname);
       if (match && req.method === 'PUT') {
         requirePermission(actor, 'upload.own');
         const result = await this.uploads.append(
@@ -1138,6 +1246,22 @@ export class ApiRouter {
         return true;
       }
 
+      if (pathname === '/api/docs/sop.pdf' && req.method === 'GET') {
+        const exporter = await import('./services/exporter.js');
+        const fileName = '天平校验视频分析系统_标准操作流程.pdf';
+        const buffer = exporter.generateSopPdf({ exportedAt: new Date() });
+        audit(this.db, actor, {
+          type: '导出',
+          objectType: '操作手册',
+          objectId: 'SOP',
+          after: fileName,
+          reason: '用户下载标准操作流程',
+          result: '成功'
+        });
+        sendBuffer(res, Buffer.from(buffer), 'application/pdf', fileName);
+        return true;
+      }
+
       if (req.method === 'POST' && pathname.startsWith('/api/exports/')) {
         requirePermission(actor, 'export.record');
         const body = await readJson(req);
@@ -1427,7 +1551,7 @@ export class ApiRouter {
   checkField(actor, recordId, key, body) {
     const record = getRecord(this.db, recordId);
     ensureOwner(actor, record, true);
-    if (!/^(RO:I[1-3]-[1-3]|SP:(cleanliness|level|internalCal))$/.test(key)) {
+      if (!/^RO:I[1-3]-[1-3]$/.test(key)) {
       throw new HttpError(400, 'INVALID_CHECK_KEY', '待核对字段标识无效');
     }
     record.checks[key] = true;
@@ -1563,17 +1687,6 @@ export class ApiRouter {
     );
     if (uncheckedReadouts.length) {
       blockers.push(`存在 ${uncheckedReadouts.length} 个低置信或缺失读数未核对：${uncheckedReadouts.map((item) => item.key).join('、')}`);
-    }
-    const speechLabels = {
-      cleanliness: '清洁',
-      level: '水平调节',
-      internalCal: '内部校正是否通过'
-    };
-    for (const [key, label] of Object.entries(speechLabels)) {
-      const item = record.speech[key];
-      if (item && Number(item.conf ?? 1) < threshold && !record.checks[`SP:${key}`]) {
-        blockers.push(`低置信口述问答“${label}”未核对`);
-      }
     }
     if (blockers.length) {
       throw new HttpError(409, 'SUBMIT_BLOCKED', '提交前校验未通过', blockers);
@@ -2151,7 +2264,7 @@ export class ApiRouter {
         ? ''
         : record.status === '已作废' ? '已作废' : '未复核';
       const fileName = `天平校验记录_${record.device}_${record.date.replaceAll('-', '')}.pdf`;
-      const buffer = await exporter.generateRecordPdf(record, device, {
+      const buffer = exporter.generateRecordPdf(record, device, {
         template,
         evaluation: await evaluate(record, device),
         watermark,
@@ -2253,7 +2366,7 @@ export class ApiRouter {
         contentType = 'application/zip';
       } else {
         fileName = `天平校验记录_${devices.join('-')}_${from.replaceAll('-', '')}-${to.replaceAll('-', '')}.pdf`;
-        outputBuffer = await exporter.generateBatchPdf(exportItems, exportOptions);
+        outputBuffer = exporter.generateBatchPdf(exportItems, exportOptions);
       }
       this.storage.recordExport(actor, {
         type: splitFiles ? '批量 PDF（逐台每日分文件）' : '批量 PDF（合并）',
@@ -2277,25 +2390,38 @@ export class ApiRouter {
     if (pathname === '/api/exports/week') {
       const device = getDevice(this.db, requireString(body.device, '天平编号', 20));
       if (!device) throw new HttpError(404, 'DEVICE_NOT_FOUND', '天平档案不存在');
-      const from = normalizeDate(body.from, '起始日期');
-      const to = normalizeDate(body.to, '结束日期');
-      requireNaturalWeek(from, to);
+      const selectedWeek = body.week
+        ? requireIsoWeek(body.week)
+        : requireNaturalWeek(
+          normalizeDate(body.from, '起始日期'),
+          normalizeDate(body.to, '结束日期')
+        );
+      const { from, to } = selectedWeek;
       const records = getRecords(this.db, { device: device.id, from, to })
         .filter((record) => record.status === '已复核确认');
-      if (!records.length) throw new HttpError(404, 'NO_EXPORT_RECORDS', '该日期段没有已复核确认记录');
-      const fileName = `天平校验周统计_${device.id}_${from.replaceAll('-', '')}-${to.replaceAll('-', '')}.pdf`;
+      if (!records.length) throw new HttpError(404, 'NO_EXPORT_RECORDS', '所选周没有已复核确认记录');
+      const accountNames = Object.fromEntries(
+        getAccounts(this.db).map((account) => [account.id, account.name])
+      );
+      const fileName = `天平校验周统计_${device.id}_${(selectedWeek.week || from).replaceAll('-', '')}.pdf`;
       const buffer = await exporter.generateWeekPdf(records, [
         deviceForRecord(records[0], device)
       ], {
         device,
         from,
         to,
+        week: selectedWeek.week || null,
+        weekLabel: selectedWeek.week
+          ? `${selectedWeek.week}（${from} ~ ${to}）`
+          : `${from} ~ ${to}`,
+        inspectorNames: accountNames,
+        verifierNames: accountNames,
         exportedAt: new Date(),
         generatedBy: actor.user.name
       });
       this.storage.recordExport(actor, {
         type: '周统计 PDF',
-        scope: `${device.id} / ${from} ~ ${to}`,
+        scope: `${device.id} / ${selectedWeek.week || `${from} ~ ${to}`}`,
         count: records.length,
         fileName
       });

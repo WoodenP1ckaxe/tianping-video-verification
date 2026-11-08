@@ -63,12 +63,36 @@ if (manifests.length !== expectedHashes.size) {
   errors.push(`样例清单数量应为 ${expectedHashes.size}，实际 ${manifests.length}`);
 }
 
+try {
+  const packageJson = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  const packageLock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8'));
+  const compose = readFileSync(join(root, 'docker-compose.yml'), 'utf8');
+  const composeVersion = /^\s*image:\s*tianping-system:([^\s#]+)/m.exec(compose)?.[1];
+  const versions = new Set([
+    packageJson.version,
+    packageLock.version,
+    packageLock.packages?.['']?.version,
+    composeVersion,
+  ]);
+  if (versions.size !== 1) {
+    errors.push(
+      `版本号不一致：package=${packageJson.version}, lock=${packageLock.version}, `
+      + `lockRoot=${packageLock.packages?.['']?.version}, compose=${composeVersion}`,
+    );
+  }
+  if (!/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(packageJson.version)) {
+    errors.push(`package.json 版本不是有效的 x.y.z SemVer：${packageJson.version}`);
+  }
+} catch (error) {
+  errors.push(`版本文件校验失败：${error.message}`);
+}
+
 for (const file of files.filter((path) => /\.(html|css|js)$/.test(path))) {
   const size = statSync(file).size;
   if (size === 0) errors.push(`${relative(root, file)} 是空文件`);
   const text = readFileSync(file, 'utf8');
   const selfCheck = file === join(root, 'scripts', 'check.js');
-  if (!selfCheck && /https?:\/\/(?!127\.0\.0\.1|localhost|\$\{host\})/i.test(text)) {
+  if (!selfCheck && /https?:\/\/(?!127\.0\.0\.1|localhost|\$\{host\}|www\.w3\.org\/2000\/svg)/i.test(text)) {
     warnings.push(`${relative(root, file)} 包含外部 URL，请确认不是运行时依赖`);
   }
   if (!selfCheck && /\bTODO\b|待实现|原型模拟/.test(text)) {
@@ -85,6 +109,7 @@ const required = [
   'src/services/analyzer.js',
   'src/services/exporter.js',
   'src/services/queue.js',
+  'src/version.js',
   'public/index.html',
   'docker-compose.yml',
   'README.md',

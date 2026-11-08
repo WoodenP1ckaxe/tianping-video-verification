@@ -321,18 +321,6 @@ export function submitBlockers(record, device, options = {}) {
     blockers.push(`存在 ${lowReadouts.length} 个低置信读数未核对：${lowReadouts.map((item) => item.key).join('、')}`);
   }
 
-  const speechLabels = {
-    cleanliness: '清洁',
-    level: '水平调节',
-    internalCal: '内部校正是否通过',
-  };
-  for (const [field, label] of Object.entries(speechLabels)) {
-    const candidate = record?.speech?.[field];
-    if (candidate && (candidate.conf === undefined || candidate.conf < threshold) && !checked[`SP:${field}`]) {
-      blockers.push(`低置信口述问答“${label}”未核对`);
-    }
-  }
-
   const evaluation = evaluateRecord(record, device);
   const missingUnchecked = evaluation.items
     .filter((item) => item.missing && !checked[`RO:${item.key}`])

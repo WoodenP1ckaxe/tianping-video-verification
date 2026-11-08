@@ -68,7 +68,6 @@ for (const record of candidates) {
     SET readouts_json = ?,
         person_card_json = ?,
         device_card_json = ?,
-        speech_json = ?,
         range_switch = ?,
         duration_seconds = ?,
         device_id = ?,
@@ -79,7 +78,7 @@ for (const record of candidates) {
     JSON.stringify(analysis.readouts),
     JSON.stringify(analysis.personCard),
     JSON.stringify(analysis.deviceCard),
-    JSON.stringify(analysis.speech),
+    // Legacy speech_json remains in old databases but is no longer part of the workflow.
     analysis.rangeSwitch ? 1 : 0,
     analysis.durationSeconds,
     analysis.deviceId,

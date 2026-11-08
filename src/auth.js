@@ -1,4 +1,6 @@
 import {
+  createHash,
+  randomInt,
   randomBytes,
   timingSafeEqual
 } from 'node:crypto';
@@ -17,8 +19,8 @@ import {
 export const SESSION_COOKIE = 'tp_session';
 export const SESSION_IDLE_MINUTES = 30;
 export const SESSION_ABSOLUTE_HOURS = 12;
-export const MAX_FAILED_ATTEMPTS = 5;
-export const LOCK_MINUTES = 10;
+export const CAPTCHA_REQUIRED_AFTER = 5;
+export const CAPTCHA_TTL_MINUTES = 5;
 
 export class HttpError extends Error {
   constructor(status, code, message, details = undefined) {
@@ -158,6 +160,83 @@ function csrfMatches(expected, actual) {
   const a = Buffer.from(String(expected));
   const b = Buffer.from(String(actual));
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function sha256(value) {
+  return createHash('sha256').update(String(value)).digest('hex');
+}
+
+function captchaSvg(code) {
+  const characters = Array.from(code);
+  const glyphs = characters.map((character, index) => {
+    const x = 25 + index * 31;
+    const y = 47 + randomInt(-5, 6);
+    const rotate = randomInt(-18, 19);
+    return `<text x="${x}" y="${y}" transform="rotate(${rotate} ${x} ${y})">${character}</text>`;
+  }).join('');
+  const noise = Array.from({ length: 9 }, () => {
+    const x1 = randomInt(5, 190);
+    const y1 = randomInt(5, 62);
+    const x2 = randomInt(5, 190);
+    const y2 = randomInt(5, 62);
+    return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" />`;
+  }).join('');
+  return [
+    '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="68" viewBox="0 0 200 68" role="img" aria-label="登录验证码">',
+    '<rect width="200" height="68" rx="8" fill="#eef4f6"/>',
+    '<g stroke="#9eb6c1" stroke-width="1" opacity=".55">',
+    noise,
+    '</g>',
+    '<g fill="#173c52" font-family="Consolas,monospace" font-size="30" font-weight="800" text-anchor="middle">',
+    glyphs,
+    '</g>',
+    '</svg>',
+  ].join('');
+}
+
+export function createLoginCaptcha(db, accountId) {
+  const account = getRawAccount(db, String(accountId || '').trim());
+  if (!account) {
+    throw new HttpError(404, 'CAPTCHA_ACCOUNT_NOT_FOUND', '无法生成验证码，请检查账号');
+  }
+  const alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  const answer = Array.from(
+    { length: 6 },
+    () => alphabet[randomInt(0, alphabet.length)]
+  ).join('');
+  const token = randomBytes(24).toString('base64url');
+  const now = Date.now();
+  const expiresAt = now + CAPTCHA_TTL_MINUTES * 60 * 1000;
+  db.prepare('DELETE FROM login_captchas WHERE account_id = ?').run(account.id);
+  db.prepare(`
+    INSERT INTO login_captchas (
+      token_hash, account_id, answer_hash, expires_at, used_at, created_at
+    ) VALUES (?, ?, ?, ?, NULL, ?)
+  `).run(sha256(token), account.id, sha256(answer), expiresAt, now);
+  return {
+    token,
+    svg: captchaSvg(answer),
+    expiresAt,
+    ttlSeconds: CAPTCHA_TTL_MINUTES * 60,
+  };
+}
+
+function consumeLoginCaptcha(db, accountId, token, answer) {
+  const normalizedToken = String(token || '').trim();
+  const normalizedAnswer = String(answer || '').trim().toUpperCase();
+  if (!normalizedToken || !normalizedAnswer) return false;
+  const tokenHash = sha256(normalizedToken);
+  const row = db.prepare(`
+    SELECT * FROM login_captchas WHERE token_hash = ? LIMIT 1
+  `).get(tokenHash);
+  if (!row || row.account_id !== accountId || Number(row.expires_at) <= Date.now()) {
+    return false;
+  }
+  // Every validation consumes the challenge so it cannot be reused for guessing.
+  db.prepare('DELETE FROM login_captchas WHERE token_hash = ?').run(tokenHash);
+  const expected = Buffer.from(row.answer_hash, 'hex');
+  const actual = Buffer.from(sha256(normalizedAnswer), 'hex');
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
 }
 
 export function createSession(db, userId, req, options = {}) {
@@ -303,71 +382,78 @@ export function login(db, req, accountId, password, options = {}) {
     throw new HttpError(401, 'ACCOUNT_DISABLED', '该账号已停用，无法登录');
   }
 
-  if (raw.locked_until && Number(raw.locked_until) > Date.now()) {
-    audit(db, null, {
-      account: raw.id,
-      name: raw.name,
-      role: raw.role === 'admin' ? '管理员' : raw.role === 'verifier' ? '复核确认人员' : '检验人员',
-      type: '登录失败',
-      objectType: '账号',
-      objectId: id,
-      reason: '账号仍处于锁定期',
-      sourceIp: clientIp(req, options.trustProxy),
-      result: '失败'
-    });
-    throw new HttpError(
-      429,
-      'ACCOUNT_LOCKED',
-      `账号已锁定，请于 ${new Date(Number(raw.locked_until)).toLocaleTimeString('zh-CN', {
-        timeZone: 'Asia/Shanghai',
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false
-      })} 后重试`
+  const failuresBefore = Number(raw.failed_attempts || 0);
+  if (failuresBefore >= CAPTCHA_REQUIRED_AFTER) {
+    const captchaValid = consumeLoginCaptcha(
+      db,
+      raw.id,
+      options.captchaToken,
+      options.captchaAnswer
     );
-  }
-  if (raw.locked_until && Number(raw.locked_until) <= Date.now()) {
-    raw.failed_attempts = 0;
-    raw.locked_until = null;
-    db.prepare(`
-      UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?
-    `).run(id);
+    if (!captchaValid) {
+      audit(db, null, {
+        account: raw.id,
+        name: raw.name,
+        role: raw.role === 'admin' ? '管理员' : raw.role === 'verifier' ? '复核确认人员' : '检验人员',
+        type: '登录验证码',
+        objectType: '账号',
+        objectId: id,
+        reason: '连续口令错误达到 5 次，验证码缺失、错误或已过期',
+        sourceIp: clientIp(req, options.trustProxy),
+        result: '失败'
+      });
+      throw new HttpError(
+        400,
+        'CAPTCHA_REQUIRED',
+        '口令错误次数已达到 5 次，请输入验证码后继续登录',
+        {
+          captchaRequired: true,
+          failedAttempts: failuresBefore,
+          captchaRequiredAfter: CAPTCHA_REQUIRED_AFTER,
+          captcha: createLoginCaptcha(db, raw.id)
+        }
+      );
+    }
   }
 
   if (!verifyPassword(password, raw.password_hash)) {
-    const failures = Number(raw.failed_attempts || 0) + 1;
-    const lockedUntil = failures >= MAX_FAILED_ATTEMPTS
-      ? Date.now() + LOCK_MINUTES * 60 * 1000
-      : null;
+    const failures = failuresBefore + 1;
+    const captchaRequired = failures >= CAPTCHA_REQUIRED_AFTER;
     withTransaction(db, () => {
       db.prepare(`
         UPDATE users
         SET failed_attempts = ?, locked_until = ?, updated_at = ?
         WHERE id = ?
-      `).run(failures, lockedUntil, nowIso(), id);
+      `).run(failures, null, nowIso(), id);
 
       audit(db, null, {
         account: raw.id,
         name: raw.name,
         role: raw.role === 'admin' ? '管理员' : raw.role === 'verifier' ? '复核确认人员' : '检验人员',
-        type: failures >= MAX_FAILED_ATTEMPTS ? '账号锁定' : '登录失败',
+        type: captchaRequired ? '登录失败（验证码保护）' : '登录失败',
         objectType: '账号',
         objectId: id,
         before: '',
-        after: lockedUntil ? `锁定 ${LOCK_MINUTES} 分钟` : `失败 ${failures} 次`,
+        after: captchaRequired ? `失败 ${failures} 次；后续需验证码` : `失败 ${failures} 次`,
         reason: '口令错误',
         sourceIp: clientIp(req, options.trustProxy),
         result: '失败'
       });
     });
 
-    if (lockedUntil) {
-      throw new HttpError(429, 'ACCOUNT_LOCKED', `连续 ${MAX_FAILED_ATTEMPTS} 次口令错误，账号已锁定 ${LOCK_MINUTES} 分钟`);
-    }
+    const challenge = captchaRequired ? createLoginCaptcha(db, raw.id) : null;
     throw new HttpError(
-      401,
-      'LOGIN_FAILED',
-      `账号或口令错误（第 ${failures} 次 / 共 ${MAX_FAILED_ATTEMPTS} 次）`
+      captchaRequired ? 400 : 401,
+      captchaRequired ? 'CAPTCHA_REQUIRED' : 'LOGIN_FAILED',
+      captchaRequired
+        ? `账号或口令错误（已错误 ${failures} 次）。后续每次登录均需输入验证码，可无限次重试`
+        : `账号或口令错误（第 ${failures} 次）`,
+      {
+        captchaRequired,
+        failedAttempts: failures,
+        captchaRequiredAfter: CAPTCHA_REQUIRED_AFTER,
+        captcha: challenge
+      }
     );
   }
 

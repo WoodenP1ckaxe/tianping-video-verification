@@ -91,13 +91,6 @@ function normalizeReadouts(items, device, startedAt) {
   });
 }
 
-function speechValue(speech, key, fallback = '是') {
-  const item = speech?.[key];
-  if (item && typeof item === 'object') return item.value ?? fallback;
-  if (typeof item === 'string') return item;
-  return fallback;
-}
-
 function stageVideoForRecord(task, recordId, dataDir) {
   if (!task.filePath || !existsSync(task.filePath)) {
     throw new HttpError(500, 'VIDEO_MISSING', '分析任务关联的视频文件不存在');
@@ -357,7 +350,6 @@ export class AnalysisQueue {
     const effectiveStartTime = result.startTime || task.startTime;
     const date = effectiveStartTime.slice(0, 10);
     const recordId = nextRecordId(this.db, device.id, date);
-    const speech = result.speech || {};
     const readouts = normalizeReadouts(result.readouts, device, effectiveStartTime);
     const warnings = Array.isArray(result.warnings) ? [...result.warnings] : [];
     const sameDayCount = this.db.prepare(`
@@ -438,11 +430,11 @@ export class AnalysisQueue {
         task.file,
         task.size,
         task.sha,
-        speechValue(speech, 'cleanliness', '是'),
-        speechValue(speech, 'level', '是'),
-        speechValue(speech, 'internalCal', device.internalCal === 'NA' ? 'NA' : '是'),
+        result.visualChecks?.cleanliness || null,
+        result.visualChecks?.level || null,
+        result.visualChecks?.internalCal || null,
         jsonString(readouts),
-        jsonString(speech),
+        '{}',
         jsonString(result.personCard || { account: task.user, conf: 1 }),
         jsonString(result.deviceCard || { code: device.id, conf: 1 }),
         result.rangeSwitch === false ? 0 : 1,
@@ -684,10 +676,16 @@ export class AnalysisQueue {
         durationSeconds: payload?.durationSeconds || evidence.media.duration || null,
         rangeSwitch: payload?.rangeSwitch !== false,
         readouts: evidence.readouts,
-        speech: payload?.speech || {
-          cleanliness: { value: payload?.cleanliness || '是', conf: 1 },
-          level: { value: payload?.level || '是', conf: 1 },
-          internalCal: { value: payload?.internalCal || '是', conf: 1 }
+        visualChecks: {
+          cleanliness: ['是', '否', 'NA'].includes(payload?.cleanliness)
+            ? payload.cleanliness
+            : null,
+          level: ['是', '否', 'NA'].includes(payload?.level)
+            ? payload.level
+            : null,
+          internalCal: ['是', '否', 'NA'].includes(payload?.internalCal)
+            ? payload.internalCal
+            : null
         },
         screenshots: evidence.screenshots,
         rangeTransition: payload?.rangeTransition || null,

@@ -3,6 +3,8 @@
 const root = document.getElementById('app');
 const modalRoot = document.getElementById('modal-root');
 const toastRoot = document.getElementById('toast-root');
+let loginCaptcha = null;
+let lastLoginAccount = '';
 
 const ROLE_LABEL = {
   admin: '管理员',
@@ -58,6 +60,8 @@ const ICON_PATHS = {
   printer: '<path d="M6 9V3h12v6M6 17H4v-7h16v7h-2"/><rect x="7" y="14" width="10" height="7"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
   file: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v5h4"/>'
+  ,qr: '<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM20 14v3M17 20h4M14 20h.01"/>',
+  help: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 1 1 4.2 1.8c-.9.8-1.7 1.3-1.7 2.7M12 17.5h.01"/>'
 };
 
 const state = {
@@ -69,6 +73,7 @@ const state = {
   ui: {
     sidebarOpen: false,
     masterTab: 'devices',
+    qrDevice: '',
     recordPage: 1,
     auditPage: 1
   },
@@ -118,6 +123,13 @@ const state = {
     page: 1,
     pageSize: 200,
     totalPages: 1,
+    error: ''
+  },
+  weekPrint: {
+    key: '',
+    loaded: false,
+    loading: false,
+    items: [],
     error: ''
   },
   verifyView: {
@@ -232,6 +244,14 @@ function formatDuration(milliseconds) {
   return `${minutes} 分 ${String(seconds).padStart(2, '0')} 秒`;
 }
 
+function formatRetention(days) {
+  if (days === null || days === undefined || !Number.isFinite(Number(days))) return '无法估算';
+  const value = Number(days);
+  if (value < 60) return `约 ${Math.round(value)} 天`;
+  if (value < 365) return `约 ${(value / 30).toFixed(1)} 个月`;
+  return `约 ${(value / 365).toFixed(1)} 年`;
+}
+
 function shanghaiParts(date = new Date()) {
   const parts = new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',
@@ -282,7 +302,37 @@ function naturalWeekRange(anchorText = todayText()) {
   sunday.setUTCDate(monday.getUTCDate() + 6);
   return {
     from: monday.toISOString().slice(0, 10),
-    to: sunday.toISOString().slice(0, 10)
+    to: sunday.toISOString().slice(0, 10),
+    week: isoWeekValue(anchorText)
+  };
+}
+
+function isoWeekValue(anchorText = todayText()) {
+  const anchor = new Date(`${anchorText}T00:00:00Z`);
+  const day = anchor.getUTCDay() || 7;
+  const thursday = new Date(anchor);
+  thursday.setUTCDate(anchor.getUTCDate() + 4 - day);
+  const year = thursday.getUTCFullYear();
+  const yearStart = new Date(Date.UTC(year, 0, 1));
+  const week = Math.ceil((((thursday - yearStart) / 86_400_000) + 1) / 7);
+  return `${year}-W${String(week).padStart(2, '0')}`;
+}
+
+function weekRangeFromIso(value) {
+  const match = /^(\d{4})-W(\d{2})$/.exec(String(value || ''));
+  if (!match) return naturalWeekRange();
+  const year = Number(match[1]);
+  const week = Number(match[2]);
+  const januaryFourth = new Date(Date.UTC(year, 0, 4));
+  const mondayOffset = (januaryFourth.getUTCDay() + 6) % 7;
+  const monday = new Date(januaryFourth);
+  monday.setUTCDate(januaryFourth.getUTCDate() - mondayOffset + (week - 1) * 7);
+  const sunday = new Date(monday);
+  sunday.setUTCDate(monday.getUTCDate() + 6);
+  return {
+    from: monday.toISOString().slice(0, 10),
+    to: sunday.toISOString().slice(0, 10),
+    week: `${year}-W${String(week).padStart(2, '0')}`
   };
 }
 
@@ -399,6 +449,8 @@ async function loadState({ renderAfter = true } = {}) {
   state.csrfToken = data.csrfToken || state.csrfToken;
   state.recordsView.loaded = false;
   state.historyView.loaded = false;
+  state.weekPrint.loaded = false;
+  state.weekPrint.key = '';
   state.verifyView.loaded = false;
   if (renderAfter) render();
   return data;
@@ -461,11 +513,21 @@ function renderLogin(message = '') {
         <form class="mt16" data-form="login">
           <div class="field">
             <label for="login-account" class="required">账号编号</label>
-            <input id="login-account" name="account" autocomplete="username" required maxlength="20" placeholder="例如 U001">
+            <input id="login-account" name="account" autocomplete="username" required maxlength="20" placeholder="例如 U001" value="${attr(lastLoginAccount)}">
           </div>
           <div class="field mt12">
             <label for="login-password" class="required">口令</label>
             <input id="login-password" name="password" type="password" autocomplete="current-password" required placeholder="请输入登录口令">
+          </div>
+          <div class="captcha-block mt12 ${loginCaptcha ? '' : 'hidden'}" id="login-captcha-block">
+            <label for="login-captcha" class="required">登录验证码</label>
+            <div class="captcha-row">
+              <div class="captcha-image">${loginCaptcha?.svg || ''}</div>
+              <button type="button" class="btn btn-secondary btn-sm" data-action="refresh-login-captcha">换一张</button>
+            </div>
+            <input id="login-captcha" name="captchaAnswer" autocomplete="off" maxlength="6" ${loginCaptcha ? 'required' : ''} placeholder="输入图中 6 位字符（不区分大小写）">
+            <input type="hidden" name="captchaToken" value="${attr(loginCaptcha?.token || '')}">
+            <p class="muted small mt8">连续错误 5 次后启用。验证码有效 5 分钟，不限制重试次数。</p>
           </div>
           <button class="btn btn-primary btn-lg btn-block mt16" type="submit" data-submit-label>安全登录</button>
         </form>
@@ -478,7 +540,7 @@ function renderLogin(message = '') {
               ${tag(roleLabel(role), role === 'admin' ? 'gray' : role === 'verifier' ? 'violet' : 'blue')}
             </button>`).join('')}
         </div>
-        <p class="account-note mt16">初始口令由部署人员提供。非容器方式全新安装时，可读取数据目录下受保护的 <code>initial-password.txt</code>；首次登录会强制设置至少 8 位、同时含字母和数字的新口令，连续输错 5 次锁定 10 分钟。</p>
+        <p class="account-note mt16">初始口令由部署人员提供。非容器方式全新安装时，可读取数据目录下受保护的 <code>initial-password.txt</code>；首次登录会强制设置至少 8 位、同时含字母和数字的新口令。口令错误可无限次重试，连续错误 5 次后每次需输入验证码。</p>
       </section>
     </main>`;
 }
@@ -528,6 +590,8 @@ function navigationItems() {
       items: [
         { path: '/dashboard', label: '工作台', icon: 'dashboard' },
         { path: '/records', label: '校验记录', icon: 'records' },
+        { path: '/qr', label: '二维码', icon: 'qr' },
+        { path: '/help', label: '操作流程', icon: 'help' },
         { path: '/export', label: '导出与打印', icon: 'download' }
       ]
     }
@@ -814,7 +878,7 @@ function pageUpload() {
             <div><b>01 · 固定机位</b><br>整个校验过程保持手机位置不变，画面同时覆盖显示屏和称重仓。</div>
             <div><b>02 · 清晰卡面</b><br>开头依次展示人员卡、设备卡，每张停留不少于 2 秒。</div>
             <div><b>03 · 稳定读数</b><br>读数稳定后停留不少于 3 秒再取下砝码。</div>
-            <div><b>04 · 口述次序</b><br>清晰口述“第一次”至“第九次”，语音仅用于辅助校验。</div>
+            <div><b>04 · 稳定读数</b><br>每次示值稳定停留至少 3 秒，依次完成九次称量。</div>
           </div>
         </section>
         <section class="card">
@@ -956,7 +1020,7 @@ function pageRecords() {
   const inspectors = state.data.accounts.filter((account) => account.role === 'inspector' && account.status !== '已删除');
   return `${pageHeader(
     draftOnly ? '待核对记录' : '校验记录',
-    draftOnly ? '核对低置信读数、口述字段和砝码盒编号后，一键提交。' : '所有角色均可查询全部记录，不作“仅本人记录”限制。',
+    draftOnly ? '核对低置信读数、视觉复核确认项和砝码盒编号后，一键提交。' : '所有角色均可查询全部记录，不作“仅本人记录”限制。',
     `<button class="btn btn-secondary" data-action="export-records-csv">${icon('download')}导出当前筛选清单</button>`
   )}
     <form class="card filterbar" data-form="record-filter">
@@ -1207,7 +1271,7 @@ function pageRecordDetail(record) {
           <p class="muted small mt8">若视频已按容量策略清理，记录、截图和审计信息仍完整可查。</p>
         </section>
         <section class="card">
-          <div class="card-head"><h2>口述确认项</h2><span class="muted small">语音候选值</span></div>
+          <div class="card-head"><h2>人工复核确认项</h2><span class="muted small">现场观察后确认</span></div>
           ${[
             ['cleanliness', '清洁', ['是', '否', 'NA']],
             ['level', '水平调节', ['是', '否', 'NA']],
@@ -1293,6 +1357,87 @@ async function loadHistoryRecords(deviceId, pageNumber = 1) {
   if (parseRoute().path.startsWith('/history/')) render();
 }
 
+function historyTrendChart(records, device, point) {
+  const ordered = [...records]
+    .filter((record) => record.status !== '已作废')
+    .sort((left, right) => (
+      `${left.startTime || left.date} ${left.id}`.localeCompare(`${right.startTime || right.date} ${right.id}`)
+    ));
+  const nominal = Number(device.points?.[point]);
+  const rows = ordered.map((record) => {
+    const items = (recordEvaluation(record)?.items || [])
+      .filter((item) => Number(item.point) === point && item.value !== null && Number.isFinite(Number(item.value)));
+    return {
+      record,
+      items,
+      mean: items.length
+        ? items.reduce((sum, item) => sum + Number(item.value), 0) / items.length
+        : null
+    };
+  }).filter((row) => row.items.length);
+  if (!rows.length) {
+    return `<div class="empty"><strong>L${point + 1} 暂无可绘制示值</strong>完成校验后会显示误差曲线。</div>`;
+  }
+  const deviations = rows.flatMap((row) => row.items.map((item) => (Number(item.value) - nominal) * 1000));
+  const means = rows.map((row) => (row.mean - nominal) * 1000);
+  const range = Number(device.pointRange?.[point]) === 2 ? device.range2 : device.range1;
+  const dMg = Number(range?.d ?? device.d ?? 0.1);
+  const maxDeviation = Math.max(...deviations.map(Math.abs), ...means.map(Math.abs), 0);
+  const padding = Math.max((Math.max(...deviations) - Math.min(...deviations)) * 0.28, dMg * 1.5, 0.02);
+  let yMin = Math.min(0, ...deviations) - padding;
+  let yMax = Math.max(0, ...deviations) + padding;
+  if (yMax - yMin < dMg * 2) {
+    const center = (yMax + yMin) / 2;
+    yMin = center - dMg;
+    yMax = center + dMg;
+  }
+  const width = 760;
+  const height = 238;
+  const left = 62;
+  const right = 18;
+  const top = 18;
+  const bottom = 45;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const xAt = (index) => rows.length <= 1
+    ? left + plotWidth / 2
+    : left + (index / (rows.length - 1)) * plotWidth;
+  const yAt = (value) => top + ((yMax - value) / (yMax - yMin)) * plotHeight;
+  const ticks = Array.from({ length: 5 }, (_, index) => yMin + ((yMax - yMin) * index) / 4);
+  const axisDecimals = Math.abs(yMax - yMin) < 1 ? 2 : Math.abs(yMax - yMin) < 10 ? 1 : 0;
+  const meanPoints = rows.map((row, index) => `${xAt(index)},${yAt((row.mean - nominal) * 1000)}`).join(' ');
+  const labelEvery = Math.max(1, Math.ceil(rows.length / 7));
+  const toleranceMg = nominal * Number(recordEvaluation(rows[0].record)?.tol ?? device.tol ?? 0.05) / 100 * 1000;
+  const toleranceOutside = toleranceMg > Math.max(yMax, Math.abs(yMin)) + 0.001;
+  const pointColors = ['#0b8f7e', '#246da8', '#c17a17'];
+  const circles = rows.map((row, index) => {
+    const centerX = xAt(index);
+    return row.items.map((item, itemIndex) => {
+      const spread = (itemIndex - (row.items.length - 1) / 2) * 4;
+      return `<circle cx="${(centerX + spread).toFixed(2)}" cy="${yAt((Number(item.value) - nominal) * 1000).toFixed(2)}" r="2.8" fill="${pointColors[point]}" fill-opacity=".62"><title>${esc(item.key)} ${esc(item.value)} g</title></circle>`;
+    }).join('');
+  }).join('');
+  const dateLabels = rows.map((row, index) => {
+    if (index % labelEvery !== 0 && index !== rows.length - 1) return '';
+    const label = String(row.record.startTime || row.record.date).slice(5, 16).replace(' ', ' ');
+    const anchor = index === 0 ? 'start' : index === rows.length - 1 ? 'end' : 'middle';
+    return `<text x="${xAt(index).toFixed(2)}" y="${height - 20}" fill="#617786" font-size="9" text-anchor="${anchor}">${esc(label)}</text>`;
+  }).join('');
+  return `<div class="trend-chart">
+    <div class="trend-head"><strong>L${point + 1} · ${esc(nominal)} g</strong><span>纵轴按实测量差自动放大；点表示 3 次称量，折线表示均值</span></div>
+    <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="L${point + 1} 示值误差曲线，纵轴单位毫克">
+      <rect x="${left}" y="${top}" width="${plotWidth}" height="${plotHeight}" rx="5" fill="#f8fbfc" stroke="#d7e1e7"/>
+      ${ticks.map((tick) => `<line x1="${left}" y1="${yAt(tick).toFixed(2)}" x2="${left + plotWidth}" y2="${yAt(tick).toFixed(2)}" stroke="#dce5ea" stroke-dasharray="${Math.abs(tick) < 0.000001 ? '0' : '3 5'}"/><text x="${left - 9}" y="${(yAt(tick) + 3).toFixed(2)}" fill="#617786" font-size="9" text-anchor="end">${formatNumber(tick, axisDecimals)}</text>`).join('')}
+      <line x1="${left}" y1="${yAt(0).toFixed(2)}" x2="${left + plotWidth}" y2="${yAt(0).toFixed(2)}" stroke="#526b7a" stroke-width="1.2"/>
+      <polyline points="${meanPoints}" fill="none" stroke="${pointColors[point]}" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+      ${circles}
+      ${dateLabels}
+      <text x="13" y="${top + plotHeight / 2}" fill="#405766" font-size="10" text-anchor="middle" transform="rotate(-90 13 ${top + plotHeight / 2})">示值误差（mg）</text>
+    </svg>
+    <p class="trend-note">本点最大绝对偏差 ${formatNumber(maxDeviation, axisDecimals)} mg，容差约 ±${formatNumber(toleranceMg, 2)} mg${toleranceOutside ? '（容差线超出本图自动缩放范围）' : ''}。图中 0 表示标称值。</p>
+  </div>`;
+}
+
 function pageHistory(deviceId) {
   const device = deviceById(deviceId);
   if (!device) {
@@ -1312,7 +1457,7 @@ function pageHistory(deviceId) {
   return `${pageHeader(
     `${device.id} 历史汇总`,
     `${device.uniqueNo} · ${device.dept} · Max ${device.max}g / d ${device.d}mg`,
-    `<a class="btn btn-secondary" href="#/print/week?device=${encodeURIComponent(device.id)}&from=${attr(currentWeek.from)}&to=${attr(currentWeek.to)}">${icon('printer')}本周打印</a>
+    `<a class="btn btn-secondary" href="#/print/week?device=${encodeURIComponent(device.id)}&week=${attr(currentWeek.week)}">${icon('printer')}本周打印</a>
      <button class="btn btn-secondary" data-action="history-csv" data-device="${attr(device.id)}">${icon('download')}示值明细 CSV</button>`
   )}
     <form class="card filterbar" data-form="history-filter">
@@ -1346,7 +1491,13 @@ function pageHistory(deviceId) {
       </div>
     </section>
     <section class="card mt16">
-      <div class="card-head"><div><h2>示值明细汇总</h2><p>按标称点列出历次示值，不提供图形化趋势曲线</p></div></div>
+      <div class="card-head"><div><h2>示值误差曲线</h2><p>L1 / L2 / L3 分别自动缩放纵轴，突出每次称量的微小波动</p></div>${tag('单位 mg', 'blue')}</div>
+      <div class="trend-grid">
+        ${[0, 1, 2].map((point) => historyTrendChart(records, device, point)).join('')}
+      </div>
+    </section>
+    <section class="card mt16">
+      <div class="card-head"><div><h2>示值明细汇总</h2><p>按标称点列出历次示值与限内状态</p></div></div>
       ${records.length ? `<div class="table-wrap"><table class="readout-table">
         <thead><tr><th>日期 / 记录</th><th>L1 示值</th><th>L2 示值</th><th>L3 示值</th><th>结论</th><th>状态</th><th>异常说明</th></tr></thead>
         <tbody>${records.map((record) => {
@@ -1636,10 +1787,11 @@ function pageExport() {
         <div class="field"><label>单台天平</label><select name="device" required>
           ${devices.filter((device) => device.status === '在用').map((device) => `<option value="${attr(device.id)}">${esc(device.id)} · ${esc(device.uniqueNo)}</option>`).join('')}
         </select></div>
-        <div class="field mt12"><label>周一</label><input type="date" name="from" value="${attr(week.from)}" required></div>
-        <div class="field mt12"><label>周日</label><input type="date" name="to" value="${attr(week.to)}" required></div>
+        <div class="field mt12"><label>校验周</label><input type="week" name="week" value="${attr(week.week)}" required>
+          <p class="muted small mt8">当前：${esc(week.from)} 至 ${esc(week.to)}（周一至周日）</p>
+        </div>
         <button class="btn btn-primary btn-block mt16" type="submit">${icon('printer')}生成周统计 PDF</button>
-        <a class="btn btn-secondary btn-block mt8" href="#/print/week">在浏览器中预览</a>
+        <a class="btn btn-secondary btn-block mt8" href="#/print/week?week=${attr(week.week)}">在浏览器中预览</a>
       </form>
     </div>
     <section class="card mt16">
@@ -1657,10 +1809,131 @@ function pageExport() {
       </div>`).join('') || '<div class="empty">暂无导出历史</div>'}</div>
     </section>
     <section class="card mt16">
-      <div class="card-head"><h2>空白表与卡片清单</h2></div>
-      <p class="muted small">用于客户打印现有留档表和人员/设备二维码内容清单。卡片二维码建议使用 H 级纠错并固定在设备正面或侧面。</p>
-      <a class="btn btn-secondary mt12" href="#/print/blank">${icon('printer')}打开空白表与卡片清单</a>
+      <div class="card-head"><div><h2>二维码与空白表</h2><p>人员下载本人卡片；检验人员查询并导出天平设备卡</p></div></div>
+      <div class="row row-wrap mt12">
+        <a class="btn btn-primary" href="#/qr">${icon('qr')}打开二维码中心</a>
+        <a class="btn btn-secondary" href="#/print/blank">${icon('printer')}打印空白记录表</a>
+      </div>
     </section>`;
+}
+
+function pageQr() {
+  const user = state.data.user;
+  const devices = state.data.devices.filter((device) => device.status === '在用');
+  const selectedId = devices.some((device) => device.id === state.ui.qrDevice)
+    ? state.ui.qrDevice
+    : devices[0]?.id;
+  const device = devices.find((item) => item.id === selectedId) || null;
+  return `${pageHeader('二维码中心', '人员导出本人身份卡；检验人员按编号查询并导出天平设备卡。',
+    `<a class="btn btn-secondary" href="#/help">${icon('help')}查看操作流程</a>`)}
+    <div class="alert">二维码内容只包含人员账号或天平编号，不包含姓名、口令等敏感信息。卡片使用 H 级纠错，编号采用大号字体，便于长期张贴和视频识别。</div>
+    <div class="grid grid-2 mt16">
+      <section class="card qr-card-panel">
+        <div class="card-head"><div><h2>我的人员二维码</h2><p>每名人员只能下载自己的身份卡</p></div>${tag('本人专用', 'green')}</div>
+        <div class="identity-badge person">
+          <img class="qr-card-image" src="/api/qr/person.svg?account=${encodeURIComponent(user.id)}" alt="${attr(user.id)} 人员二维码">
+          <div class="qr-side-label"><span>人员身份识别码</span><strong>${esc(user.id)}</strong><b>${esc(user.name)} · ${esc(roleLabel(user.role))}</b><small>校验前请将本人卡片出示给镜头，不得转借。</small></div>
+        </div>
+        <div class="row row-wrap mt16">
+          <button class="btn btn-primary" data-action="qr-download-person">${icon('download')}下载 SVG 卡片</button>
+          <button class="btn btn-secondary" data-action="qr-download-person-png">${icon('download')}下载 PNG</button>
+          <a class="btn btn-secondary" href="#/print/qr?type=person">${icon('printer')}打印卡片</a>
+        </div>
+      </section>
+      <section class="card qr-card-panel">
+        <div class="card-head"><div><h2>天平设备二维码</h2><p>按天平编号或唯一号查询，再导出用于张贴</p></div>${tag('长期张贴', 'blue')}</div>
+        <form class="qr-search" data-form="qr-device-search">
+          <div class="field grow"><label for="qr-device-query">天平编号 / 唯一号</label><input id="qr-device-query" name="deviceQuery" required value="${attr(device?.id || '')}" list="qr-device-options" placeholder="例如 F001 或 DZTP170911C"></div>
+          <datalist id="qr-device-options">${devices.map((item) => `<option value="${attr(item.id)}">${esc(item.uniqueNo)} · ${esc(item.dept)}</option>`).join('')}</datalist>
+          <button class="btn btn-primary" type="submit">查询</button>
+        </form>
+        ${device ? `<div class="identity-badge device">
+          <img class="qr-card-image" src="/api/qr/device/${encodeURIComponent(device.id)}.svg" alt="${attr(device.id)} 天平二维码">
+          <div class="qr-side-label"><span>天平设备识别码</span><strong>${esc(device.id)}</strong><b>${esc(device.uniqueNo)} · ${esc(device.dept)}</b><small>扫描用于核对天平身份。请长期固定在设备正面或侧面，保持平整、无遮挡。</small></div>
+        </div>
+        <div class="row row-wrap mt16">
+          <button class="btn btn-primary" data-action="qr-download-device" data-id="${attr(device.id)}">${icon('download')}下载 SVG 卡片</button>
+          <button class="btn btn-secondary" data-action="qr-download-device-png" data-id="${attr(device.id)}">${icon('download')}下载 PNG</button>
+          <a class="btn btn-secondary" href="#/print/qr?type=device&id=${encodeURIComponent(device.id)}">${icon('printer')}打印卡片</a>
+        </div>` : '<div class="empty"><strong>暂无在用天平</strong>请先由复核确认人员建立天平档案。</div>'}
+      </section>
+    </div>
+    <section class="card mt16">
+      <div class="card-head"><h2>张贴与拍摄要求</h2></div>
+      <div class="qr-guidance-grid">
+        <div><b>设备卡</b><span>贴在天平正面显示屏旁，不遮住水平泡、按键或显示屏。设备卡可长期在画面中。</span></div>
+        <div><b>人员卡</b><span>开始校验时由本人出示，停留至少 2 秒。人员卡与设备卡同屏出现是允许的。</span></div>
+        <div><b>打印尺寸</b><span>建议卡片宽度不小于 70 mm；二维码本体不小于 40 mm × 40 mm。</span></div>
+      </div>
+    </section>`;
+}
+
+function pageHelp() {
+  const role = state.data.user.role;
+  return `${pageHeader('标准操作流程', '建议首次使用前完整阅读；可下载 PDF 或直接打印。',
+    `<button class="btn btn-primary" data-action="download-sop">${icon('download')}下载 PDF</button>
+     <button class="btn btn-secondary" data-action="print-window">${icon('printer')}打印</button>`)}
+    <section class="card sop-intro">
+      <div class="sop-number">01</div>
+      <div><h2>开始前准备</h2><p>确认电脑已连接内网，摄像头或固定手机支架已就位，天平开机并完成水平调节。人员二维码由本人保存；设备二维码应长期贴在天平上。</p></div>
+    </section>
+    <div class="sop-steps">
+      ${[
+        ['02', '确认身份', '登录系统后进入“二维码”，人员下载自己的身份卡并在镜头前出示；检验人员查询并打印对应天平设备卡。'],
+        ['03', '拍摄校验视频', '画面需同时覆盖天平显示屏、称重仓和身份卡。设备卡长期可见不影响人员卡识别。每次读数稳定停留至少 3 秒。'],
+        ['04', '上传并等待分析', '选择 MP4 / MOV 视频，确认拍摄时间后上传。任务按顺序自动分析；失败或待人工处理时查看原因。'],
+        ['05', '核对九次称重', '打开待提交记录，逐项核对真实识别帧、示值、低置信提示和缺次状态。修正错误必须填写理由。'],
+        ['06', '确认观察项并提交', '人工确认清洁、水平调节、内部校正是否通过和砝码盒编号。点击提交即完成电子确认。'],
+        ['07', '复核与归档', '复核确认人员检查证据后确认或退回。确认后的记录锁定；正式 PDF 可用于打印留档。']
+      ].map(([number, title, text]) => `<article class="card sop-step"><span>${number}</span><div><h3>${esc(title)}</h3><p>${esc(text)}</p></div></article>`).join('')}
+    </div>
+    <div class="grid grid-2 mt16">
+      <section class="card">
+        <div class="card-head"><h2>${isRole('inspector') ? '检验人员操作要点' : isRole('verifier') ? '复核确认人员操作要点' : '管理员操作要点'}</h2></div>
+        <ol class="sop-list">
+          ${role === 'inspector' ? `
+            <li>只上传本人完成的校验视频，人员卡必须与登录账号一致。</li>
+            <li>双量程天平先完成高量程三次，再切换量程完成低量程六次。</li>
+            <li>提交前处理全部低置信或缺失读数提示；不通过记录也需提交归档。</li>
+            <li>在“校验记录”选择天平查看历史趋势和自动缩放的误差曲线。</li>`
+          : role === 'verifier' ? `
+            <li>优先核对视频、九次识别帧、限值、偏差和修改理由。</li>
+            <li>确认即电子签名并锁定记录；退回时必须写明修改要求。</li>
+            <li>在“二维码”中查询天平编号，导出并张贴设备卡。</li>
+            <li>周统计表直接选择一个自然周，避免手工填写起止日期。</li>`
+          : `
+            <li>管理账号、天平档案、模板、队列、备份、容量和审计日志。</li>
+            <li>运行状态页按“每台在用天平每天 1 段”预估视频可存储时长。</li>
+            <li>下载操作流程 PDF 并组织三类角色培训。</li>
+            <li>管理员操作同样写入审计日志；不得修改已确认记录。</li>`}
+        </ol>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>常见问题</h2></div>
+        <div class="faq-list">
+          <details><summary>人员卡和设备卡能否同屏？</summary><p>可以。分析器会在一帧内检测多个二维码，也会跨多个抽样帧合并身份；只要最终各识别到唯一且一致的有效卡片即可。</p></details>
+          <details><summary>读数波动很小，图上看不出来怎么办？</summary><p>历史页使用“示值误差（mg）”作为纵轴，并按当前天平的实测波动自动缩放，不把曲线压在 0～Max 的大范围中。</p></details>
+          <details><summary>为什么自动记录还要人工确认清洁和水平？</summary><p>当前系统以视觉读数识别为主，已移除语音识别依赖。清洁、水平调节和内部校正结果由操作人员现场观察后确认。</p></details>
+          <details><summary>口令输错很多次会锁定吗？</summary><p>不会锁定，可以无限次重试。错误达到 5 次后，每次登录均需输入图中验证码。</p></details>
+        </div>
+      </section>
+    </div>`;
+}
+
+function pagePrintQr() {
+  const query = parseRoute().query;
+  const type = query.get('type') === 'device' ? 'device' : 'person';
+  const user = state.data.user;
+  const device = type === 'device' ? deviceById(query.get('id') || '') : null;
+  if (type === 'device' && !device) {
+    return '<div class="print-toolbar app-only"><a class="btn btn-secondary" href="#/qr">返回二维码</a></div><section class="card"><div class="empty">未找到天平设备卡</div></section>';
+  }
+  const src = type === 'person'
+    ? `/api/qr/person.svg?account=${encodeURIComponent(user.id)}`
+    : `/api/qr/device/${encodeURIComponent(device.id)}.svg`;
+  return `<div class="print-toolbar app-only"><div><strong>${type === 'person' ? '人员身份卡' : '天平设备卡'}打印预览</strong><div class="muted small">建议按实际尺寸打印，二维码本体不小于 40 mm</div></div>
+    <div class="row"><a class="btn btn-secondary" href="#/qr">返回二维码</a><button class="btn btn-primary" data-action="print-window">${icon('printer')}打印</button></div></div>
+    <article class="print-paper qr-print-paper"><img src="${src}" alt="${type === 'person' ? attr(user.id) : attr(device.id)} 二维码卡片"></article>`;
 }
 
 function pageAccounts() {
@@ -1670,15 +1943,16 @@ function pageAccounts() {
     <section class="card">
       <div class="alert">账号初始口令由部署配置或安全随机生成，不在审计日志中显示。新建或重置账号后会仅在当前对话框展示一次临时口令，首次登录强制改密。</div>
       <div class="table-wrap desktop-table"><table>
-        <thead><tr><th>账号</th><th>姓名</th><th>角色</th><th>状态</th><th>首次改密</th><th>登录锁定</th><th>最近登录</th><th class="col-actions">操作</th></tr></thead>
+        <thead><tr><th>账号</th><th>姓名</th><th>角色</th><th>状态</th><th>首次改密</th><th>验证码保护</th><th>最近登录</th><th class="col-actions">操作</th></tr></thead>
         <tbody>${accounts.map((account) => `<tr class="${account.status === '已删除' ? 'row-muted' : ''}">
           <td><b class="mono">${esc(account.id)}</b>${account.id === state.data.user.id ? '<div class="muted small">当前登录</div>' : ''}</td>
           <td>${esc(account.name)}</td><td>${tag(roleLabel(account.role), account.role === 'admin' ? 'gray' : account.role === 'verifier' ? 'violet' : 'blue')}</td>
           <td>${tag(account.status)}</td><td>${account.mustChangePassword ? tag('待修改', 'amber') : tag('已设置', 'gray')}</td>
-          <td>${account.lockedUntil ? `<span class="danger-text small">${esc(account.lockedUntil)}</span>` : '正常'}</td>
+          <td>${account.captchaRequired ? tag('已启用', 'amber') : tag('未触发', 'gray')}<div class="muted small">错误 ${Number(account.failedAttempts || 0)} 次</div></td>
           <td class="num">${esc(formatDate(account.lastLoginAt))}</td>
           <td class="col-actions"><div class="btn-group">
             <button class="btn btn-ghost btn-sm" data-action="account-edit" data-id="${attr(account.id)}">编辑</button>
+            <button class="btn btn-ghost btn-sm" data-action="qr-download-person-admin" data-id="${attr(account.id)}">二维码</button>
             <button class="btn btn-ghost btn-sm" data-action="account-reset" data-id="${attr(account.id)}">重置口令</button>
             ${account.id !== state.data.user.id && account.status !== '已删除' ? `<button class="btn btn-ghost btn-sm danger-text" data-action="account-delete" data-id="${attr(account.id)}">删除</button>` : ''}
           </div></td>
@@ -1756,6 +2030,9 @@ function pageSystem() {
   const logs = system.logs || {};
   const backedUp = (system.backups || state.data.backups || [])[0];
   const usage = Number(storage.percent ?? storage.usagePercent ?? storage.usedPercent ?? 0);
+  const estimate = storage.storageEstimate || {};
+  const activeDevices = Number(estimate.activeDeviceCount || 0);
+  const planningCount = Number(estimate.plannedDailyVideoCount || Math.max(1, activeDevices));
   return `${pageHeader('存储与运行状态', '服务健康、分析队列、磁盘容量、备份与配置集中查看。',
     `<button class="btn btn-secondary" data-action="system-refresh">${icon('refresh')}刷新</button>
      <button class="btn btn-secondary" data-action="health-check">${icon('server')}健康检查</button>`)}
@@ -1763,16 +2040,24 @@ function pageSystem() {
     <div class="grid grid-4 mt12">
       ${[
         ['数据库', system.database?.status || '正常', `探测 ${formatNumber(system.database?.latencyMs,2)} ms`, system.database?.status !== '异常'],
-        ['分析队列', `${Number(queue.queued || 0)} 段`, queue.running ? '单消费者运行中' : '当前空闲', true],
-        ['视频容量', `${formatNumber(storage.usedGb ?? (storage.usedBytes ? storage.usedBytes / 1024 / 1024 / 1024 : 0),1)} GB`, `配额 ${settings.videoQuotaGb || 200} GB`, usage < 100],
-        ['最近备份', backedUp ? formatDate(backedUp.time) : '暂无', '数据库与配置快照', Boolean(backedUp)]
-      ].map(([label, value, note, ok], index) => `<article class="card stat-card ${ok ? (index === 2 && usage >= 90 ? 'amber' : 'teal') : 'amber'}">
+        ['视频占用', `${formatNumber(storage.usedGb ?? (storage.usedBytes ? storage.usedBytes / 1024 / 1024 / 1024 : 0),1)} GB`, `配额 ${settings.videoQuotaGb || 200} GB · 已用 ${formatNumber(usage,1)}%`, usage < 100],
+        ['已有视频', `${Number(storage.videoCount || 0)} 个`, `平均 ${estimate.averageVideoSizeMb ? `${formatNumber(estimate.averageVideoSizeMb,1)} MB/段` : '暂无样本'}`, true],
+        ['预计还可记录', formatRetention(storage.retainDays), `${planningCount} 段/日 · ${estimate.limitingFactor || '按容量测算'}`, storage.retainDays !== null]
+      ].map(([label, value, note, ok], index) => `<article class="card stat-card ${ok ? (index === 1 && usage >= 90 ? 'amber' : 'teal') : 'amber'}">
         <div class="stat-label">${esc(label)}</div><div class="stat-value" style="${String(value).length > 12 ? 'font-size:16px' : ''}">${esc(value)}</div><div class="stat-note">${esc(note)}</div>
       </article>`).join('')}
     </div>
     <section class="card mt16">
-      <div class="card-head"><div><h2>各天平视频占用</h2><p>预计可保留 ${storage.retainDays === null ? '需继续积累用量样本' : `${Number(storage.retainDays)} 天`} · 磁盘可用 ${storage.diskAvailableBytes === null ? '无法探测' : formatFileSize(storage.diskAvailableBytes / 1024 / 1024)}</p></div>
+      <div class="card-head"><div><h2>容量与可存储时长预估</h2><p>${esc(estimate.basis || '按每台在用天平每天 1 次校验记录估算')}；同时受视频配额与磁盘可用空间限制</p></div>
         ${tag(`${Number(storage.videoCount || 0)} 个视频`, 'blue')}</div>
+      <div class="storage-estimate-grid">
+        <div><span>在用天平</span><strong>${activeDevices} 台</strong><small>通常每天各新增 1 段</small></div>
+        <div><span>预计每日新增</span><strong>${planningCount} 段</strong><small>${estimate.plannedDailyBytes ? formatFileSize(estimate.plannedDailyBytes / 1024 / 1024) : '需先有视频样本'}</small></div>
+        <div><span>配额剩余</span><strong>${formatFileSize(Number(estimate.quotaRemainingBytes || 0) / 1024 / 1024)}</strong><small>${formatRetention(estimate.quotaRetainDays)}</small></div>
+        <div><span>磁盘可用</span><strong>${storage.diskAvailableBytes === null ? '无法探测' : formatFileSize(storage.diskAvailableBytes / 1024 / 1024)}</strong><small>${formatRetention(estimate.diskRetainDays)}</small></div>
+        <div class="highlight"><span>综合可存储</span><strong>${formatRetention(storage.retainDays)}</strong><small>${storage.retainMonths !== null && storage.retainMonths !== undefined ? `${storage.retainMonths} 个月 · ` : ''}${esc(estimate.limitingFactor || '')}</small></div>
+        <div><span>最近备份</span><strong>${backedUp ? formatDate(backedUp.time) : '暂无'}</strong><small>数据库与配置快照</small></div>
+      </div>
       <div class="table-wrap"><table>
         <thead><tr><th>天平编号</th><th>视频数</th><th>占用容量</th></tr></thead>
         <tbody>${(storage.byDevice || []).map((item) => `<tr><td>${esc(item.id)}</td><td>${Number(item.count || 0)}</td><td>${formatNumber(item.sizeGb, 2)} GB</td></tr>`).join('') || '<tr><td colspan="3"><div class="empty">暂无视频占用数据</div></td></tr>'}</tbody>
@@ -1918,7 +2203,10 @@ function printRecordContent(record) {
       }).join('')}</tbody>
     </table>
     <table class="print-grid" style="margin-top:8px">
-      <tr><td class="label">外部校正</td><td>${esc(evaluation.conclusion || '')}</td>${detailConfig.show ? `<td class="label">${esc(detailConfig.label)}</td><td>9 次读数均在 (1±${esc(evaluation.tol ?? 0.05)}%)×L 内，稳定、齐全、顺序正确${device.ranges === 2 ? '且完成量程切换' : ''}</td>` : '<td colspan="2"></td>'}</tr>
+      <tr><td class="label">外部校正</td><td>${esc(evaluation.conclusion || '')}</td>${detailConfig.show ? `<td class="label">${esc(detailConfig.label)}</td><td>${evaluation.pass
+        ? `9 次读数均在 (1±${esc(evaluation.tol ?? 0.05)}%)×L 内，稳定、齐全、顺序正确${device.ranges === 2 ? '且完成量程切换' : ''}`
+        : `不通过：${esc((evaluation.reasons || []).map((reason) => reason.label).join('；') || '存在流程或测量异常')}`
+      }</td>` : '<td colspan="2"></td>'}</tr>
     </table>
     <div class="print-sign">
       <div>校验人员：${esc(accountName(record.submittedBy || record.inspector))}<br>签名时间：${esc(formatDate(record.submittedAt))}</div>
@@ -1933,20 +2221,75 @@ function pagePrintRecord(record) {
     <article class="print-paper">${printRecordContent(record)}</article>`;
 }
 
+async function loadWeekPrint(deviceId, weekValue) {
+  const key = `${deviceId}/${weekValue}`;
+  if (state.weekPrint.loading && state.weekPrint.key === key) return;
+  state.weekPrint = {
+    key,
+    loaded: false,
+    loading: true,
+    items: [],
+    error: ''
+  };
+  render();
+  const range = weekRangeFromIso(weekValue);
+  const query = new URLSearchParams({
+    devices: deviceId,
+    from: range.from,
+    to: range.to,
+    status: '已复核确认',
+    page: '1',
+    pageSize: '50'
+  });
+  try {
+    const result = await api(`/api/records?${query.toString()}`);
+    state.weekPrint = {
+      key,
+      loaded: true,
+      loading: false,
+      items: result.items || [],
+      error: ''
+    };
+  } catch (error) {
+    state.weekPrint = {
+      key,
+      loaded: true,
+      loading: false,
+      items: [],
+      error: errorMessage(error)
+    };
+  }
+  render();
+}
+
 function pagePrintWeek() {
   const query = parseRoute().query;
   const deviceId = query.get('device') || state.data.devices[0]?.id || '';
-  const week = naturalWeekRange();
-  const from = query.get('from') || week.from;
-  const to = query.get('to') || week.to;
+  const selectedWeek = query.get('week')
+    ? weekRangeFromIso(query.get('week'))
+    : {
+      from: query.get('from') || naturalWeekRange().from,
+      to: query.get('to') || naturalWeekRange().to,
+      week: query.get('week') || naturalWeekRange().week
+    };
+  const { from, to } = selectedWeek;
   const device = deviceById(deviceId);
-  const records = state.data.records.filter((record) => (
+  if (state.weekPrint.loading || !state.weekPrint.loaded || state.weekPrint.key !== `${deviceId}/${selectedWeek.week}`) {
+    return `<div class="print-toolbar app-only"><div><strong>每周天平校验统计记录 · A4 横向预览</strong><div class="muted small">${esc(deviceId)} · ${esc(selectedWeek.week)}</div></div>
+      <div class="row"><a class="btn btn-secondary" href="#/export">返回导出</a></div></div>
+      <section class="card"><div class="empty"><span class="spinner"></span>正在读取所选周的全部已复核记录…</div></section>`;
+  }
+  if (state.weekPrint.error) {
+    return `<div class="print-toolbar app-only"><a class="btn btn-secondary" href="#/export">返回导出</a></div>
+      <section class="card"><div class="empty"><strong>周统计读取失败</strong>${esc(state.weekPrint.error)}</div></section>`;
+  }
+  const records = (state.weekPrint?.items || []).filter((record) => (
     record.device === deviceId && record.status === '已复核确认' && record.date >= from && record.date <= to
   ));
   const dates = [...new Set(records.map((record) => record.date))].sort();
   const evals = records.map(recordEvaluation);
   const recordsForDate = (date) => records.filter((record) => record.date === date);
-  return `<div class="print-toolbar app-only"><div><strong>每周天平校验统计记录 · A4 横向预览</strong><div class="muted small">${esc(deviceId)} · ${esc(from)} ~ ${esc(to)}</div></div>
+  return `<div class="print-toolbar app-only"><div><strong>每周天平校验统计记录 · A4 横向预览</strong><div class="muted small">${esc(deviceId)} · ${esc(selectedWeek.week || '')} · ${esc(from)} ~ ${esc(to)}</div></div>
       <div class="row"><a class="btn btn-secondary" href="#/export">返回导出</a><button class="btn btn-primary" data-action="print-window">${icon('printer')}打印</button></div></div>
     <article class="print-paper week">
       <div class="print-title">每周天平校验统计记录表</div>
@@ -2122,6 +2465,14 @@ function render() {
     shell('导出与打印', 'PDF、CSV 与 A4 留档', pageExport(), { pathname: path });
     return;
   }
+  if (path === '/qr') {
+    shell('二维码中心', '人员身份卡与天平设备卡', pageQr(), { pathname: path });
+    return;
+  }
+  if (path === '/help') {
+    shell('标准操作流程', '从登录到复核归档的完整使用方法', pageHelp(), { pathname: path });
+    return;
+  }
   if (path === '/accounts') {
     shell('账号与角色', '人员权限与人员卡编号', pageAccounts(), { pathname: path });
     return;
@@ -2144,12 +2495,24 @@ function render() {
     return;
   }
   if (path === '/print/week') {
+    const query = parseRoute().query;
+    const selectedWeek = query.get('week') || naturalWeekRange().week;
+    const selectedDevice = query.get('device') || state.data.devices[0]?.id || '';
+    const printKey = `${selectedDevice}/${selectedWeek}`;
+    if (state.weekPrint.key !== printKey && !state.weekPrint.loading) {
+      window.setTimeout(() => loadWeekPrint(selectedDevice, selectedWeek), 0);
+    }
     root.innerHTML = `<main class="main" style="margin-left:0"><div class="content">${pagePrintWeek()}</div></main>`;
     wireDynamic();
     return;
   }
   if (path === '/print/blank') {
     root.innerHTML = `<main class="main" style="margin-left:0"><div class="content">${pagePrintBlank()}</div></main>`;
+    wireDynamic();
+    return;
+  }
+  if (path === '/print/qr') {
+    root.innerHTML = `<main class="main" style="margin-left:0"><div class="content">${pagePrintQr()}</div></main>`;
     wireDynamic();
     return;
   }
@@ -2267,6 +2630,38 @@ async function downloadFromApi(path, body, fallbackName, method = 'POST') {
   const blob = await response.blob();
   triggerDownload(blob, fileNameFromResponse(response, fallbackName));
   return blob.size;
+}
+
+async function downloadIdentityCard(path, fallbackName, format = 'svg') {
+  const separator = path.includes('?') ? '&' : '?';
+  const response = await fetchResponse(`${path}${separator}download=1`, { method: 'GET' });
+  const svgBlob = await response.blob();
+  if (format === 'svg') {
+    triggerDownload(svgBlob, fallbackName);
+    return;
+  }
+  const svgUrl = URL.createObjectURL(svgBlob);
+  try {
+    const image = new Image();
+    await new Promise((resolve, reject) => {
+      image.onload = resolve;
+      image.onerror = () => reject(new ClientError('二维码图像转换失败'));
+      image.src = svgUrl;
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = 1320;
+    canvas.height = 780;
+    const context = canvas.getContext('2d');
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    const pngBlob = await new Promise((resolve, reject) => {
+      canvas.toBlob((blob) => blob ? resolve(blob) : reject(new ClientError('PNG 生成失败')), 'image/png');
+    });
+    triggerDownload(pngBlob, fallbackName);
+  } finally {
+    URL.revokeObjectURL(svgUrl);
+  }
 }
 
 function parseStoredFilename(contentDisposition) {
@@ -2676,11 +3071,9 @@ function showManualTaskModal(task) {
           durationSeconds: data.durationSeconds ? Number(data.durationSeconds) : null,
           rangeSwitch: form.querySelector('[name="rangeSwitch"]')?.checked !== false,
           readouts,
-          speech: {
-            cleanliness: { value: data.cleanliness, conf: 1 },
-            level: { value: data.level, conf: 1 },
-            internalCal: { value: data.internalCal, conf: 1 }
-          }
+          cleanliness: data.cleanliness,
+          level: data.level,
+          internalCal: data.internalCal
         }
       });
       closeModal();
@@ -3017,7 +3410,7 @@ async function updateRecordField(recordId, field, value) {
   const body = {
     field,
     value,
-    reason: `记录核对页修改${field === 'box' ? '砝码盒编号' : '口述确认项'}`
+    reason: `记录核对页修改${field === 'box' ? '砝码盒编号' : '视觉复核确认项'}`
   };
   try {
     await api(`/api/records/${encodeURIComponent(recordId)}`, { method: 'PATCH', body });
@@ -3060,6 +3453,22 @@ async function handleAction(action, element) {
       const password = document.getElementById('login-password');
       if (account) account.value = element.dataset.account || '';
       if (password) password.focus();
+      return;
+    }
+    case 'refresh-login-captcha': {
+      const account = document.getElementById('login-account')?.value?.trim() || lastLoginAccount;
+      if (!account) {
+        toast('请先填写账号编号', 'warn');
+        return;
+      }
+      await withBusy(element, async () => {
+        loginCaptcha = await api(
+          `/api/auth/captcha?account=${encodeURIComponent(account)}`,
+          { allowUnauthorized: true }
+        );
+        lastLoginAccount = account;
+        renderLogin();
+      });
       return;
     }
     case 'toggle-sidebar':
@@ -3231,6 +3640,47 @@ async function handleAction(action, element) {
       });
       return;
     }
+    case 'qr-download-person':
+    case 'qr-download-person-png': {
+      await withBusy(element, async () => {
+        await downloadIdentityCard(
+          `/api/qr/person.svg?account=${encodeURIComponent(state.data.user.id)}`,
+          `人员二维码_${state.data.user.id}.${action.endsWith('-png') ? 'png' : 'svg'}`,
+          action.endsWith('-png') ? 'png' : 'svg'
+        );
+      });
+      toast('人员身份卡已下载', 'success');
+      return;
+    }
+    case 'qr-download-person-admin': {
+      await withBusy(element, async () => {
+        await downloadIdentityCard(
+          `/api/qr/person.svg?account=${encodeURIComponent(id)}`,
+          `人员二维码_${id}.svg`,
+          'svg'
+        );
+      });
+      toast(`人员 ${id} 身份卡已下载`, 'success');
+      return;
+    }
+    case 'qr-download-device':
+    case 'qr-download-device-png': {
+      await withBusy(element, async () => {
+        await downloadIdentityCard(
+          `/api/qr/device/${encodeURIComponent(id)}.svg`,
+          `天平二维码_${id}.${action.endsWith('-png') ? 'png' : 'svg'}`,
+          action.endsWith('-png') ? 'png' : 'svg'
+        );
+      });
+      toast(`天平 ${id} 设备卡已下载`, 'success');
+      return;
+    }
+    case 'download-sop':
+      await withBusy(element, async () => {
+        await downloadFromApi('/api/docs/sop.pdf', null, '天平校验视频分析系统_标准操作流程.pdf', 'GET');
+      });
+      toast('标准操作流程 PDF 已下载', 'success');
+      return;
     case 'export-records-csv':
       await withBusy(element, async () => {
         await downloadFromApi('/api/exports/csv', {
@@ -3556,12 +4006,19 @@ async function handleForm(form) {
     await withBusy(submit, async () => {
       const data = formObject(form);
       if (!data.account?.trim() || !data.password) throw new ClientError('请输入账号与口令');
+      lastLoginAccount = data.account.trim();
       try {
         const result = await api('/api/auth/login', {
           method: 'POST',
-          body: { account: data.account.trim(), password: data.password },
+          body: {
+            account: data.account.trim(),
+            password: data.password,
+            captchaToken: data.captchaToken || '',
+            captchaAnswer: data.captchaAnswer || ''
+          },
           allowUnauthorized: true
         });
+        loginCaptcha = null;
         state.session = result.user;
         state.csrfToken = result.csrfToken || '';
         if (result.user.mustChangePassword) {
@@ -3573,9 +4030,35 @@ async function handleForm(form) {
         navigate('/dashboard');
         toast(`登录成功：${result.user.name}`, 'success');
       } catch (error) {
+        if (error.details?.captchaRequired) {
+          loginCaptcha = error.details.captcha || loginCaptcha;
+          if (!loginCaptcha) {
+            try {
+              loginCaptcha = await api(
+                `/api/auth/captcha?account=${encodeURIComponent(data.account.trim())}`,
+                { allowUnauthorized: true }
+              );
+            } catch {
+              // The login error remains the primary message.
+            }
+          }
+        }
         renderLogin(errorMessage(error));
       }
     });
+    return;
+  }
+  if (type === 'qr-device-search') {
+    const data = formObject(form);
+    const query = String(data.deviceQuery || '').trim().toUpperCase();
+    const device = state.data.devices.find((item) => (
+      item.id.toUpperCase() === query || String(item.uniqueNo).toUpperCase() === query
+    ));
+    if (!device) throw new ClientError('未找到对应天平，请检查编号或唯一号');
+    if (device.status !== '在用') throw new ClientError(`天平 ${device.id} 已停用，不能生成新设备卡`);
+    state.ui.qrDevice = device.id;
+    render();
+    toast(`已查询天平 ${device.id}`, 'success');
     return;
   }
   if (type === 'change-password') {
@@ -3717,9 +4200,8 @@ async function handleForm(form) {
     await withBusy(submit, async () => {
       await downloadFromApi('/api/exports/week', {
         device: data.device,
-        from: data.from,
-        to: data.to
-      }, `天平校验周统计_${data.device}_${data.from.replaceAll('-', '')}-${data.to.replaceAll('-', '')}.pdf`);
+        week: data.week
+      }, `天平校验周统计_${data.device}_${data.week.replaceAll('-', '')}.pdf`);
       toast('周统计 PDF 已生成并开始下载', 'success');
       await loadState({ renderAfter: false });
     });

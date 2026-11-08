@@ -5,6 +5,7 @@ import {
   existsSync,
   lstatSync,
   readFileSync,
+  writeFileSync,
 } from 'node:fs';
 import { join, resolve } from 'node:path';
 import process from 'node:process';
@@ -58,6 +59,7 @@ const requiredFiles = [
   'src/db.js',
   'src/services/display-ocr.js',
   'src/rules.js',
+  'src/version.js',
 ];
 
 const secretPatterns = [
@@ -106,6 +108,153 @@ function splitNull(value) {
 
 function normalize(path) {
   return path.replaceAll('\\', '/');
+}
+
+function parseJsonFile(path) {
+  return JSON.parse(readFileSync(join(root, path), 'utf8'));
+}
+
+function versionState() {
+  const packageJson = parseJsonFile('package.json');
+  const packageLock = parseJsonFile('package-lock.json');
+  const composeText = readFileSync(join(root, 'docker-compose.yml'), 'utf8');
+  const composeMatch = composeText.match(/^(\s*image:\s*tianping-system:)([^\s#]+)(.*)$/m);
+  return {
+    packageJson,
+    packageLock,
+    composeText,
+    composeMatch,
+    packageVersion: packageJson.version,
+    lockVersion: packageLock.version,
+    lockRootVersion: packageLock.packages?.['']?.version,
+    composeVersion: composeMatch?.[2] || null,
+  };
+}
+
+function versionErrors() {
+  const state = versionState();
+  const errors = [];
+  const semver = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
+  if (!semver.test(String(state.packageVersion || ''))) {
+    errors.push(`package.json 版本不是有效的 x.y.z SemVer：${state.packageVersion}`);
+  }
+  const versions = new Set([
+    state.packageVersion,
+    state.lockVersion,
+    state.lockRootVersion,
+    state.composeVersion,
+  ]);
+  if (versions.size !== 1) {
+    errors.push(
+      `版本号不一致：package=${state.packageVersion}, lock=${state.lockVersion}, `
+      + `lockRoot=${state.lockRootVersion}, compose=${state.composeVersion}`,
+    );
+  }
+  return errors;
+}
+
+function bumpPartFromArgs() {
+  const index = commandArgs.findIndex((value) => value === '--bump');
+  const part = index === -1 ? 'patch' : commandArgs[index + 1];
+  if (!['patch', 'minor', 'major'].includes(part)) {
+    throw new Error('--bump 仅支持 patch、minor 或 major');
+  }
+  return part;
+}
+
+function nextVersion(version, part) {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(version));
+  if (!match) throw new Error(`无法递增无效版本号：${version}`);
+  let major = Number(match[1]);
+  let minor = Number(match[2]);
+  let patch = Number(match[3]);
+  if (part === 'major') {
+    major += 1;
+    minor = 0;
+    patch = 0;
+  } else if (part === 'minor') {
+    minor += 1;
+    patch = 0;
+  } else {
+    patch += 1;
+  }
+  return `${major}.${minor}.${patch}`;
+}
+
+function applyVersionBump(part) {
+  const consistencyErrors = versionErrors();
+  if (consistencyErrors.length > 0) {
+    throw new Error(consistencyErrors.join('；'));
+  }
+  const state = versionState();
+  const oldVersion = state.packageVersion;
+  const newVersion = nextVersion(oldVersion, part);
+  const tag = `v${newVersion}`;
+  if (git(['rev-parse', '--quiet', `refs/tags/${tag}`], { allowFailure: true })) {
+    throw new Error(`Git 标签 ${tag} 已存在，请检查当前版本号`);
+  }
+
+  const packageJson = {
+    ...state.packageJson,
+    version: newVersion,
+  };
+  const packageLock = {
+    ...state.packageLock,
+    version: newVersion,
+    packages: {
+      ...state.packageLock.packages,
+      '': {
+        ...(state.packageLock.packages?.[''] || {}),
+        version: newVersion,
+      },
+    },
+  };
+  const composeText = state.composeText.replace(
+    /^(\s*image:\s*tianping-system:)([^\s#]+)(.*)$/m,
+    `$1${newVersion}$3`,
+  );
+  const changes = [
+    {
+      path: 'package.json',
+      before: readFileSync(join(root, 'package.json'), 'utf8'),
+      after: `${JSON.stringify(packageJson, null, 2)}\n`,
+    },
+    {
+      path: 'package-lock.json',
+      before: readFileSync(join(root, 'package-lock.json'), 'utf8'),
+      after: `${JSON.stringify(packageLock, null, 2)}\n`,
+    },
+    {
+      path: 'docker-compose.yml',
+      before: state.composeText,
+      after: composeText,
+    },
+  ];
+
+  try {
+    for (const change of changes) {
+      writeFileSync(join(root, change.path), change.after, 'utf8');
+    }
+  } catch (error) {
+    for (const change of changes) {
+      writeFileSync(join(root, change.path), change.before, 'utf8');
+    }
+    throw error;
+  }
+  return {
+    oldVersion,
+    newVersion,
+    tag,
+    files: changes.map((change) => change.path),
+    changes,
+  };
+}
+
+function restoreVersionFiles(release) {
+  if (!release) return;
+  for (const change of release.changes) {
+    writeFileSync(join(root, change.path), change.before, 'utf8');
+  }
 }
 
 function isAllowed(path) {
@@ -196,6 +345,7 @@ function checkPolicy({ quiet = false } = {}) {
     const normalized = normalize(path);
     if (forbiddenReason(normalized)) errors.push(`Git 已跟踪禁止发布的文件：${normalized}`);
   }
+  errors.push(...versionErrors());
 
   if (errors.length > 0) {
     for (const error of errors) console.error(`ERROR ${error}`);
@@ -264,15 +414,34 @@ function messageFromArgs() {
 
 function commitIfNeeded(message) {
   git(['add', '-A']);
-  checkPolicy({ quiet: true });
-  const staged = splitNull(git(['diff', '--cached', '--name-only', '-z']));
-  if (staged.length === 0) {
+  const initialStaged = splitNull(git(['diff', '--cached', '--name-only', '-z']));
+  if (initialStaged.length === 0) {
     console.log('没有需要提交的源码变化。');
-    return false;
+    return null;
   }
-  git(['commit', '-m', message]);
-  console.log(`已提交 ${staged.length} 个文件：${message}`);
-  return true;
+  checkPolicy({ quiet: true });
+
+  let release = null;
+  let committed = false;
+  try {
+    release = applyVersionBump(bumpPartFromArgs());
+    git(['add', ...release.files]);
+    checkPolicy({ quiet: true });
+    const staged = splitNull(git(['diff', '--cached', '--name-only', '-z']));
+    const versionedMessage = `${message.replace(/\s+$/, '')} (v${release.newVersion})`;
+    git(['commit', '-m', versionedMessage]);
+    committed = true;
+    git(['tag', '-a', release.tag, '-m', `Release ${release.tag}`]);
+    console.log(`版本：${release.oldVersion} -> ${release.newVersion}（${bumpPartFromArgs()}）`);
+    console.log(`已提交 ${staged.length} 个文件并创建标签 ${release.tag}：${versionedMessage}`);
+    return release;
+  } catch (error) {
+    if (!committed && release) {
+      restoreVersionFiles(release);
+      git(['add', ...release.files]);
+    }
+    throw error;
+  }
 }
 
 function githubToken() {
@@ -359,6 +528,10 @@ function check() {
   runSourceCheck();
 }
 
+function exactTagAtHead() {
+  return git(['describe', '--tags', '--exact-match', 'HEAD'], { allowFailure: true });
+}
+
 function commit() {
   check();
   commitIfNeeded(messageFromArgs());
@@ -370,14 +543,26 @@ function backup() {
     throw new Error(`当前分支不是 ${branch}，拒绝自动备份`);
   }
   check();
-  commitIfNeeded(messageFromArgs());
+  const release = commitIfNeeded(messageFromArgs());
+  const releaseTag = release?.tag || exactTagAtHead();
 
   git(['push', '--porcelain', '--set-upstream', 'origin', branch], { stdio: 'inherit' });
+  if (releaseTag) {
+    git(['push', '--porcelain', 'origin', `refs/tags/${releaseTag}`], { stdio: 'inherit' });
+  }
   const localHead = git(['rev-parse', 'HEAD']);
   const remoteLine = git(['ls-remote', 'origin', `refs/heads/${branch}`]);
   const remoteHead = remoteLine.split(/\s+/)[0];
   if (!remoteHead || remoteHead !== localHead) {
     throw new Error('推送后远端 HEAD 与本地不一致，请检查 GitHub 状态');
+  }
+  if (releaseTag) {
+    const localTag = git(['rev-parse', releaseTag]);
+    const remoteTagLine = git(['ls-remote', 'origin', `refs/tags/${releaseTag}`]);
+    const remoteTag = remoteTagLine.split(/\s+/)[0];
+    if (!remoteTag || remoteTag !== localTag) {
+      throw new Error(`推送后远端标签 ${releaseTag} 与本地不一致`);
+    }
   }
   console.log(`GitHub 备份已同步：${localHead}`);
 }

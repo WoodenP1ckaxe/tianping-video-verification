@@ -159,7 +159,6 @@ HTTP 状态使用 400/401/403/404/409/413/415/429/500。接口不得把堆栈返
   "rangeSwitch": true,
   "personCard": {"account": "U001", "conf": 0.997},
   "deviceCard": {"code": "F001", "conf": 0.996},
-  "speech": {},
   "modifications": [],
   "templateVersion": "v1",
   "analyzedAt": "2026-09-28 08:46",
@@ -208,6 +207,7 @@ HTTP 状态使用 400/401/403/404/409/413/415/429/500。接口不得把堆栈返
 ### 认证和状态
 
 - `POST /api/auth/login`
+- `GET /api/auth/captcha?account=U001`
 - `POST /api/auth/logout`
 - `POST /api/auth/change-password`
 - `GET /api/session`
@@ -243,6 +243,9 @@ HTTP 状态使用 400/401/403/404/409/413/415/429/500。接口不得把堆栈返
 - `GET /api/audit`
 - `GET /api/system`
 - `POST /api/system/backup`
+- `GET /api/qr/person.svg?account=U001`
+- `GET /api/qr/device/F001.svg`
+- `GET /api/docs/sop.pdf`
 
 ### 导出
 
@@ -308,7 +311,6 @@ async function analyzeVideo(context)
   rangeSwitch: true,
   rangeTransition: {fromRange: 1, toRange: 2, startOffsetSeconds, endOffsetSeconds},
   readouts: [],
-  speech: {},
   screenshots: [],
   warnings: []
 }
@@ -319,6 +321,10 @@ async function analyzeVideo(context)
 二维码身份；缺少卡面或缺少任一有效读数截图时，队列不得生成自动正式记录。错误
 使用 `AnalyzerError(code, message, status)`，其中 `status` 可为 `待人工处理` 或
 `失败`。无法识别稳定示值时不返回伪造读数。
+
+当前识别适配器不包含 ASR/语音识别。二维码检测支持同一帧内的多个二维码：先解码
+主候选，再遮挡其区域继续解码，并以重叠竖/横条带补充扫描；身份在全部抽样帧上
+按类型前缀和已登记档案合并。
 
 ## 9. 队列契约
 
@@ -336,4 +342,7 @@ async function analyzeVideo(context)
 - 低置信读数、缺次、不稳定、超限必须在视觉上可区分。
 - 页面需要可打印版式，隐藏导航/按钮；正式导出由服务端生成。
 - 不使用任何 CDN、外链字体、远程图片、遥测或在线分析服务。
+- 验证码登录在连续 5 次口令错误后启用，但不锁定账号。
+- 周统计通过 HTML `week` 输入直接选择自然周，服务端换算周一至周日。
+- 曲线图以标称点差值的毫克数绘制，并针对实测波动自动缩放纵轴。
 

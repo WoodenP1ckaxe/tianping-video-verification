@@ -857,6 +857,112 @@ function mergeAdjacentReadings(readings) {
   return result;
 }
 
+function qrBounds(result, offsetX = 0, offsetY = 0) {
+  const points = result?.location
+    ? [
+      result.location.topLeftCorner,
+      result.location.topRightCorner,
+      result.location.bottomRightCorner,
+      result.location.bottomLeftCorner,
+    ]
+    : [];
+  if (!points.length) return null;
+  const xs = points.map((point) => Number(point.x) + offsetX);
+  const ys = points.map((point) => Number(point.y) + offsetY);
+  return {
+    x: Math.min(...xs),
+    y: Math.min(...ys),
+    width: Math.max(...xs) - Math.min(...xs),
+    height: Math.max(...ys) - Math.min(...ys),
+  };
+}
+
+function eraseQrArea(pixels, width, height, bounds) {
+  if (!bounds) return;
+  const padding = Math.max(6, Math.round(Math.min(bounds.width, bounds.height) * 0.14));
+  const left = Math.max(0, Math.floor(bounds.x - padding));
+  const right = Math.min(width, Math.ceil(bounds.x + bounds.width + padding));
+  const top = Math.max(0, Math.floor(bounds.y - padding));
+  const bottom = Math.min(height, Math.ceil(bounds.y + bounds.height + padding));
+  for (let y = top; y < bottom; y += 1) {
+    let offset = (y * width + left) * 4;
+    for (let x = left; x < right; x += 1) {
+      pixels[offset] = 255;
+      pixels[offset + 1] = 255;
+      pixels[offset + 2] = 255;
+      pixels[offset + 3] = 255;
+      offset += 4;
+    }
+  }
+}
+
+/**
+ * jsQR 一次通常只返回一个二维码。此函数先解码最大候选，再擦除其区域继续
+ * 查找，并对四个重叠分区补充扫描，以兼容人员卡与长期张贴的设备卡同屏。
+ */
+export function decodeQrCodesFromPixels(
+  sourcePixels,
+  width,
+  height,
+  maxCodes = 4
+) {
+  if (!sourcePixels || !width || !height) return [];
+  const working = new Uint8ClampedArray(sourcePixels);
+  const found = [];
+  const seen = new Set();
+  const add = (result, offsetX = 0, offsetY = 0) => {
+    const data = String(result?.data || '').trim();
+    if (!data || seen.has(data)) return false;
+    seen.add(data);
+    found.push({
+      data,
+      location: qrBounds(result, offsetX, offsetY),
+    });
+    return true;
+  };
+
+  for (let attempt = 0; attempt < maxCodes; attempt += 1) {
+    const decoded = jsQR(working, width, height, { inversionAttempts: 'attemptBoth' });
+    if (!decoded) break;
+    const before = found.length;
+    add(decoded);
+    const bounds = qrBounds(decoded);
+    eraseQrArea(working, width, height, bounds);
+    if (found.length === before && attempt >= 1) break;
+  }
+
+  if (found.length < 2) {
+    const overlapX = Math.round(width * 0.1);
+    const overlapY = Math.round(height * 0.1);
+    const halfWidth = Math.ceil(width / 2) + overlapX;
+    const halfHeight = Math.ceil(height / 2) + overlapY;
+    // Full-height vertical strips retain the square-ish framing jsQR expects
+    // for side-by-side cards; horizontal strips cover vertically stacked cards.
+    const regions = [
+      [0, 0, Math.min(width, halfWidth), height],
+      [Math.max(0, width - halfWidth), 0, Math.min(width, halfWidth), height],
+      [0, 0, width, Math.min(height, halfHeight)],
+      [0, Math.max(0, height - halfHeight), width, Math.min(height, halfHeight)],
+    ];
+    for (const [left, top, regionWidth, regionHeight] of regions) {
+      if (found.length >= maxCodes) break;
+      const crop = new Uint8ClampedArray(regionWidth * regionHeight * 4);
+      for (let row = 0; row < regionHeight; row += 1) {
+        const sourceStart = ((top + row) * width + left) * 4;
+        crop.set(
+          sourcePixels.subarray(sourceStart, sourceStart + regionWidth * 4),
+          row * regionWidth * 4
+        );
+      }
+      const decoded = jsQR(crop, regionWidth, regionHeight, {
+        inversionAttempts: 'attemptBoth',
+      });
+      if (decoded) add(decoded, left, top);
+    }
+  }
+  return found;
+}
+
 async function decodeCards(ffmpegPath, filePath, media, timeoutMs = 120_000) {
   const width = Number(media.width);
   const height = Number(media.height);
@@ -877,9 +983,15 @@ async function decodeCards(ffmpegPath, filePath, media, timeoutMs = 120_000) {
   const found = [];
   for (let offset = 0, second = 0; offset + frameBytes <= data.length; offset += frameBytes, second += 2) {
     const pixels = new Uint8ClampedArray(data.subarray(offset, offset + frameBytes));
-    const decoded = jsQR(pixels, width, height, { inversionAttempts: 'attemptBoth' });
-    if (decoded?.data) {
-      found.push({ data: decoded.data, offsetSeconds: second });
+    const decodedCards = decodeQrCodesFromPixels(pixels, width, height);
+    for (const [index, decoded] of decodedCards.entries()) {
+      found.push({
+        data: decoded.data,
+        location: decoded.location,
+        frameOffsetSeconds: second,
+        sameFrameIndex: index,
+        sameFrameCount: decodedCards.length,
+      });
     }
   }
   return found;

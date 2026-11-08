@@ -113,10 +113,34 @@ export class StorageService {
     }
     const byDeviceRows = [...deviceUsage.values()]
       .sort((left, right) => right.size_bytes - left.size_bytes);
-    const dailyBytes = this.dailyVideoBytes();
+    const observedDailyBytes = this.dailyVideoBytes();
     const remainingBytes = Math.max(0, quotaBytes - usedBytes);
-    const retainDays = dailyBytes > 0
-      ? Math.max(0, Math.floor(remainingBytes / dailyBytes))
+    const averageVideoBytes = videos.length
+      ? Math.round(usedBytes / videos.length)
+      : 0;
+    const activeDeviceCount = Number(this.db.prepare(`
+      SELECT COUNT(*) AS n FROM devices WHERE status = '在用'
+    `).get()?.n || 0);
+    // Planning assumption requested by operations: one validation video per
+    // active balance per day. Observed throughput is shown alongside it.
+    const plannedDailyVideoCount = Math.max(1, activeDeviceCount);
+    const plannedDailyBytes = averageVideoBytes > 0
+      ? averageVideoBytes * plannedDailyVideoCount
+      : null;
+    const quotaRetainDays = plannedDailyBytes
+      ? Math.max(0, Math.floor(remainingBytes / plannedDailyBytes))
+      : null;
+    const diskAvailableBytes = this.diskAvailableBytes();
+    const usableDiskBytes = diskAvailableBytes === null
+      ? null
+      : Math.max(0, diskAvailableBytes - Number(this.config.minFreeDiskBytes || 0));
+    const diskRetainDays = plannedDailyBytes && usableDiskBytes !== null
+      ? Math.max(0, Math.floor(usableDiskBytes / plannedDailyBytes))
+      : null;
+    const retainCandidates = [quotaRetainDays, diskRetainDays]
+      .filter((value) => value !== null);
+    const retainDays = retainCandidates.length
+      ? Math.min(...retainCandidates)
       : null;
     const warningActive = getSetting(this.db, 'capacityWarningActive', false);
     if (percent >= threshold && !warningActive) {
@@ -142,6 +166,30 @@ export class StorageService {
       threshold,
       warning: percent >= threshold,
       retainDays,
+      retainMonths: retainDays === null
+        ? null
+        : Math.round((retainDays / 30) * 10) / 10,
+      storageEstimate: {
+        basis: '按每台在用天平每天 1 次校验记录估算',
+        activeDeviceCount,
+        plannedDailyVideoCount,
+        averageVideoBytes,
+        averageVideoSizeMb: averageVideoBytes
+          ? Math.round((averageVideoBytes / 1024 ** 2) * 10) / 10
+          : null,
+        plannedDailyBytes,
+        observedDailyBytes: Math.round(observedDailyBytes),
+        quotaRemainingBytes: remainingBytes,
+        quotaRetainDays,
+        diskAvailableBytes,
+        usableDiskBytes,
+        diskRetainDays,
+        limitingFactor: retainDays === null
+          ? null
+          : quotaRetainDays === retainDays
+            ? '视频配额'
+            : '磁盘可用空间',
+      },
       byDevice: byDeviceRows.map((row) => ({
         id: row.id,
         count: row.count,
@@ -152,7 +200,7 @@ export class StorageService {
       backupBytes: sumFiles(backups),
       pendingUploadBytes: sumFiles(pendingUploads),
       pendingUploadCount: pendingUploads.length,
-      diskAvailableBytes: this.diskAvailableBytes(),
+      diskAvailableBytes,
       videoCount: videos.length,
       cleaned: this.db.prepare(
         'SELECT * FROM cleanup_log ORDER BY id DESC LIMIT 50'

@@ -1,6 +1,6 @@
 {
   "name": "tianping-video-verification",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "description": "电子天平日常校验视频分析系统",
@@ -24,6 +24,7 @@
     "@tesseract.js-data/eng": "^1.0.0",
     "jpeg-js": "^0.4.4",
     "jsqr": "^1.4.0",
+    "qrcode-generator": "1.4.4",
     "tesseract.js": "^7.0.0"
   }
 }
