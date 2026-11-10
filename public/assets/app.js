@@ -3,8 +3,8 @@
 const root = document.getElementById('app');
 const modalRoot = document.getElementById('modal-root');
 const toastRoot = document.getElementById('toast-root');
-let loginCaptcha = null;
 let lastLoginAccount = '';
+let sessionEpoch = 0;
 
 const ROLE_LABEL = {
   admin: '管理员',
@@ -47,6 +47,7 @@ const ICON_PATHS = {
   users: '<circle cx="9" cy="8" r="3"/><path d="M3.5 20c.3-4 2.3-6 5.5-6s5.2 2 5.5 6"/><path d="M15 5.5a3 3 0 0 1 0 5.8M16 14c2.7.4 4.2 2.4 4.5 5"/>',
   audit: '<path d="M5 3h14v18H5z"/><path d="M8 7h8M8 11h8M8 15h5"/>',
   server: '<rect x="3" y="4" width="18" height="6" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><path d="M7 7h.01M7 17h.01"/>',
+  bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/>',
   history: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3.5 2"/>',
   logout: '<path d="M10 4H5v16h5M14 8l4 4-4 4M8 12h10"/>',
   menu: '<path d="M4 7h16M4 12h16M4 17h16"/>',
@@ -75,8 +76,7 @@ const state = {
     masterTab: 'devices',
     qrDevice: '',
     deviceDirectoryQuery: '',
-    recordPage: 1,
-    auditPage: 1
+    recordPage: 1
   },
   filters: {
     records: {
@@ -91,7 +91,9 @@ const state = {
       device: '',
       from: '',
       to: '',
-      inspector: ''
+      inspector: '',
+      submittedFrom: '',
+      submittedTo: ''
     },
     history: {
       from: '',
@@ -102,7 +104,8 @@ const state = {
       from: '',
       to: '',
       account: '',
-      type: ''
+      type: '',
+      objectId: ''
     }
   },
   recordsView: {
@@ -143,6 +146,28 @@ const state = {
     totalPages: 1,
     error: ''
   },
+  notificationsView: {
+    loaded: false,
+    loading: false,
+    items: [],
+    total: 0,
+    unreadCount: 0,
+    unreadOnly: false,
+    page: 1,
+    pageSize: 20,
+    totalPages: 1,
+    error: ''
+  },
+  auditView: {
+    loaded: false,
+    loading: false,
+    items: [],
+    total: 0,
+    page: 1,
+    pageSize: 60,
+    totalPages: 1,
+    error: ''
+  },
   upload: {
     file: null,
     startedAt: '',
@@ -162,6 +187,45 @@ const state = {
   },
   modal: null
 };
+
+const sessionStateDefaults = structuredClone({
+  ui: state.ui,
+  filters: state.filters,
+  recordsView: state.recordsView,
+  historyView: state.historyView,
+  weekPrint: state.weekPrint,
+  verifyView: state.verifyView,
+  notificationsView: state.notificationsView,
+  auditView: state.auditView,
+  upload: state.upload
+});
+
+/**
+ * 清除所有账号作用域内的页面状态。递增会话代次后，旧账号尚未返回的
+ * 请求即使完成，也不得写入新账号的页面。
+ */
+function clearClientSessionState({ clearAccountHint = false } = {}) {
+  sessionEpoch += 1;
+  state.upload.abortController?.abort();
+  state.data = null;
+  state.session = null;
+  state.csrfToken = '';
+  state.route = '';
+  state.loadingRecordId = null;
+  state.ui = structuredClone(sessionStateDefaults.ui);
+  state.filters = structuredClone(sessionStateDefaults.filters);
+  state.recordsView = structuredClone(sessionStateDefaults.recordsView);
+  state.historyView = structuredClone(sessionStateDefaults.historyView);
+  state.weekPrint = structuredClone(sessionStateDefaults.weekPrint);
+  state.verifyView = structuredClone(sessionStateDefaults.verifyView);
+  state.notificationsView = structuredClone(sessionStateDefaults.notificationsView);
+  state.auditView = structuredClone(sessionStateDefaults.auditView);
+  state.upload = structuredClone(sessionStateDefaults.upload);
+  state.modal = null;
+  modalRoot.replaceChildren();
+  toastRoot.replaceChildren();
+  if (clearAccountHint) lastLoginAccount = '';
+}
 
 function esc(value) {
   return String(value ?? '')
@@ -225,6 +289,19 @@ function formatNumber(value, decimals = 4) {
 function formatDate(value) {
   if (!value) return '—';
   return String(value).replace('T', ' ').slice(0, 16);
+}
+
+function formatEpochDateTime(value) {
+  if (!value) return '—';
+  return new Date(Number(value)).toLocaleString('sv-SE', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).replace('T', ' ');
 }
 
 function formatFileSize(mb) {
@@ -416,10 +493,12 @@ async function fetchResponse(path, options = {}) {
       payload?.error?.details || null
     );
     if (response.status === 401 && !options.allowUnauthorized) {
-      state.session = null;
-      state.data = null;
-      state.csrfToken = '';
-      window.setTimeout(renderLogin, 0);
+      clearClientSessionState({ clearAccountHint: true });
+      void clearUploadSession();
+      window.setTimeout(
+        () => renderLogin('登录状态已失效，请重新登录。', { resetState: false }),
+        0
+      );
     }
     throw error;
   }
@@ -444,7 +523,9 @@ function errorMessage(error) {
 }
 
 async function loadState({ renderAfter = true } = {}) {
+  const requestEpoch = sessionEpoch;
   const data = await api('/api/state', { allowUnauthorized: true });
+  if (requestEpoch !== sessionEpoch) return null;
   state.data = data;
   state.session = data.user;
   state.csrfToken = data.csrfToken || state.csrfToken;
@@ -453,6 +534,8 @@ async function loadState({ renderAfter = true } = {}) {
   state.weekPrint.loaded = false;
   state.weekPrint.key = '';
   state.verifyView.loaded = false;
+  state.notificationsView.loaded = false;
+  state.auditView.loaded = false;
   if (renderAfter) render();
   return data;
 }
@@ -481,10 +564,9 @@ async function boot() {
   }
 }
 
-function renderLogin(message = '') {
-  state.data = null;
-  state.session = null;
-  state.csrfToken = '';
+function renderLogin(message = '', { clearAccountHint = false, resetState = true } = {}) {
+  if (resetState) clearClientSessionState({ clearAccountHint });
+  window.history.replaceState(null, '', '#/login');
   root.innerHTML = `
     <main class="login-page">
       <section class="login-visual">
@@ -508,16 +590,7 @@ function renderLogin(message = '') {
             <label for="login-password" class="required">口令</label>
             <input id="login-password" name="password" type="password" autocomplete="current-password" required placeholder="请输入口令">
           </div>
-          <div class="captcha-block mt12 ${loginCaptcha ? '' : 'hidden'}" id="login-captcha-block">
-            <label for="login-captcha" class="required">登录验证码</label>
-            <div class="captcha-row">
-              <div class="captcha-image">${loginCaptcha?.svg || ''}</div>
-              <button type="button" class="btn btn-secondary btn-sm" data-action="refresh-login-captcha">换一张</button>
-            </div>
-            <input id="login-captcha" name="captchaAnswer" autocomplete="off" maxlength="6" ${loginCaptcha ? 'required' : ''} placeholder="输入图中 6 位字符（不区分大小写）">
-            <input type="hidden" name="captchaToken" value="${attr(loginCaptcha?.token || '')}">
-            <p class="muted small mt8">连续错误 5 次后启用。验证码有效 5 分钟，不限制重试次数。</p>
-          </div>
+          <p class="muted small mt12">连续 5 次口令错误将锁定账号 10 分钟。请核对账号后再重试。</p>
           <button class="btn btn-primary btn-lg btn-block mt16" type="submit" data-submit-label>安全登录</button>
         </form>
       </section>
@@ -560,6 +633,7 @@ function renderChangePassword() {
 function navigationItems() {
   const queueCount = state.data?.queue?.queued || 0;
   const pendingVerify = Number(state.data?.recordSummary?.byStatus?.['已提交'] || 0);
+  const unreadNotifications = Number(state.data?.unreadNotifications || 0);
   const myDrafts = state.data?.records?.filter(
     (record) => record.status === '待提交' && record.inspector === state.data?.user?.id
   ).length || 0;
@@ -569,6 +643,7 @@ function navigationItems() {
       items: [
         { path: '/dashboard', label: '工作台', icon: 'dashboard' },
         { path: '/records', label: '校验记录', icon: 'records' },
+        { path: '/notifications', label: '通知中心', icon: 'bell', badge: unreadNotifications || null },
         { path: '/help', label: '操作流程', icon: 'help' },
         { path: '/export', label: '导出与打印', icon: 'download' }
       ]
@@ -593,7 +668,9 @@ function navigationItems() {
       { path: '/qr', label: '设备二维码', icon: 'qr' }
     );
   } else if (isRole('admin')) {
-    groups[0].items.splice(1, 0, { path: '/tasks', label: '分析队列', icon: 'tasks', badge: queueCount || null });
+    groups[0].items.splice(1, 0,
+      { path: '/tasks', label: '分析队列', icon: 'tasks', badge: queueCount || null }
+    );
     groups.push({
       label: '系统管理',
       items: [
@@ -613,6 +690,25 @@ function isActiveRoute(itemPath, routePath) {
   if (itemPath === '/records') return routePath === '/records' || routePath.startsWith('/records/') || routePath.startsWith('/history/');
   if (itemPath === '/tasks') return routePath === '/tasks';
   return routePath === itemPath;
+}
+
+function associateFieldLabels(container = root) {
+  let sequence = 0;
+  for (const field of container.querySelectorAll('.field')) {
+    const label = field.querySelector(':scope > label');
+    const control = field.querySelector(
+      'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), select, textarea'
+    );
+    if (!label || !control) continue;
+    if (!control.id) {
+      control.id = `field-${Date.now()}-${sequence++}`;
+    }
+    label.htmlFor = control.id;
+  }
+  const fileInput = container.querySelector('#video-file');
+  if (fileInput && !fileInput.getAttribute('aria-label')) {
+    fileInput.setAttribute('aria-label', '选择校验视频');
+  }
 }
 
 function shell(title, subtitle, content, options = {}) {
@@ -652,6 +748,7 @@ function shell(title, subtitle, content, options = {}) {
         <div class="content">${content}</div>
       </main>
     </div>`;
+  associateFieldLabels();
   wireDynamic();
 }
 
@@ -909,7 +1006,8 @@ function pageTasks() {
               <td>${tag(task.status)}</td>
               <td>${task.recordId
                 ? `<a href="#/records/${encodeURIComponent(task.recordId)}" class="mono">${esc(task.recordId)}</a>`
-                : task.reason ? `<span class="small danger-text">${esc(task.reason)}</span>` : '<span class="muted">—</span>'}</td>
+                : task.reason ? `<span class="small danger-text">${esc(task.reason)}</span>` : '<span class="muted">—</span>'}
+                ${(task.warnings || []).map((warning) => `<div class="muted small warn-text">${esc(warning)}</div>`).join('')}</td>
               <td class="num">${esc(formatDuration(task.durationMs))}</td>
               <td class="col-actions">${taskActions(task)}</td>
             </tr>`).join('')}</tbody>
@@ -921,6 +1019,7 @@ function pageTasks() {
             <p>${task.queuePosition ? `队列第 ${task.queuePosition} 位 · ` : ''}${esc(formatDate(task.queuedAt))} · ${esc(task.user)}</p>
             <p class="muted small">分析 ${esc(formatDate(task.startedAt))} · 完成 ${esc(formatDate(task.finishedAt))}</p>
             ${task.reason ? `<div class="alert ${task.status === '失败' ? 'danger' : 'warn'} mt8">${esc(task.reason)}</div>` : ''}
+            ${(task.warnings || []).map((warning) => `<div class="alert warn mt8">${esc(warning)}</div>`).join('')}
             <div class="btn-group mt8">${taskActions(task)}</div>
           </div>`).join('')}</div>` : `<div class="empty"><strong>暂无分析任务</strong>${isRole('inspector') ? '上传一段校验视频后，任务会进入串行队列。' : '目前没有系统内的分析任务。'}</div>`}
     </section>`;
@@ -938,11 +1037,17 @@ function taskActions(task) {
     actions.push(`<button class="btn btn-secondary btn-sm" data-action="task-retry" data-id="${attr(task.id)}">重试</button>`);
     actions.push(`<button class="btn btn-primary btn-sm" data-action="task-manual" data-id="${attr(task.id)}">人工补录</button>`);
   }
+  if (isRole('admin')
+    && ['失败', '待人工处理', '已取消'].includes(task.status)
+    && task.fileAvailable === false) {
+    actions.push(`<button class="btn btn-ghost btn-sm danger-text" data-action="task-purge" data-id="${attr(task.id)}">清理无效任务</button>`);
+  }
   return actions.join('') || '<span class="muted small">只读</span>';
 }
 
 async function loadRecordsPage(pageNumber = 1) {
   if (state.recordsView.loading) return;
+  const requestEpoch = sessionEpoch;
   const filter = state.filters.records;
   const draftOnly = parseRoute().query.get('draft') === '1';
   const page = Math.max(1, Number(pageNumber) || 1);
@@ -953,6 +1058,8 @@ async function loadRecordsPage(pageNumber = 1) {
   for (const device of filter.devices || []) query.append('devices', device);
   if (filter.from) query.set('from', filter.from);
   if (filter.to) query.set('to', filter.to);
+  if (filter.submittedFrom) query.set('submittedFrom', filter.submittedFrom);
+  if (filter.submittedTo) query.set('submittedTo', filter.submittedTo);
   if (draftOnly) {
     query.set('inspector', state.data.user.id);
     query.set('status', '待提交');
@@ -965,6 +1072,7 @@ async function loadRecordsPage(pageNumber = 1) {
   query.set('pageSize', '50');
   try {
     const result = await api(`/api/records?${query.toString()}`);
+    if (requestEpoch !== sessionEpoch) return;
     state.recordsView = {
       loaded: true,
       loading: false,
@@ -976,6 +1084,7 @@ async function loadRecordsPage(pageNumber = 1) {
       error: ''
     };
   } catch (error) {
+    if (requestEpoch !== sessionEpoch) return;
     state.recordsView = {
       ...state.recordsView,
       loaded: true,
@@ -983,7 +1092,75 @@ async function loadRecordsPage(pageNumber = 1) {
       error: errorMessage(error)
     };
   }
-  if (parseRoute().path === '/records') render();
+  if (requestEpoch === sessionEpoch && parseRoute().path === '/records') render();
+}
+
+async function loadNotificationsPage(pageNumber = 1) {
+  const requestEpoch = sessionEpoch;
+  const view = state.notificationsView;
+  view.loading = true;
+  view.error = '';
+  try {
+    const query = new URLSearchParams({
+      page: String(Math.max(1, Number(pageNumber) || 1)),
+      pageSize: '20'
+    });
+    if (view.unreadOnly) query.set('unread', '1');
+    const result = await api(`/api/notifications?${query}`);
+    if (requestEpoch !== sessionEpoch) return;
+    Object.assign(view, {
+      items: result.items || [],
+      total: Number(result.total || 0),
+      unreadCount: Number(result.unreadCount || 0),
+      page: Number(result.page || 1),
+      pageSize: Number(result.pageSize || 20),
+      totalPages: Number(result.totalPages || 1),
+      loaded: true
+    });
+    state.data.unreadNotifications = Number(result.unreadCount || 0);
+  } catch (error) {
+    if (requestEpoch !== sessionEpoch) return;
+    view.error = errorMessage(error);
+    view.loaded = true;
+  } finally {
+    if (requestEpoch !== sessionEpoch) return;
+    view.loading = false;
+    render();
+  }
+}
+
+function pageNotifications() {
+  const view = state.notificationsView;
+  return `${pageHeader(
+    '通知中心',
+    '记录退回等定向消息只发送给对应人员，并保留发送与已读时间。',
+    `<button class="btn btn-secondary" data-action="notifications-read-all" ${view.unreadCount ? '' : 'disabled'}>${icon('check')}全部标为已读</button>`
+  )}
+    <section class="card">
+      <div class="card-head">
+        <div><h2>消息</h2><p>未读 ${view.unreadCount || 0} 条 · 共 ${view.total} 条</p></div>
+        <label class="row"><input type="checkbox" id="notifications-unread-only" ${view.unreadOnly ? 'checked' : ''}> 仅未读</label>
+      </div>
+      ${view.error ? `<div class="alert danger">${esc(view.error)}</div>` : ''}
+      ${view.loading ? '<div class="empty"><span class="spinner"></span>正在读取通知…</div>' : view.items.length ? `
+        <div class="stack">${view.items.map((item) => `
+          <article class="card ${item.read ? '' : 'notification-unread'}">
+            <div class="row between row-wrap"><strong>${esc(item.title)}</strong>${item.read ? tag('已读', 'gray') : tag('未读', 'blue')}</div>
+            <p class="mt8">${esc(item.body).replaceAll('\n', '<br>')}</p>
+            <div class="row between row-wrap muted small mt8">
+              <span>${esc(formatDate(item.createdAt))} · ${esc(item.type)}</span>
+              <span class="row">
+                ${item.objectType === '校验记录' && item.objectId ? `<a class="btn btn-ghost btn-sm" href="#/records/${encodeURIComponent(item.objectId)}">查看记录</a>` : ''}
+                ${!item.read ? `<button class="btn btn-secondary btn-sm" data-action="notification-read" data-id="${item.id}">标为已读</button>` : ''}
+              </span>
+            </div>
+          </article>`).join('')}</div>` : '<div class="empty"><strong>暂无通知</strong></div>'}
+      ${view.totalPages > 1 ? `<div class="pagination">
+        <button class="btn btn-ghost" data-action="notifications-page" data-page="${view.page - 1}" ${view.page <= 1 ? 'disabled' : ''}>上一页</button>
+        <span>第 ${view.page} / ${view.totalPages} 页</span>
+        <button class="btn btn-ghost" data-action="notifications-page" data-page="${view.page + 1}" ${view.page >= view.totalPages ? 'disabled' : ''}>下一页</button>
+      </div>` : ''}
+    </section>`;
 }
 
 function pageRecords() {
@@ -1005,9 +1182,16 @@ function pageRecords() {
     `<button class="btn btn-secondary" data-action="export-records-csv">${icon('download')}导出当前筛选清单</button>`
   )}
     <form class="card filterbar" data-form="record-filter">
-      <div class="field"><label>天平编号（可多选）</label><select name="devices" multiple size="4">
-        ${state.data.devices.map((device) => `<option value="${attr(device.id)}" ${state.filters.records.devices.includes(device.id) ? 'selected' : ''}>${esc(device.id)} · ${esc(device.uniqueNo)}</option>`).join('')}
-      </select><span class="hint">按住 Ctrl / Command 多选；不选表示全部天平</span></div>
+      <fieldset class="field device-filter-field">
+        <legend>天平编号（可多选）</legend>
+        <div class="device-filter-options">
+          ${state.data.devices.map((device) => `<label class="device-filter-option ${device.status === '停用' ? 'is-disabled-device' : ''}">
+            <input type="checkbox" name="devices" value="${attr(device.id)}" ${state.filters.records.devices.includes(device.id) ? 'checked' : ''}>
+            <span><b>${esc(device.id)}</b><small>${esc(device.uniqueNo)}${device.status === '停用' ? ' · 已停用' : ''}</small></span>
+          </label>`).join('')}
+        </div>
+        <span class="hint">可同时勾选多台天平；不勾选表示全部天平</span>
+      </fieldset>
       <div class="field"><label>开始日期</label><input type="date" name="from" value="${attr(state.filters.records.from)}"></div>
       <div class="field"><label>结束日期</label><input type="date" name="to" value="${attr(state.filters.records.to)}"></div>
       <div class="field"><label>检验人员</label><select name="inspector">
@@ -1138,6 +1322,43 @@ function showFrameEvidenceModal(record, key) {
     </div>`);
 }
 
+function showRecognitionFrameModal(record, sequence) {
+  const segment = (record.recognition?.segments || []).find(
+    (candidate) => Number(candidate.sequence) === Number(sequence)
+  );
+  if (!segment?.screenshot) {
+    toast('该称重段没有保存识别帧', 'error');
+    return;
+  }
+  const offset = Number(segment.off || 0);
+  const label = `L${Number(segment.point) + 1} · 第${Number(segment.idx)}次`;
+  const imageUrl = frameImageUrl(record, segment);
+  openModal({
+    title: `称重时序识别帧 · ${label}`,
+    subtitle: `${record.device} · 序列 ${segment.sequence} · 视频绝对时间 ${formatVideoOffset(offset)}`,
+    wide: true,
+    body: `<div class="frame-proof">
+        <img src="${attr(imageUrl)}" alt="${attr(label)} 称重段识别帧">
+        <span class="recognized-region" style="${attr(bboxStyle(segment.bbox))}"></span>
+        <span class="frame-badge">${esc(label)} · ${formatVideoOffset(offset)}</span>
+      </div>
+      <div class="frame-evidence-meta">
+        <div><span>识别文本</span><strong class="mono">${esc(segment.recognizedText || `${segment.value} ${segment.unit || 'g'}`)}</strong></div>
+        <div><span>稳定段</span><strong class="mono">${Number(segment.segmentStart)}s ~ ${Number(segment.segmentEnd)}s</strong></div>
+        <div><span>合并平台</span><strong>${Number(segment.mergedWindowCount || 1)} 个</strong></div>
+        <div><span>识别置信度</span><strong>${Number.isFinite(Number(segment.conf)) ? `${Math.round(Number(segment.conf) * 100)}%` : '—'}</strong></div>
+        <div><span>稳定读数</span><strong>${segment.stable === false ? '否' : '是'}</strong></div>
+      </div>`,
+    primary: '关闭',
+    cancel: '',
+  });
+  const footer = modalRoot.querySelector('.modal-foot');
+  if (footer) {
+    footer.insertAdjacentHTML('afterbegin',
+      `<button type="button" class="btn btn-secondary" data-action="frame-play" data-id="${attr(record.id)}" data-off="${offset}">播放此帧</button>`);
+  }
+}
+
 function fieldSelect(record, field, options, label) {
   const editable = record.status === '待提交';
   return `<select class="record-field" data-record="${attr(record.id)}" data-field="${attr(field)}"
@@ -1155,6 +1376,9 @@ function pageRecordDetail(record) {
   const editable = owner && record.status === '待提交';
   const remarkEditable = owner && ['待提交', '已提交'].includes(record.status) && !isRole('verifier');
   const itemMap = new Map(evaluation.items.map((item) => [item.key, item]));
+  const recognitionSegments = Array.isArray(record.recognition?.segments)
+    ? record.recognition.segments
+    : [];
   const actionButtons = [];
   if (editable) {
     actionButtons.push(`<button class="btn btn-primary" data-action="submit-record" data-id="${attr(record.id)}">${icon('check')}一键提交</button>`);
@@ -1194,7 +1418,10 @@ function pageRecordDetail(record) {
           ['原始文件', record.file],
           ['文件大小', formatFileSize(record.fileSize)],
           ['SHA-256', record.sha],
-          ['模板版本', record.templateVersion || '—']
+          ['模板版本', record.templateVersion || '—'],
+          ['判定时间', record.judgedAt || evaluation.judgedAt || '—'],
+          ['规则版本', record.ruleVersion || evaluation.ruleVersion || '—'],
+          ['固定容差', `±${formatNumber(record.tolerancePercent ?? evaluation.tol, 4)}%`]
         ].map(([label, value]) => `<div class="meta-item"><span>${esc(label)}</span><strong class="${label === 'SHA-256' ? 'mono' : ''}">${esc(value)}</strong></div>`).join('')}
       </div>
     </section>
@@ -1241,13 +1468,31 @@ function pageRecordDetail(record) {
             </tr>`;
           }).join('')}</tbody>
         </table></div>
+        ${recognitionSegments.length ? `<div class="recognition-timeline">
+          <div class="row between row-wrap">
+            <div><b>真实称重段时序</b><p class="muted small">按视频时间排列，规则直接读取该序列；红色段表示超出每点 3 次。</p></div>
+            ${recognitionSegments.length > 9 ? tag(`共 ${recognitionSegments.length} 段`, 'red') : tag(`${recognitionSegments.length} 段`, 'green')}
+          </div>
+          <div class="recognition-sequence">
+            ${recognitionSegments.map((segment) => {
+              const extra = Number(segment.idx) > 3;
+              const action = segment.screenshot ? 'recognition-frame' : 'jump-video';
+              return `<button type="button" class="sequence-step ${extra ? 'extra' : ''} ${segment.stable === false ? 'unstable' : ''}"
+                data-action="${action}" data-id="${attr(record.id)}" data-sequence="${attr(segment.sequence)}" data-off="${attr(segment.off)}">
+                <b>L${Number(segment.point) + 1} · #${Number(segment.idx)}</b>
+                <span>${formatVideoOffset(segment.segmentStart)}–${formatVideoOffset(segment.segmentEnd)}</span>
+                <em>${extra ? '超出 3 次' : Number(segment.mergedWindowCount || 1) > 1 ? `已合并 ${Number(segment.mergedWindowCount)} 平台` : segment.stable === false ? '未稳定' : '稳定段'}</em>
+              </button>`;
+            }).join('')}
+          </div>
+        </div>` : ''}
         <div class="alert mt12">不稳定判定：连续不少于 3 秒且示值变化不超过 1 个显示分度值 d；取平台段最后有效读数。</div>
       </section>
       <aside class="stack">
         <section class="card">
           <div class="card-head"><div><h2>原始视频</h2><p>按需跳转到指定读数时间点</p></div></div>
           <div class="video-panel" id="video-panel">
-            <video id="record-video" controls preload="metadata" src="/api/records/${encodeURIComponent(record.id)}/video"></video>
+            <video id="record-video" controls preload="none" src="/api/records/${encodeURIComponent(record.id)}/video"></video>
           </div>
           <p class="muted small mt8">若视频已按容量策略清理，记录、截图和审计信息仍完整可查。</p>
         </section>
@@ -1300,6 +1545,7 @@ function pageRecordDetail(record) {
 
 async function loadHistoryRecords(deviceId, pageNumber = 1) {
   if (state.historyView.loading) return;
+  const requestEpoch = sessionEpoch;
   const filter = state.filters.history;
   const page = Math.max(1, Number(pageNumber) || 1);
   state.historyView.device = deviceId;
@@ -1315,6 +1561,7 @@ async function loadHistoryRecords(deviceId, pageNumber = 1) {
   query.set('pageSize', '200');
   try {
     const result = await api(`/api/records?${query.toString()}`);
+    if (requestEpoch !== sessionEpoch) return;
     state.historyView = {
       device: deviceId,
       loaded: true,
@@ -1327,6 +1574,7 @@ async function loadHistoryRecords(deviceId, pageNumber = 1) {
       error: ''
     };
   } catch (error) {
+    if (requestEpoch !== sessionEpoch) return;
     state.historyView = {
       ...state.historyView,
       device: deviceId,
@@ -1335,7 +1583,7 @@ async function loadHistoryRecords(deviceId, pageNumber = 1) {
       error: errorMessage(error)
     };
   }
-  if (parseRoute().path.startsWith('/history/')) render();
+  if (requestEpoch === sessionEpoch && parseRoute().path.startsWith('/history/')) render();
 }
 
 function historyTrendChart(records, device, point) {
@@ -1498,6 +1746,7 @@ function pageHistory(deviceId) {
 
 async function loadVerifyRecords(pageNumber = 1) {
   if (state.verifyView.loading) return;
+  const requestEpoch = sessionEpoch;
   const filter = state.filters.verify;
   const page = Math.max(1, Number(pageNumber) || 1);
   state.verifyView.loading = true;
@@ -1510,6 +1759,7 @@ async function loadVerifyRecords(pageNumber = 1) {
   if (filter.to) query.set('to', filter.to);
   try {
     const result = await api(`/api/records?${query.toString()}`);
+    if (requestEpoch !== sessionEpoch) return;
     state.verifyView = {
       loaded: true,
       loading: false,
@@ -1521,6 +1771,7 @@ async function loadVerifyRecords(pageNumber = 1) {
       error: ''
     };
   } catch (error) {
+    if (requestEpoch !== sessionEpoch) return;
     state.verifyView = {
       ...state.verifyView,
       loaded: true,
@@ -1528,7 +1779,7 @@ async function loadVerifyRecords(pageNumber = 1) {
       error: errorMessage(error)
     };
   }
-  if (parseRoute().path === '/verify') render();
+  if (requestEpoch === sessionEpoch && parseRoute().path === '/verify') render();
 }
 
 function pageVerify() {
@@ -1540,7 +1791,7 @@ function pageVerify() {
   }
   const pending = view.items;
   const inspectors = state.data.accounts.filter((account) => account.role === 'inspector');
-  return `${pageHeader('待复核记录', '复核确认即电子签名。确认后全部字段锁定；发现问题可退回或按现行方式口头通知。')}
+  return `${pageHeader('待复核记录', '复核确认即电子签名。确认后全部字段锁定；退回会向原检验人员发送站内通知。')}
     <form class="card filterbar" data-form="verify-filter">
       <div class="field"><label>天平编号</label><select name="device">
         <option value="">全部天平</option>
@@ -1552,6 +1803,8 @@ function pageVerify() {
       </select></div>
       <div class="field"><label>校验开始日期</label><input type="date" name="from" value="${attr(filter.from)}"></div>
       <div class="field"><label>校验结束日期</label><input type="date" name="to" value="${attr(filter.to)}"></div>
+      <div class="field"><label>提交开始日期</label><input type="date" name="submittedFrom" value="${attr(filter.submittedFrom)}"></div>
+      <div class="field"><label>提交结束日期</label><input type="date" name="submittedTo" value="${attr(filter.submittedTo)}"></div>
       <button class="btn btn-primary" type="submit">筛选</button>
       <button class="btn btn-secondary" type="button" data-action="reset-verify-filter">重置</button>
     </form>
@@ -1761,9 +2014,9 @@ function pageTemplate() {
           <thead><tr><th>字段</th><th>显示</th><th>显示名称</th><th>说明</th></tr></thead>
           <tbody>${fields.map((field, index) => `<tr>
             <td class="mono">${esc(field.key)}</td>
-            <td><input type="checkbox" name="show_${attr(field.key)}" ${field.show !== false ? 'checked' : ''} ${field.locked || !write ? 'disabled' : ''}></td>
-            <td><input name="label_${attr(field.key)}" value="${attr(field.label || '')}" ${field.locked || !write ? 'disabled' : ''}></td>
-            <td class="muted small">${field.locked ? '固定合规字段' : '可配置字段'}</td>
+            <td><input type="checkbox" name="show_${attr(field.key)}" ${field.show !== false ? 'checked' : ''} ${!write ? 'disabled' : ''}></td>
+            <td><input name="label_${attr(field.key)}" value="${attr(field.label || '')}" ${!write ? 'disabled' : ''}></td>
+            <td class="muted small">${field.locked ? '合规字段（可配置显示）' : '可配置字段'}</td>
           </tr>`).join('')}</tbody>
         </table></div>
         ${write ? `<div class="row row-wrap mt16">
@@ -2004,16 +2257,17 @@ function pagePrintQr() {
 function pageAccounts() {
   const accounts = state.data.accounts;
   return `${pageHeader('账号与角色', '一个账号只属于一种角色；检验人员账号编号用于人员身份证。',
-    `<button class="btn btn-primary" data-action="account-new">${icon('plus')}新增账号</button>`)}
+    `<a class="btn btn-secondary" href="/api/qr/cards.csv">${icon('download')}二维码内容清单</a>
+     <button class="btn btn-primary" data-action="account-new">${icon('plus')}新增账号</button>`)}
     <section class="card">
       <div class="alert">账号初始口令由部署配置或安全随机生成，不在审计日志中显示。新建或重置账号后会仅在当前对话框展示一次临时口令，首次登录强制改密。</div>
       <div class="table-wrap desktop-table"><table>
-        <thead><tr><th>账号</th><th>姓名</th><th>角色</th><th>状态</th><th>首次改密</th><th>验证码保护</th><th>最近登录</th><th class="col-actions">操作</th></tr></thead>
+        <thead><tr><th>账号</th><th>姓名</th><th>角色</th><th>状态</th><th>首次改密</th><th>登录保护</th><th>最近登录</th><th class="col-actions">操作</th></tr></thead>
         <tbody>${accounts.map((account) => `<tr class="${account.status === '已删除' ? 'row-muted' : ''}">
           <td><b class="mono">${esc(account.id)}</b>${account.id === state.data.user.id ? '<div class="muted small">当前登录</div>' : ''}</td>
           <td>${esc(account.name)}</td><td>${tag(roleLabel(account.role), account.role === 'admin' ? 'gray' : account.role === 'verifier' ? 'violet' : 'blue')}</td>
           <td>${tag(account.status)}</td><td>${account.mustChangePassword ? tag('待修改', 'amber') : tag('已设置', 'gray')}</td>
-          <td>${account.captchaRequired ? tag('已启用', 'amber') : tag('未触发', 'gray')}<div class="muted small">错误 ${Number(account.failedAttempts || 0)} 次</div></td>
+          <td>${account.isLocked ? tag('已锁定', 'red') : tag('正常', 'green')}<div class="muted small">错误 ${Number(account.failedAttempts || 0)} 次${account.isLocked && account.lockedUntil ? ` · 至 ${formatEpochDateTime(account.lockedUntil)}` : ''}</div></td>
           <td class="num">${esc(formatDate(account.lastLoginAt))}</td>
           <td class="col-actions"><div class="btn-group">
             <button class="btn btn-ghost btn-sm" data-action="account-edit" data-id="${attr(account.id)}">编辑</button>
@@ -2031,25 +2285,47 @@ function pageAccounts() {
     </section>`;
 }
 
-function filterAudit(rows) {
-  const filter = state.filters.audit;
-  return rows.filter((row) => {
-    const date = String(row.time || '').slice(0, 10);
-    if (filter.from && date < filter.from) return false;
-    if (filter.to && date > filter.to) return false;
-    if (filter.account && row.account !== filter.account) return false;
-    if (filter.type && row.type !== filter.type) return false;
-    return true;
-  });
+async function loadAuditPage(pageNumber = 1) {
+  const requestEpoch = sessionEpoch;
+  const view = state.auditView;
+  view.loading = true;
+  view.error = '';
+  try {
+    const query = new URLSearchParams({
+      page: String(Math.max(1, Number(pageNumber) || 1)),
+      pageSize: String(view.pageSize || 60)
+    });
+    Object.entries(state.filters.audit).forEach(([key, value]) => {
+      if (value) query.set(key, value);
+    });
+    const result = await api(`/api/audit?${query}`);
+    if (requestEpoch !== sessionEpoch) return;
+    Object.assign(view, {
+      items: result.items || [],
+      total: Number(result.total || 0),
+      page: Number(result.page || 1),
+      pageSize: Number(result.pageSize || 60),
+      totalPages: Number(result.totalPages || 1),
+      loaded: true
+    });
+  } catch (error) {
+    if (requestEpoch !== sessionEpoch) return;
+    view.error = errorMessage(error);
+    view.loaded = true;
+  } finally {
+    if (requestEpoch !== sessionEpoch) return;
+    view.loading = false;
+    render();
+  }
 }
 
 function pageAudit() {
-  const rows = filterAudit(state.data.audit || []);
+  const view = state.auditView;
   const types = [...new Set((state.data.audit || []).map((row) => row.type))].sort();
-  const pageSize = 60;
-  const pages = Math.max(1, Math.ceil(rows.length / pageSize));
-  const page = Math.min(state.ui.auditPage, pages);
-  const pageRows = rows.slice((page - 1) * pageSize, page * pageSize);
+  const pageSize = view.pageSize;
+  const pages = view.totalPages;
+  const page = view.page;
+  const pageRows = view.items;
   return `${pageHeader('审计日志', '只读事件流。登录、上传、分析、修改、提交、复核、导出、作废与系统配置均留痕。',
     `<button class="btn btn-secondary" data-action="export-audit">${icon('download')}导出 CSV</button>`)}
     <form class="card filterbar" data-form="audit-filter">
@@ -2063,11 +2339,14 @@ function pageAudit() {
         <option value="">全部类型</option>
         ${types.map((type) => `<option value="${attr(type)}" ${state.filters.audit.type === type ? 'selected' : ''}>${esc(type)}</option>`).join('')}
       </select></div>
+      <div class="field"><label for="audit-object-id">对象标识</label><input id="audit-object-id" name="objectId" value="${attr(state.filters.audit.objectId)}" placeholder="记录、任务、账号或设备编号"></div>
       <button class="btn btn-primary" type="submit">查询</button>
       <button class="btn btn-secondary" type="button" data-action="reset-audit-filter">重置</button>
     </form>
     <section class="card">
-      <div class="card-head"><div><h2>${rows.length} 条事件</h2><p>日志只读，不提供页面编辑或删除入口</p></div><span class="muted small">第 ${page} / ${pages} 页</span></div>
+      <div class="card-head"><div><h2>${view.total} 条事件</h2><p>日志只读，不提供页面编辑或删除入口；查询由服务端分页。</p></div><span class="muted small">第 ${page} / ${pages} 页</span></div>
+      ${view.error ? `<div class="alert danger">${esc(view.error)}</div>` : ''}
+      ${view.loading ? '<div class="empty"><span class="spinner"></span>正在读取审计日志…</div>' : ''}
       <div class="table-wrap"><table>
         <thead><tr><th>时间</th><th>操作人</th><th>类型</th><th>对象</th><th>修改与理由</th><th>来源 / 结果</th></tr></thead>
         <tbody>${pageRows.map((row) => `<tr>
@@ -2081,7 +2360,7 @@ function pageAudit() {
       </table></div>
       <div class="row between mt12">
         <button class="btn btn-secondary btn-sm" data-action="audit-page" data-page="${page - 1}" ${page <= 1 ? 'disabled' : ''}>上一页</button>
-        <span class="muted small">单页最多 ${pageSize} 条</span>
+        <span class="muted small">单页 ${pageSize} 条 · 共 ${view.total} 条</span>
         <button class="btn btn-secondary btn-sm" data-action="audit-page" data-page="${page + 1}" ${page >= pages ? 'disabled' : ''}>下一页</button>
       </div>
     </section>`;
@@ -2323,6 +2602,7 @@ function pagePrintRecord(record) {
 }
 
 async function loadWeekPrint(deviceId, weekValue) {
+  const requestEpoch = sessionEpoch;
   const key = `${deviceId}/${weekValue}`;
   if (state.weekPrint.loading && state.weekPrint.key === key) return;
   state.weekPrint = {
@@ -2344,6 +2624,7 @@ async function loadWeekPrint(deviceId, weekValue) {
   });
   try {
     const result = await api(`/api/records?${query.toString()}`);
+    if (requestEpoch !== sessionEpoch) return;
     state.weekPrint = {
       key,
       loaded: true,
@@ -2352,6 +2633,7 @@ async function loadWeekPrint(deviceId, weekValue) {
       error: ''
     };
   } catch (error) {
+    if (requestEpoch !== sessionEpoch) return;
     state.weekPrint = {
       key,
       loaded: true,
@@ -2360,7 +2642,7 @@ async function loadWeekPrint(deviceId, weekValue) {
       error: errorMessage(error)
     };
   }
-  render();
+  if (requestEpoch === sessionEpoch) render();
 }
 
 function pagePrintWeek() {
@@ -2475,6 +2757,13 @@ function render() {
     shell(isRole('admin') ? '分析队列' : '我的分析任务', 'FIFO 串行分析与异常任务处理', pageTasks(), { pathname: path });
     return;
   }
+  if (path === '/notifications') {
+    if (!state.notificationsView.loaded && !state.notificationsView.loading) {
+      window.setTimeout(() => loadNotificationsPage(1), 0);
+    }
+    shell('通知中心', '记录退回与系统定向消息', pageNotifications(), { pathname: path });
+    return;
+  }
   if (path === '/records') {
     const drafts = query.get('draft') === '1';
     if (!state.recordsView.loaded && !state.recordsView.loading) {
@@ -2559,6 +2848,9 @@ function render() {
     return;
   }
   if (path === '/audit') {
+    if (!state.auditView.loaded && !state.auditView.loading) {
+      window.setTimeout(() => loadAuditPage(1), 0);
+    }
     shell('审计日志', '不可编辑的系统事件流', pageAudit(), { pathname: path });
     return;
   }
@@ -2687,8 +2979,8 @@ function selectedValues(name) {
 }
 
 async function refreshAndRender() {
-  await loadState({ renderAfter: false });
-  render();
+  const loaded = await loadState({ renderAfter: false });
+  if (loaded) render();
 }
 
 function triggerDownload(blob, fileName) {
@@ -2783,7 +3075,9 @@ function recordDetailById(id) {
 }
 
 async function loadRecordDetail(id) {
+  const requestEpoch = sessionEpoch;
   const result = await api(`/api/records/${encodeURIComponent(id)}`);
+  if (requestEpoch !== sessionEpoch) return null;
   if (!result?.record) throw new ClientError('服务端未返回记录详情');
   const record = {
     ...result.record,
@@ -3542,22 +3836,26 @@ async function handleAction(action, element) {
     case 'retry-boot':
       boot();
       return;
-    case 'refresh-login-captcha': {
-      const account = document.getElementById('login-account')?.value?.trim() || lastLoginAccount;
-      if (!account) {
-        toast('请先填写账号编号', 'warn');
-        return;
-      }
+    case 'notifications-page':
+      await loadNotificationsPage(element.dataset.page);
+      return;
+    case 'notification-read':
+      await api(`/api/notifications/${encodeURIComponent(id)}/read`, {
+        method: 'POST',
+        body: {}
+      });
+      await loadNotificationsPage(state.notificationsView.page || 1);
+      return;
+    case 'notifications-read-all':
       await withBusy(element, async () => {
-        loginCaptcha = await api(
-          `/api/auth/captcha?account=${encodeURIComponent(account)}`,
-          { allowUnauthorized: true }
-        );
-        lastLoginAccount = account;
-        renderLogin();
+        await api('/api/notifications/read-all', {
+          method: 'POST',
+          body: {}
+        });
+        toast('全部通知已标为已读', 'success');
+        await loadNotificationsPage(state.notificationsView.page || 1);
       });
       return;
-    }
     case 'toggle-sidebar':
       state.ui.sidebarOpen = !state.ui.sidebarOpen;
       document.getElementById('sidebar')?.classList.toggle('open', state.ui.sidebarOpen);
@@ -3568,12 +3866,9 @@ async function handleAction(action, element) {
       } catch {
         // Local session still needs to be cleared if the server session already expired.
       }
-      state.data = null;
-      state.session = null;
-      state.csrfToken = '';
-      closeModal();
-      window.location.hash = '#/login';
-      renderLogin('已安全退出。');
+      await clearUploadSession();
+      clearClientSessionState({ clearAccountHint: true });
+      renderLogin('已安全退出。', { resetState: false });
       return;
     }
     case 'upload-clear':
@@ -3620,6 +3915,31 @@ async function handleAction(action, element) {
       if (task) showManualTaskModal(task);
       return;
     }
+    case 'task-purge': {
+      const task = state.data.tasks.find((candidate) => candidate.id === id);
+      if (!task) return;
+      openModal({
+        title: `清理无效任务 ${task.id}`,
+        subtitle: '仅用于源文件已经缺失的失败、待处理或已取消任务',
+        body: `<div class="alert danger">该操作会删除任务记录本身。已有正式记录、源文件仍存在或仍在分析的任务不会被删除。</div>
+          <div class="field full mt12"><label class="required" for="task-purge-reason">清理理由</label>
+            <textarea id="task-purge-reason" name="reason" required placeholder="说明文件缺失、损坏或无效任务的核实过程"></textarea></div>`,
+        primary: '确认清理任务',
+        danger: true,
+        onConfirm: async (form) => {
+          const reason = formObject(form).reason?.trim();
+          if (!reason) throw new ClientError('请填写清理理由');
+          await api(`/api/tasks/${encodeURIComponent(task.id)}/purge`, {
+            method: 'POST',
+            body: { reason }
+          });
+          closeModal();
+          toast('无效任务已清理并写入审计日志', 'warn');
+          await refreshAndRender();
+        }
+      });
+      return;
+    }
     case 'refresh-data':
       await refreshAndRender();
       toast('数据已刷新', 'success');
@@ -3633,6 +3953,11 @@ async function handleAction(action, element) {
     case 'frame-evidence': {
       const record = recordDetailById(id);
       if (record) showFrameEvidenceModal(record, element.dataset.key || '');
+      return;
+    }
+    case 'recognition-frame': {
+      const record = recordDetailById(id);
+      if (record) showRecognitionFrameModal(record, element.dataset.sequence || '');
       return;
     }
     case 'frame-play': {
@@ -3970,8 +4295,7 @@ async function handleAction(action, element) {
       });
       return;
     case 'audit-page':
-      state.ui.auditPage = Math.max(1, Number(element.dataset.page || 1));
-      render();
+      await loadAuditPage(Math.max(1, Number(element.dataset.page || 1)));
       return;
     case 'records-page':
       await loadRecordsPage(Math.max(1, Number(element.dataset.page || 1)));
@@ -4000,15 +4324,28 @@ async function handleAction(action, element) {
       return;
     }
     case 'reset-verify-filter':
-      state.filters.verify = { device: '', from: '', to: '', inspector: '' };
+      state.filters.verify = {
+        device: '',
+        from: '',
+        to: '',
+        inspector: '',
+        submittedFrom: '',
+        submittedTo: ''
+      };
       state.verifyView.loaded = false;
       state.verifyView.page = 1;
       await loadVerifyRecords(1);
       return;
     case 'reset-audit-filter':
-      state.filters.audit = { from: '', to: '', account: '', type: '' };
-      state.ui.auditPage = 1;
-      render();
+      state.filters.audit = {
+        from: '',
+        to: '',
+        account: '',
+        type: '',
+        objectId: ''
+      };
+      state.auditView.loaded = false;
+      await loadAuditPage(1);
       return;
     case 'export-audit':
       await withBusy(element, async () => {
@@ -4128,37 +4465,23 @@ async function handleForm(form) {
           method: 'POST',
           body: {
             account: data.account.trim(),
-            password: data.password,
-            captchaToken: data.captchaToken || '',
-            captchaAnswer: data.captchaAnswer || ''
+            password: data.password
           },
           allowUnauthorized: true
         });
-        loginCaptcha = null;
+        clearClientSessionState();
         state.session = result.user;
         state.csrfToken = result.csrfToken || '';
         if (result.user.mustChangePassword) {
           renderChangePassword();
           return;
         }
-        await loadState({ renderAfter: false });
+        const loaded = await loadState({ renderAfter: false });
+        if (!loaded) return;
         await restoreUploadSession();
         navigate('/dashboard');
         toast(`登录成功：${result.user.name}`, 'success');
       } catch (error) {
-        if (error.details?.captchaRequired) {
-          loginCaptcha = error.details.captcha || loginCaptcha;
-          if (!loginCaptcha) {
-            try {
-              loginCaptcha = await api(
-                `/api/auth/captcha?account=${encodeURIComponent(data.account.trim())}`,
-                { allowUnauthorized: true }
-              );
-            } catch {
-              // The login error remains the primary message.
-            }
-          }
-        }
         renderLogin(errorMessage(error));
       }
     });
@@ -4254,8 +4577,8 @@ async function handleForm(form) {
       ...state.filters.audit,
       ...formObject(form)
     };
-    state.ui.auditPage = 1;
-    render();
+    state.auditView.loaded = false;
+    await loadAuditPage(1);
     return;
   }
   if (type === 'template-save') {
@@ -4474,6 +4797,12 @@ document.addEventListener('change', async (event) => {
     state.upload.confirmed = target.checked;
     await saveUploadSession().catch(() => {});
     render();
+    return;
+  }
+  if (target.id === 'notifications-unread-only') {
+    state.notificationsView.unreadOnly = target.checked;
+    state.notificationsView.loaded = false;
+    await loadNotificationsPage(1);
     return;
   }
   const recordField = target.closest('.record-field');

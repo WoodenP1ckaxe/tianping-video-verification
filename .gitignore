@@ -16,9 +16,7 @@ coverage/
 *.sqlite
 *.sqlite3
 
-# Delivery-only material; kept locally, never published to the source repository
-/docs/
-/tests/
+# Local verification output and temporary test data
 /verification/
 /tests/tmp/
 /verification/tmp/

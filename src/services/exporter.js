@@ -4,6 +4,7 @@ import {
   statSync,
 } from 'node:fs';
 import {
+  calculateLimits,
   evaluateRecord,
   formatNumber,
   judgementBasis,
@@ -56,6 +57,16 @@ function templateField(template, key) {
     show: configured?.show !== false,
     locked: configured?.locked === true,
   };
+}
+
+function evaluationForRecord(record, device, tolerancePercent) {
+  const persisted = record?.judgment;
+  if (persisted?.conclusion
+    && Array.isArray(persisted.items)
+    && Array.isArray(persisted.reasons)) {
+    return persisted;
+  }
+  return evaluateRecord(record, device, tolerancePercent);
 }
 
 let loadedFontCache = null;
@@ -678,7 +689,11 @@ function drawRecordPage(document, record, device, options = {}) {
   const page = document.currentPage;
   const margin = 42;
   const width = page.width - margin * 2;
-  const evaluation = evaluateRecord(record, device, options.tolerancePercent);
+  const evaluation = evaluationForRecord(
+    record,
+    device,
+    options.tolerancePercent
+  );
   const watermark = recordWatermark(record, options);
   drawTitle(document, options.title || '电子天平日常校验记录', `记录编号：${record.id}`);
 
@@ -788,55 +803,71 @@ function drawRecordPage(document, record, device, options = {}) {
 
   const timeField = templateField(template, 'time');
   const showTime = options.printTime !== false && timeField.show;
-  const columns = [
-    { label: '编号', width: 52, align: 'center' },
-    { label: '量程', width: 48, align: 'center' },
-    { label: 'L/g', width: 54, align: 'right' },
-    { label: '限度/g', width: 130, align: 'center' },
-    { label: '示值 I/g', width: 74, align: 'right' },
-    { label: '偏差/g', width: 66, align: 'right' },
-    { label: '判定', width: 43, align: 'center' },
-    { label: showTime ? timeField.label : '置信度', width: 86, align: 'center' },
-  ];
-  const scale = width / columns.reduce((sum, column) => sum + column.width, 0);
-  columns.forEach((column) => { column.width *= scale; });
-
-  let x = margin;
-  for (const column of columns) {
-    drawCellText(document, x, top, column.width, 24, column.label, {
-      size: 8,
+  const detailLabelWidth = 190;
+  const detailRowHeight = 16.5;
+  const drawDetailRow = (label, value, options = {}) => {
+    drawCellText(document, margin, top, detailLabelWidth, detailRowHeight, label, {
+      size: 7.4,
+      fill: [0.95, 0.96, 0.97],
       align: 'center',
-      fill: [0.89, 0.93, 0.97],
     });
-    x += column.width;
-  }
-  top += 24;
-  const cellHeight = 20;
-  for (const item of evaluation.items) {
-    const values = [
-      item.key,
-      item.rangeLabel,
-      formatNumber(item.L, item.dec),
-      `${formatNumber(item.lim.lo, item.dec)}~${formatNumber(item.lim.hi, item.dec)}`,
-      item.missing ? '缺次' : formatNumber(item.value, item.dec),
-      item.missing ? '—' : signedNumber(item.dev, item.dec),
-      item.missing || !item.stable ? '不通过' : (item.inLimit ? '在限内' : '超限'),
-      showTime
-        ? safeText(item.time || record.startTime)
-        : (item.conf === null ? '—' : item.conf.toFixed(3)),
-    ];
-    x = margin;
-    values.forEach((value, index) => {
-      drawCellText(document, x, top, columns[index].width, cellHeight, value, {
-        size: 7.8,
-        align: columns[index].align,
-        fill: index === 6 && (item.missing || !item.stable || !item.inLimit)
-          ? [1, 0.93, 0.93]
-          : [1, 1, 1],
+    drawCellText(
+      document,
+      margin + detailLabelWidth,
+      top,
+      width - detailLabelWidth,
+      detailRowHeight,
+      value,
+      {
+        size: 7.5,
+        align: options.align || 'left',
+        fill: options.fill || [1, 1, 1],
+      }
+    );
+    top += detailRowHeight;
+  };
+  for (let point = 0; point < 3; point += 1) {
+    const pointItems = evaluation.items
+      .filter((item) => Number(item.point) === point)
+      .sort((left, right) => Number(left.idx) - Number(right.idx));
+    const first = pointItems[0];
+    const nominal = first?.L ?? configuredPoints?.[point] ?? device.points[point];
+    const decimals = first?.dec ?? 4;
+    const limits = first?.lim || calculateLimits(nominal, decimals, evaluation.tol);
+    drawDetailRow(
+      `砝码标称质量值(L${point + 1})`,
+      `${formatNumber(nominal, decimals)} g`,
+      { align: 'center' }
+    );
+    drawDetailRow(
+      `限度(1±${evaluation.tol}%)L${point + 1}`,
+      `${formatNumber(limits.lo, decimals)} g ~ ${formatNumber(limits.hi, decimals)} g`,
+      { align: 'center' }
+    );
+    for (let idx = 1; idx <= 3; idx += 1) {
+      const item = pointItems.find((candidate) => Number(candidate.idx) === idx);
+      const key = `I${point + 1}-${idx}`;
+      const invalid = !item || item.missing || item.stable === false || !item.inLimit;
+      const valueText = !item || item.missing
+        ? '缺次'
+        : `${formatNumber(item.value, item.dec)} g · ${item.rangeLabel}` +
+          (item.stable === false ? ' · 不稳定' : '') +
+          (!item.inLimit ? ' · 超限' : '') +
+          (item.value === null || item.value === undefined
+            ? ''
+            : ` · 偏差 ${signedNumber(item.dev, item.dec)} g`);
+      drawDetailRow(`测量示值(${key})`, valueText, {
+        align: 'center',
+        fill: invalid ? [1, 0.93, 0.93] : [1, 1, 1],
       });
-      x += columns[index].width;
-    });
-    top += cellHeight;
+      if (showTime) {
+        drawDetailRow(
+          `测量时间(${key})`,
+          safeText(item?.time || record.startTime),
+          { align: 'center' }
+        );
+      }
+    }
   }
   top += 10;
 
@@ -1059,7 +1090,9 @@ export function generateWeekPdf(recordsOrOptions, devices = [], options = {}) {
       : recordsOrOptions;
   const records = [...(wrapped
     ? config.items.map((item) => item.record).filter(Boolean)
-    : (config.records || []))].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    : (config.records || []))]
+    .filter((record) => record.status === '已复核确认')
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
   if (!records.length) throw new Error('周统计导出至少需要一条记录');
   const document = new PdfDocument({
     title: '天平校验周统计',
@@ -1079,74 +1112,126 @@ export function generateWeekPdf(recordsOrOptions, devices = [], options = {}) {
     `${weekDevice?.dept || '—'} · ${weekDevice?.id || records[0].device} · ` +
     `Max ${safeText(weekDevice?.max)} g / d ${safeText(weekDevice?.d)} mg`);
   let top = 90;
-  const uniqueDates = [...new Set(records.map((record) => record.date))].slice(0, 7);
-  const labelWidth = 76;
+  const datesForWeek = () => {
+    const from = config.from;
+    const to = config.to;
+    if (from && to) {
+      const result = [];
+      const start = new Date(`${from}T00:00:00Z`);
+      const end = new Date(`${to}T00:00:00Z`);
+      for (let date = start; date <= end && result.length < 7; date = new Date(date.getTime() + 86_400_000)) {
+        result.push(date.toISOString().slice(0, 10));
+      }
+      return result;
+    }
+    return [...new Set(records.map((record) => record.date))].slice(0, 7);
+  };
+  const uniqueDates = datesForWeek();
+  const labelWidth = 82;
   const dateWidth = (width - labelWidth) / Math.max(1, uniqueDates.length);
-  drawCellText(document, margin, top, labelWidth, 44, '记录日期', {
-    size: 8.2,
+  drawCellText(document, margin, top, labelWidth, 28, '记录日期', {
+    size: 7.8,
     align: 'center',
     fill: [0.9, 0.94, 0.98],
   });
   uniqueDates.forEach((date, index) => {
-    drawCellText(document, margin + labelWidth + dateWidth * index, top, dateWidth, 44, date, {
-      size: 8.4,
+    drawCellText(document, margin + labelWidth + dateWidth * index, top, dateWidth, 28, date, {
+      size: 7.8,
       align: 'center',
       fill: [0.9, 0.94, 0.98],
     });
   });
-  top += 44;
-  const fields = [
-    ['清洁 / 水平 / 内部校正', (record) => (
-      `清洁：${safeText(record.cleanliness)}\n水平：${safeText(record.level)}\n内部校正：${safeText(record.internalCal)}`
-    ), 36],
-    ['砝码盒 / 外部校正', (record) => {
-      const device = resolveDeviceForRecord(record, config.devices || config.deviceMap);
-      return `砝码盒：${safeText(record.box)}\n外部校正：${device ? evaluateRecord(record, device).conclusion : '—'}`;
-    }, 30],
-    ...[0, 1, 2].map((point) => [
-      `L${point + 1} 限度 / 示值 / 时间`,
-      (record) => {
-        const device = resolveDeviceForRecord(record, config.devices || config.deviceMap);
-        const evaluation = device ? evaluateRecord(record, device) : null;
-        const items = evaluation?.items?.filter((item) => Number(item.point) === point) || [];
-        const limit = items[0]
-          ? `L=${safeText(items[0].L, '—')} g；限度 ${safeText(items[0].lim?.lo)}～${safeText(items[0].lim?.hi)} g`
-          : 'L=—；限度 —';
-        const readings = items.length
-          ? items.map((item) => safeText(item.value)).join(' / ')
-          : valuesText(record, point);
-        const times = items.length
-          ? items.map((item) => safeText(item.time)).join(' / ')
-          : '—';
-        return `${limit}\n示值：${readings}\n时间：${times}`;
-      },
-      52,
-    ]),
-    ['备注', (record) => safeText(record.remark), 30],
-    ['人员 / 状态', (record, context) => (
-      `校验：${context.inspectorNames?.[record.inspector] || record.inspector}\n` +
-      `复核：${context.verifierNames?.[record.verifiedBy] || record.verifiedBy || '—'}\n` +
-      `状态：${record.status}`
-    ), 34],
-  ];
-  for (const [label, getter, rowHeight = 30] of fields) {
+  top += 28;
+  const rowHeight = 12.6;
+  const drawWeekRow = (label, getter) => {
     drawCellText(document, margin, top, labelWidth, rowHeight, label, {
-      size: 7.8,
+      size: 6.6,
       align: 'center',
       fill: [0.95, 0.96, 0.97],
     });
     uniqueDates.forEach((date, index) => {
       const candidates = records.filter((record) => record.date === date);
-      const value = candidates.length
-        ? candidates.map((record) => safeText(getter(record, config))).join(' / ')
-        : '';
-      drawCellText(document, margin + labelWidth + dateWidth * index, top, dateWidth, rowHeight, value, {
-        size: 6.9,
-        align: 'center',
-      });
+      const value = candidates.map(getter).filter((item) => item !== null
+        && item !== undefined && String(item) !== '').join(' / ');
+      drawCellText(
+        document,
+        margin + labelWidth + dateWidth * index,
+        top,
+        dateWidth,
+        rowHeight,
+        value,
+        { size: 6.1, align: 'center' }
+      );
     });
     top += rowHeight;
+  };
+  const recordEvaluation = (record) => {
+    const device = resolveDeviceForRecord(record, config.devices || config.deviceMap);
+    return device ? evaluationForRecord(record, device) : null;
+  };
+  const weekTolerance = records
+    .map(recordEvaluation)
+    .find((evaluation) => Number.isFinite(Number(evaluation?.tol)))?.tol
+    ?? weekDevice?.tol
+    ?? 0.05;
+  drawWeekRow('清洁', (record) => safeText(record.cleanliness, '—'));
+  drawWeekRow('水平调节', (record) => safeText(record.level, '—'));
+  drawWeekRow('内部校正是否通过', (record) => safeText(record.internalCal, '—'));
+  drawWeekRow('砝码唯一号', (record) => safeText(record.box, '—'));
+  for (let point = 0; point < 3; point += 1) {
+    const sampleItem = records
+      .map(recordEvaluation)
+      .flatMap((evaluation) => evaluation?.items || [])
+      .find((item) => Number(item.point) === point);
+    const decimals = sampleItem?.dec ?? 4;
+    const nominal = sampleItem?.L ?? weekDevice?.points?.[point] ?? '';
+    drawWeekRow(`砝码标称质量值(L${point + 1})`, () => (
+      nominal === '' ? '—' : `${formatNumber(nominal, decimals)} g`
+    ));
+    drawWeekRow(`限度(1±${weekTolerance}%)L${point + 1}`, (record) => {
+      const evaluation = recordEvaluation(record);
+      const item = evaluation?.items?.find((candidate) => (
+        Number(candidate.point) === point
+      ));
+      return item
+        ? `${formatNumber(item.lim.lo, item.dec)}~${formatNumber(item.lim.hi, item.dec)}g`
+        : '—';
+    });
+    for (let idx = 1; idx <= 3; idx += 1) {
+      const key = `I${point + 1}-${idx}`;
+      drawWeekRow(`测量示值(${key})`, (record) => {
+        const item = recordEvaluation(record)?.items?.find((candidate) => (
+          Number(candidate.point) === point && Number(candidate.idx) === idx
+        ));
+        return item
+          ? (item.missing ? '缺次' : `${formatNumber(item.value, item.dec)}g`)
+          : '—';
+      });
+      if (config.printTime !== false) {
+        drawWeekRow(`测量时间(${key})`, (record) => {
+          const item = recordEvaluation(record)?.items?.find((candidate) => (
+            Number(candidate.point) === point && Number(candidate.idx) === idx
+          ));
+          return item?.time || record.startTime || '—';
+        });
+      }
+    }
   }
+  drawWeekRow('外部校正是否通过', (record) => (
+    recordEvaluation(record)?.conclusion || '—'
+  ));
+  drawWeekRow('备注', (record) => safeText(record.remark, '—'));
+  drawWeekRow('校验人员签名', (record) => (
+    config.inspectorNames?.[record.inspector]
+    || config.names?.[record.inspector]
+    || record.inspector
+  ));
+  drawWeekRow('复核确认人签名', (record) => (
+    config.verifierNames?.[record.verifiedBy]
+    || config.names?.[record.verifiedBy]
+    || record.verifiedBy
+    || '—'
+  ));
   document.text(margin, 42,
     `导出时间：${formatDateTime(config.exportedAt || config.generatedAt || new Date())}；仅统计已复核确认且未作废记录；同一天多条记录并列展示。`, {
       size: 7.2,
@@ -1223,37 +1308,33 @@ export function generateBlankFormPdf(options = {}) {
   });
   top += 42;
 
-  const columns = [
-    ['标称点', 60],
-    ['标称值 L(g)', 62],
-    ['限度区间(g)', 112],
-    ['第 1 次 I(g)', 72],
-    ['第 2 次 I(g)', 72],
-    ['第 3 次 I(g)', 72],
-    ['测量时间', 70],
-  ];
-  const totalColumnWidth = columns.reduce((sum, [, columnWidth]) => sum + columnWidth, 0);
-  const scale = width / totalColumnWidth;
-  columns.forEach(([label, columnWidth], index) => {
-    const x = margin + columns.slice(0, index).reduce((sum, [, value]) => sum + value * scale, 0);
-    drawCellText(document, x, top, columnWidth * scale, 30, label, {
-      size: 7.5,
+  const detailLabelWidth = 190;
+  const rowHeight = 16.5;
+  const drawBlankRow = (label) => {
+    drawCellText(document, margin, top, detailLabelWidth, rowHeight, label, {
+      size: 7.4,
       align: 'center',
-      fill: [0.9, 0.94, 0.98],
+      fill: [0.95, 0.96, 0.97],
     });
-  });
-  top += 30;
+    drawCellText(
+      document,
+      margin + detailLabelWidth,
+      top,
+      width - detailLabelWidth,
+      rowHeight,
+      '',
+      { size: 7.5 }
+    );
+    top += rowHeight;
+  };
   for (let point = 0; point < 3; point += 1) {
-    columns.forEach(([, columnWidth], index) => {
-      const x = margin + columns.slice(0, index).reduce((sum, [, value]) => sum + value * scale, 0);
-      const text = index === 0 ? `L${point + 1}` : '';
-      drawCellText(document, x, top, columnWidth * scale, 54, text, {
-        size: 8,
-        align: 'center',
-        fill: index === 0 ? [0.96, 0.97, 0.98] : [1, 1, 1],
-      });
-    });
-    top += 54;
+    drawBlankRow(`砝码标称质量值(L${point + 1})`);
+    drawBlankRow(`限度(1±0.05%)L${point + 1}`);
+    for (let idx = 1; idx <= 3; idx += 1) {
+      const key = `I${point + 1}-${idx}`;
+      drawBlankRow(`测量示值(${key})`);
+      drawBlankRow(`测量时间(${key})`);
+    }
   }
 
   top += 14;
@@ -1537,7 +1618,7 @@ export function generateRecordsCsv(records, devices, names = null) {
   const deviceList = Array.isArray(devices) ? devices : Object.values(devices || {});
   const rows = records.map((record) => {
     const device = deviceList.find((item) => String(item.id) === String(record.device));
-    const evaluation = device ? evaluateRecord(record, device) : null;
+    const evaluation = device ? evaluationForRecord(record, device) : null;
     return {
       recordId: record.id,
       date: record.date,
@@ -1578,7 +1659,7 @@ export function generateReadoutSummaryCsv(records, devices) {
   for (const record of records) {
     const device = deviceList.find((item) => String(item.id) === String(record.device));
     if (!device) continue;
-    const evaluation = evaluateRecord(record, device);
+    const evaluation = evaluationForRecord(record, device);
     for (const item of evaluation.items) {
       rows.push({
         date: record.date,

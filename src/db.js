@@ -172,6 +172,29 @@ export function initSchema(db) {
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
 
+    CREATE TABLE IF NOT EXISTS login_rate_limits (
+      source_key TEXT PRIMARY KEY,
+      window_started_at INTEGER NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      blocked_until INTEGER,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      recipient_id TEXT NOT NULL REFERENCES users(id),
+      type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL DEFAULT '',
+      object_type TEXT NOT NULL DEFAULT '',
+      object_id TEXT NOT NULL DEFAULT '',
+      created_by TEXT REFERENCES users(id),
+      created_at TEXT NOT NULL,
+      read_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_notifications_recipient
+      ON notifications(recipient_id, read_at, id DESC);
+
     CREATE TABLE IF NOT EXISTS login_captchas (
       token_hash TEXT PRIMARY KEY,
       account_id TEXT NOT NULL,
@@ -256,6 +279,7 @@ export function initSchema(db) {
       task_id TEXT,
       error_code TEXT,
       error_message TEXT,
+      expected_device_id TEXT REFERENCES devices(id),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       completed_at TEXT
@@ -269,6 +293,7 @@ export function initSchema(db) {
       size_bytes INTEGER NOT NULL,
       user_id TEXT NOT NULL REFERENCES users(id),
       device_id TEXT REFERENCES devices(id),
+      expected_device_id TEXT REFERENCES devices(id),
       status TEXT NOT NULL CHECK(status IN (
         '排队中', '分析中', '已完成', '失败', '待人工处理', '已取消'
       )),
@@ -312,8 +337,13 @@ export function initSchema(db) {
       device_card_json TEXT NOT NULL DEFAULT '{}',
       range_switch INTEGER NOT NULL DEFAULT 1,
       range_transition_json TEXT NOT NULL DEFAULT '{}',
+      recognition_json TEXT NOT NULL DEFAULT '{}',
       checks_json TEXT NOT NULL DEFAULT '{}',
       modifications_json TEXT NOT NULL DEFAULT '[]',
+      conclusion TEXT,
+      judgment_json TEXT NOT NULL DEFAULT '{}',
+      judged_at TEXT,
+      rule_version TEXT,
       template_version TEXT NOT NULL,
       tolerance_percent REAL,
       device_snapshot_json TEXT NOT NULL DEFAULT '{}',
@@ -411,13 +441,23 @@ export function initSchema(db) {
   ensureColumn(db, 'tasks', 'warnings_json', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn(db, 'records', 'checks_json', "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(db, 'records', 'range_transition_json', "TEXT NOT NULL DEFAULT '{}'");
+  ensureColumn(db, 'records', 'recognition_json', "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(db, 'records', 'tolerance_percent', 'REAL');
   ensureColumn(db, 'records', 'device_snapshot_json', "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(db, 'records', 'template_snapshot_json', "TEXT NOT NULL DEFAULT '{}'");
+  ensureColumn(db, 'records', 'conclusion', 'TEXT');
+  ensureColumn(db, 'records', 'judgment_json', "TEXT NOT NULL DEFAULT '{}'");
+  ensureColumn(db, 'records', 'judged_at', 'TEXT');
+  ensureColumn(db, 'records', 'rule_version', 'TEXT');
   ensureColumn(db, 'uploads', 'time_confirmed', 'INTEGER NOT NULL DEFAULT 0');
-  // Legacy databases may still have locked_until. New login policy never sets it;
-  // clearing stale values prevents older accounts from remaining locked.
-  db.prepare('UPDATE users SET locked_until = NULL WHERE locked_until IS NOT NULL').run();
+  ensureColumn(db, 'uploads', 'expected_device_id', 'TEXT');
+  ensureColumn(db, 'tasks', 'expected_device_id', 'TEXT');
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_records_conclusion
+      ON records(conclusion, date DESC);
+    CREATE INDEX IF NOT EXISTS idx_tasks_expected_device
+      ON tasks(expected_device_id);
+  `);
 }
 
 function insertAudit(db, entry) {
@@ -453,6 +493,87 @@ export function audit(db, actor, entry) {
     sourceIp: entry.sourceIp || actor?.ip || '',
     sessionId: actor?.session?.id || null
   });
+}
+
+export function createNotification(db, notification) {
+  const recipient = String(notification.recipientId || '').trim();
+  if (!recipient) throw new Error('通知接收人不能为空');
+  const result = db.prepare(`
+    INSERT INTO notifications (
+      recipient_id, type, title, body, object_type, object_id,
+      created_by, created_at, read_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+  `).run(
+    recipient,
+    String(notification.type || '系统通知').slice(0, 100),
+    String(notification.title || '系统通知').slice(0, 200),
+    String(notification.body || '').slice(0, 4000),
+    String(notification.objectType || '').slice(0, 100),
+    String(notification.objectId || '').slice(0, 200),
+    notification.createdBy || null,
+    notification.createdAt || nowDateTime()
+  );
+  return Number(result.lastInsertRowid);
+}
+
+export function mapNotification(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    type: row.type,
+    title: row.title,
+    body: row.body,
+    objectType: row.object_type,
+    objectId: row.object_id,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+    readAt: row.read_at,
+    read: Boolean(row.read_at)
+  };
+}
+
+export function getNotifications(db, recipientId, filters = {}) {
+  const clauses = ['recipient_id = ?'];
+  const params = [recipientId];
+  if (filters.unread === true) clauses.push('read_at IS NULL');
+  const where = `WHERE ${clauses.join(' AND ')}`;
+  const limit = Math.min(200, Math.max(1, Number(filters.limit || 50)));
+  const offset = Math.max(0, Number(filters.offset || 0));
+  const rows = db.prepare(`
+    SELECT * FROM notifications
+    ${where}
+    ORDER BY id DESC
+    LIMIT ? OFFSET ?
+  `).all(...params, limit, offset);
+  return rows.map(mapNotification);
+}
+
+export function getNotificationCount(db, recipientId, filters = {}) {
+  const clauses = ['recipient_id = ?'];
+  const params = [recipientId];
+  if (filters.unread === true) clauses.push('read_at IS NULL');
+  return db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM notifications
+    WHERE ${clauses.join(' AND ')}
+  `).get(...params).count;
+}
+
+export function markNotificationRead(db, recipientId, id) {
+  const result = db.prepare(`
+    UPDATE notifications
+    SET read_at = ?
+    WHERE id = ? AND recipient_id = ? AND read_at IS NULL
+  `).run(nowDateTime(), Number(id), recipientId);
+  return result.changes;
+}
+
+export function markAllNotificationsRead(db, recipientId) {
+  return db.prepare(`
+    UPDATE notifications
+    SET read_at = ?
+    WHERE recipient_id = ? AND read_at IS NULL
+  `).run(nowDateTime(), recipientId).changes;
 }
 
 function defaultTemplate() {
@@ -970,7 +1091,9 @@ export function mapAccount(row) {
     status: row.status,
     mustChangePassword: truthy(row.must_change_password),
     failedAttempts: row.failed_attempts,
-    captchaRequired: Number(row.failed_attempts || 0) >= 5,
+    lockedUntil: row.locked_until || null,
+    isLocked: Number(row.locked_until || 0) > Date.now(),
+    captchaRequired: false,
     lastLogin: row.last_login,
     lastLoginAt: row.last_login,
     permissions: PERMISSIONS[row.role] || []
@@ -1037,6 +1160,18 @@ export function getDevices(db, filters = {}) {
   if (filters.status) {
     clauses.push('status = ?');
     params.push(filters.status);
+  }
+  if (filters.conclusion) {
+    clauses.push('conclusion = ?');
+    params.push(filters.conclusion);
+  }
+  if (filters.submittedFrom) {
+    clauses.push('submitted_at >= ?');
+    params.push(`${filters.submittedFrom} 00:00`);
+  }
+  if (filters.submittedTo) {
+    clauses.push('submitted_at <= ?');
+    params.push(`${filters.submittedTo} 23:59`);
   }
   if (filters.q) {
     clauses.push('(id LIKE ? OR unique_no LIKE ?)');
@@ -1112,6 +1247,7 @@ export function mapTask(row) {
     size: Math.round((row.size_bytes / (1024 * 1024)) * 10) / 10,
     user: row.user_id,
     device: row.device_id,
+    expectedDevice: row.expected_device_id,
     status: row.status,
     startTime: row.started_at,
     queuedAt: row.queued_at,
@@ -1179,8 +1315,13 @@ export function mapRecord(row) {
     deviceCard: jsonParse(row.device_card_json, {}),
     rangeSwitch: truthy(row.range_switch),
     rangeTransition: jsonParse(row.range_transition_json, {}),
+    recognition: jsonParse(row.recognition_json, {}),
     checks: jsonParse(row.checks_json, {}),
     modifications: jsonParse(row.modifications_json, []),
+    conclusion: row.conclusion,
+    judgment: jsonParse(row.judgment_json, {}),
+    judgedAt: row.judged_at,
+    ruleVersion: row.rule_version,
     templateVersion: row.template_version,
     tolerancePercent: row.tolerance_percent,
     deviceSnapshot: jsonParse(row.device_snapshot_json, {}),
@@ -1338,9 +1479,10 @@ export function getAuditLogs(db, filters = {}) {
   }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const limit = Math.min(10000, Math.max(1, Number(filters.limit || 5000)));
+  const offset = Math.max(0, Number(filters.offset || 0));
   return db.prepare(
-    `SELECT * FROM audit_logs ${where} ORDER BY id DESC LIMIT ?`
-  ).all(...params, limit).map((row) => ({
+    `SELECT * FROM audit_logs ${where} ORDER BY id DESC LIMIT ? OFFSET ?`
+  ).all(...params, limit, offset).map((row) => ({
     id: `AU-${row.id}`,
     time: row.time,
     account: row.account,
@@ -1355,6 +1497,35 @@ export function getAuditLogs(db, filters = {}) {
     ip: row.source_ip,
     result: row.result
   }));
+}
+
+export function getAuditLogCount(db, filters = {}) {
+  const clauses = [];
+  const params = [];
+  if (filters.from) {
+    clauses.push('time >= ?');
+    params.push(`${filters.from} 00:00`);
+  }
+  if (filters.to) {
+    clauses.push('time <= ?');
+    params.push(`${filters.to} 23:59`);
+  }
+  if (filters.account) {
+    clauses.push('account = ?');
+    params.push(filters.account);
+  }
+  if (filters.type) {
+    clauses.push('type = ?');
+    params.push(filters.type);
+  }
+  if (filters.objectId) {
+    clauses.push('object_id = ?');
+    params.push(filters.objectId);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  return db.prepare(
+    `SELECT COUNT(*) AS count FROM audit_logs ${where}`
+  ).get(...params).count;
 }
 
 export function getExports(db, actor) {

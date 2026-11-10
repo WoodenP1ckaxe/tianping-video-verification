@@ -23,8 +23,16 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Install runtime test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk poppler-utils
+
       - name: Install offline OCR dependencies
         run: npm ci
 
       - name: Verify implementation
         run: npm run check
+
+      - name: Run automated tests
+        run: npm test

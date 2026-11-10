@@ -27,15 +27,23 @@
     "sequenceKeywords": ["第一次", "第二次", "第三次", "第四次", "第五次", "第六次", "第七次", "第八次", "第九次"]
   },
   "readouts": [
-    {"point": 0, "idx": 1, "value": 100.0004, "unit": "g", "off": 45, "conf": 0.996, "stable": true, "range": 1, "recognizedText": "100.0004 g"},
-    {"point": 0, "idx": 2, "value": 100.0004, "unit": "g", "off": 70, "conf": 0.994, "stable": true, "range": 1, "recognizedText": "100.0004 g"},
-    {"point": 0, "idx": 3, "value": 100.0003, "unit": "g", "off": 95, "conf": 0.995, "stable": true, "range": 1, "recognizedText": "100.0003 g"},
-    {"point": 1, "idx": 1, "value": 20.0001, "unit": "g", "off": 160, "conf": 0.991, "stable": true, "range": 2, "recognizedText": "20000.1 mg"},
-    {"point": 1, "idx": 2, "value": 20.0001, "unit": "g", "off": 190, "conf": 0.993, "stable": true, "range": 2, "recognizedText": "20000.1 mg"},
-    {"point": 1, "idx": 3, "value": 20.0001, "unit": "g", "off": 220, "conf": 0.994, "stable": true, "range": 2, "recognizedText": "20000.1 mg"},
-    {"point": 2, "idx": 1, "value": 2.00008, "unit": "g", "off": 275, "conf": 0.991, "stable": true, "range": 2, "recognizedText": "2000.08 mg"},
-    {"point": 2, "idx": 2, "value": 2.00005, "unit": "g", "off": 315, "conf": 0.881, "stable": false, "range": 2, "recognizedText": "2000.05 mg（未形成稳定平台）"},
-    {"point": 2, "idx": 3, "value": 2.00004, "unit": "g", "off": 360, "conf": 0.995, "stable": true, "range": 2, "recognizedText": "2000.04 mg"}
+    {"point": 0, "idx": 1, "value": 100.0003, "unit": "g", "off": 53, "conf": 0.982, "stable": true, "range": 1, "recognizedText": "100.0003 g"},
+    {"point": 0, "idx": 2, "value": 100.0004, "unit": "g", "off": 77, "conf": 0.98, "stable": true, "range": 1, "recognizedText": "100.0004 g"},
+    {"point": 0, "idx": 3, "value": 100.0004, "unit": "g", "off": 106, "conf": 0.993, "stable": true, "range": 1, "recognizedText": "100.0004 g"},
+    {"point": 1, "idx": 1, "value": 20.0002, "unit": "g", "off": 168, "conf": 0.997, "stable": true, "range": 2, "recognizedText": "20000.2 mg"},
+    {"point": 1, "idx": 2, "value": 20.0001, "unit": "g", "off": 196, "conf": 0.986, "stable": true, "range": 2, "recognizedText": "20000.1 mg"},
+    {"point": 1, "idx": 3, "value": 20.0001, "unit": "g", "off": 225, "conf": 0.997, "stable": false, "range": 2, "recognizedText": "20000.1 mg"},
+    {"point": 2, "idx": 1, "value": 2.00008, "unit": "g", "off": 281, "conf": 0.966, "stable": true, "range": 2, "recognizedText": "2000.08 mg"},
+    {"point": 2, "idx": 2, "value": 2.00006, "unit": "g", "off": 322, "conf": 0.962, "stable": true, "range": 2, "recognizedText": "2000.06 mg"},
+    {"point": 2, "idx": 3, "value": 2.00004, "unit": "g", "off": 357, "conf": 0.976, "stable": true, "range": 2, "recognizedText": "2000.04 mg"}
   ],
-  "notes": "读数偏移、显示区框选与识别值已按客户样例真实画面校正；低量程 2g 第二次称重画面持续漂移，稳定段判定为不通过。"
+  "recognitionRegression": {
+    "pointCounts": [3, 3, 3],
+    "totalSegments": 9,
+    "orderViolation": false,
+    "mergedSameWeighingWindows": 3,
+    "discardedTransientCrossPointWindows": 2,
+    "reason": "同一次称重内的相邻稳定平台按间隔和不超过 20d 的漂移合并；短暂跨点误识别不另计一次称重。"
+  },
+  "notes": "本清单是当前稳定段识别器的回归基准，不对应人工字段准确率。读数偏移、显示区框选与识别值已按客户样例真实画面校正；低量程 20g 第三次称重持续漂移，稳定段判定为不通过。"
 }

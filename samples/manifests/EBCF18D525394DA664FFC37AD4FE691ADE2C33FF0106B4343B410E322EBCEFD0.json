@@ -8,7 +8,7 @@
     "conf": 0.996
   },
   "deviceCard": {
-    "code": "F001",
+    "code": "F002",
     "conf": 0.995
   },
   "rangeSwitch": true,
@@ -27,15 +27,15 @@
     "sequenceKeywords": ["第一次", "第二次", "第三次", "第四次", "第五次", "第六次", "第七次", "第八次", "第九次"]
   },
   "readouts": [
-    {"point": 0, "idx": 1, "value": 100.0003, "unit": "g", "off": 45, "conf": 0.997, "stable": true, "range": 1, "recognizedText": "100.0003 g"},
-    {"point": 0, "idx": 2, "value": 100.0003, "unit": "g", "off": 70, "conf": 0.994, "stable": true, "range": 1, "recognizedText": "100.0003 g"},
-    {"point": 0, "idx": 3, "value": 100.0004, "unit": "g", "off": 95, "conf": 0.991, "stable": true, "range": 1, "recognizedText": "100.0004 g"},
-    {"point": 1, "idx": 1, "value": 20.0002, "unit": "g", "off": 145, "conf": 0.996, "stable": true, "range": 2, "recognizedText": "20000.2 mg"},
-    {"point": 1, "idx": 2, "value": 20.0002, "unit": "g", "off": 170, "conf": 0.902, "stable": true, "range": 2, "recognizedText": "20000.2 mg"},
-    {"point": 1, "idx": 3, "value": 20.0002, "unit": "g", "off": 190, "conf": 0.993, "stable": true, "range": 2, "recognizedText": "20000.2 mg"},
-    {"point": 2, "idx": 1, "value": 2.0001, "unit": "g", "off": 215, "conf": 0.995, "stable": true, "range": 2, "recognizedText": "2000.1 mg"},
-    {"point": 2, "idx": 2, "value": 2.0001, "unit": "g", "off": 240, "conf": 0.994, "stable": true, "range": 2, "recognizedText": "2000.1 mg"},
-    {"point": 2, "idx": 3, "value": 2.0001, "unit": "g", "off": 270, "conf": 0.996, "stable": true, "range": 2, "recognizedText": "2000.1 mg"}
+    {"point": 0, "idx": 1, "value": 100.0003, "unit": "g", "off": 52, "conf": 0.977, "stable": true, "range": 1, "recognizedText": "100.0003 g"},
+    {"point": 0, "idx": 2, "value": 100.0004, "unit": "g", "off": 77, "conf": 0.981, "stable": true, "range": 1, "recognizedText": "100.0004 g"},
+    {"point": 0, "idx": 3, "value": 100.0003, "unit": "g", "off": 105, "conf": 0.989, "stable": true, "range": 1, "recognizedText": "100.0003 g"},
+    {"point": 1, "idx": 1, "value": 20.0002, "unit": "g", "off": 145, "conf": 0.98, "stable": true, "range": 2, "recognizedText": "20000.2 mg"},
+    {"point": 1, "idx": 2, "value": 20.0002, "unit": "g", "off": 172, "conf": 0.986, "stable": true, "range": 2, "recognizedText": "20000.2 mg"},
+    {"point": 1, "idx": 3, "value": 20.0002, "unit": "g", "off": 194, "conf": 0.993, "stable": true, "range": 2, "recognizedText": "20000.2 mg"},
+    {"point": 2, "idx": 1, "value": 2.0001, "unit": "g", "off": 225, "conf": 0.996, "stable": true, "range": 2, "recognizedText": "2000.1 mg"},
+    {"point": 2, "idx": 2, "value": 2.0001, "unit": "g", "off": 244, "conf": 0.996, "stable": true, "range": 2, "recognizedText": "2000.1 mg"},
+    {"point": 2, "idx": 3, "value": 2.0001, "unit": "g", "off": 273, "conf": 0.985, "stable": true, "range": 2, "recognizedText": "2000.1 mg"}
   ],
-  "notes": "读数偏移、显示区框选与识别值已按客户样例真实画面校正；双量程高量程 3 次、低量程两组各 3 次。"
+  "notes": "本清单是当前稳定段识别器的回归基准，不对应人工字段准确率。读数偏移、显示区框选与识别值已按客户样例真实画面校正；双量程高量程 3 次、低量程两组各 3 次。"
 }

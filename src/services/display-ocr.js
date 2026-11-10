@@ -25,6 +25,10 @@ const DEFAULT_DISPLAY_REGION = Object.freeze({
 const MAX_RELATIVE_ERROR = 0.005;
 const MIN_STABLE_SECONDS = 3;
 const MAX_OCR_FRAMES = 1800;
+const MAX_PLATEAU_MERGE_GAP_SECONDS = 10;
+const MAX_SAME_WEIGHING_DRIFT_D = 20;
+const MAX_TRANSIENT_SEGMENT_SECONDS = 5;
+const TRANSIENT_NEIGHBOR_GAP_SECONDS = 12;
 
 let workerPromise = null;
 
@@ -620,7 +624,6 @@ function inferReadout(
   ocrConfidence = 0,
   ocrMethod = 'tesseract',
   ocrDetails = null,
-  preferredPoint = null,
   preferredDeviceId = null,
 ) {
   const cleaned = normalizeDigits(text);
@@ -649,6 +652,32 @@ function inferReadout(
         : decimals;
 
       for (const numberText of numberMatches) {
+        // 七段码和 Tesseract 已识别出小数点时，直接按屏幕值换算。
+        // 保留传统重建逻辑只用于小数点漏识别的回退，避免把 2 g 与 20 g 混淆。
+        if (numberText.includes('.')) {
+          const parsed = Number(numberText);
+          if (!Number.isFinite(parsed)) continue;
+          const valueInGrams = parsed / factor;
+          const relativeError = Math.abs(valueInGrams - nominal) / nominal;
+          if (relativeError > MAX_RELATIVE_ERROR) continue;
+          const rounded = Number(valueInGrams.toFixed(decimals));
+          candidates.push({
+            device,
+            deviceId: device.id,
+            point,
+            range,
+            value: rounded,
+            displayValue: parsed,
+            displayUnit,
+            displayText: `${numberText} ${displayUnit}`,
+            relativeError,
+            confidence: Math.max(0, Math.min(1, Number(ocrConfidence) || 0)),
+            ocrMethod,
+            ocrDetails,
+            decimals,
+          });
+          continue;
+        }
         const digits = numberText.replace('.', '');
         if (digits.length <= integerDigits) continue;
         const availableDecimals = digits.length - integerDigits;
@@ -675,10 +704,7 @@ function inferReadout(
           displayUnit,
           displayText: `${reconstructed} ${displayUnit}`,
           relativeError,
-          confidence: Math.max(
-            Number(ocrConfidence) || 0,
-            ocrMethod === 'seven-segment-template' ? 0.96 : 0.9,
-          ),
+          confidence: Math.max(0, Math.min(1, Number(ocrConfidence) || 0)),
           ocrMethod,
           ocrDetails,
           decimals,
@@ -690,13 +716,10 @@ function inferReadout(
   let preferred = preferredDeviceId
     ? candidates.filter((candidate) => candidate.deviceId === preferredDeviceId)
     : candidates;
-  preferred = Number.isInteger(preferredPoint)
-    ? preferred.filter((candidate) => candidate.point === preferredPoint)
-    : [];
+  if (!preferred.length) preferred = candidates;
   if (preferred.length) {
     return preferred.sort((left, right) => left.relativeError - right.relativeError)[0];
   }
-  if (preferredDeviceId || Number.isInteger(preferredPoint)) return null;
   return candidates.sort((left, right) => {
     const errorDifference = left.relativeError - right.relativeError;
     if (Math.abs(errorDifference) > 1e-12) return errorDifference;
@@ -719,7 +742,7 @@ function resultConfidence(result) {
   return Math.max(0, Number(result?.data?.confidence) || 0) / 100;
 }
 
-function groupObservations(samples) {
+export function groupObservationSamples(samples, { minimumSamples = 3 } = {}) {
   const groups = [];
   let current = null;
 
@@ -734,9 +757,7 @@ function groupObservations(samples) {
     }
     const compatible = current
       && current.point === sample.point
-      && current.deviceId === sample.deviceId
-      && Math.abs(sample.value - current.lastValue)
-        <= 10 ** -current.decimals * 20;
+      && current.deviceId === sample.deviceId;
     if (!compatible) {
       if (current) groups.push(current);
       current = {
@@ -748,7 +769,6 @@ function groupObservations(samples) {
         start: sample.second,
         end: sample.second,
         gap: 0,
-        lastValue: sample.value,
         values: [sample.value],
         seconds: [sample.second],
         texts: [sample.displayText],
@@ -759,7 +779,6 @@ function groupObservations(samples) {
     } else {
       current.end = sample.second;
       current.gap = 0;
-      current.lastValue = sample.value;
       current.values.push(sample.value);
       current.seconds.push(sample.second);
       current.texts.push(sample.displayText);
@@ -769,10 +788,10 @@ function groupObservations(samples) {
     }
   }
   if (current) groups.push(current);
-  return groups.filter((group) => group.values.length >= 3);
+  return groups.filter((group) => group.values.length >= minimumSamples);
 }
 
-function stableWindow(group) {
+export function stableObservationWindow(group) {
   const dGram = 10 ** -group.decimals;
   let best = null;
   for (let start = 0; start < group.values.length; start += 1) {
@@ -801,7 +820,7 @@ function stableWindow(group) {
 }
 
 function groupToReading(group) {
-  const window = stableWindow(group);
+  const window = stableObservationWindow(group);
   const sourceStart = window?.start ?? 0;
   const sourceEnd = window?.end ?? group.values.length - 1;
   const values = group.values.slice(sourceStart, sourceEnd + 1);
@@ -825,36 +844,201 @@ function groupToReading(group) {
     segmentStart: group.start + sourceStart,
     segmentEnd: group.start + sourceEnd,
     stable,
-    confidence: stable
-      ? Math.max(0.9, confidences.at(-1) || 0.9)
-      : Math.min(0.88, Math.max(0.5, confidences.at(-1) || 0.7)),
+    confidence: Math.max(
+      0,
+      Math.min(1, confidences.reduce((sum, value) => sum + Number(value || 0), 0)
+        / Math.max(1, confidences.length)),
+    ),
     recognizedText: texts.at(-1),
     ocrMethod: group.methods[latestIndex],
     ocrDetails: group.details[latestIndex],
     sampleCount: values.length,
     observedMin: Math.min(...values),
     observedMax: Math.max(...values),
+    observedStart: group.start,
+    observedEnd: group.end,
   };
 }
 
-function mergeAdjacentReadings(readings) {
-  const result = [];
-  for (const reading of readings.sort((left, right) => left.off - right.off)) {
-    const previous = result.at(-1);
+function readingBoundary(reading, edge) {
+  const fallback = Number(reading?.off);
+  const value = Number(
+    edge === 'start'
+      ? (reading?.observedStart ?? reading?.segmentStart ?? fallback)
+      : (reading?.observedEnd ?? reading?.segmentEnd ?? fallback),
+  );
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function readingGap(left, right) {
+  return Math.max(
+    0,
+    readingBoundary(right, 'start') - readingBoundary(left, 'end'),
+  );
+}
+
+function readingDuration(reading) {
+  return Math.max(
+    0,
+    readingBoundary(reading, 'end') - readingBoundary(reading, 'start'),
+  );
+}
+
+function readingWindows(reading) {
+  if (Array.isArray(reading?.mergedWindows) && reading.mergedWindows.length) {
+    return reading.mergedWindows;
+  }
+  return [{
+    start: reading?.segmentStart ?? reading?.off,
+    end: reading?.segmentEnd ?? reading?.off,
+    value: reading?.value,
+    stable: reading?.stable === true,
+  }];
+}
+
+function mergeRelatedReadings(left, right) {
+  const chosen = right.stable === true
+    ? right
+    : (left.stable === true ? left : right);
+  const mergedWindows = [...readingWindows(left), ...readingWindows(right)];
+  const leftCount = Math.max(1, Number(left.sampleCount) || 1);
+  const rightCount = Math.max(1, Number(right.sampleCount) || 1);
+  return {
+    ...chosen,
+    stable: left.stable === true || right.stable === true,
+    confidence: (
+      Number(left.confidence || 0) * leftCount
+      + Number(right.confidence || 0) * rightCount
+    ) / (leftCount + rightCount),
+    sampleCount: leftCount + rightCount,
+    observedMin: Math.min(Number(left.observedMin), Number(right.observedMin)),
+    observedMax: Math.max(Number(left.observedMax), Number(right.observedMax)),
+    observedStart: Math.min(
+      readingBoundary(left, 'start'),
+      readingBoundary(right, 'start'),
+    ),
+    observedEnd: Math.max(
+      readingBoundary(left, 'end'),
+      readingBoundary(right, 'end'),
+    ),
+    mergedWindowCount: readingWindows(left).length + readingWindows(right).length,
+    mergedWindows,
+    consolidationReason: 'same-weighing-plateau-merge',
+  };
+}
+
+/**
+ * 一段实际称重可能包含多个短暂稳定平台。仅在时间接近且漂移不超过 20d 时
+ * 合并同点平台；真正重新加载砝码通常会产生更长的取放间隔，因而仍保留为独立段。
+ */
+export function consolidateWeighingReadings(readings, options = {}) {
+  const mergeGapSeconds = Number(options.mergeGapSeconds)
+    || MAX_PLATEAU_MERGE_GAP_SECONDS;
+  const maxDriftD = Number(options.maxDriftD) || MAX_SAME_WEIGHING_DRIFT_D;
+  const transientMaxSeconds = Number(options.transientMaxSeconds)
+    || MAX_TRANSIENT_SEGMENT_SECONDS;
+  const neighborGapSeconds = Number(options.neighborGapSeconds)
+    || TRANSIENT_NEIGHBOR_GAP_SECONDS;
+  const ordered = [...readings].sort(
+    (left, right) => readingBoundary(left, 'start') - readingBoundary(right, 'start'),
+  );
+  const kept = [];
+  const discardedTransientReadings = [];
+
+  for (let index = 0; index < ordered.length; index += 1) {
+    const current = ordered[index];
+    const previous = ordered[index - 1];
+    const next = ordered[index + 1];
+    const currentStart = readingBoundary(current, 'start');
+    const currentEnd = readingBoundary(current, 'end');
+    const localSupport = [0, 0, 0];
+    for (let neighborIndex = 0; neighborIndex < ordered.length; neighborIndex += 1) {
+      if (neighborIndex === index) continue;
+      const neighbor = ordered[neighborIndex];
+      const neighborStart = readingBoundary(neighbor, 'start');
+      const neighborEnd = readingBoundary(neighbor, 'end');
+      const nearby = neighborEnd >= currentStart - neighborGapSeconds
+        && neighborStart <= currentEnd + neighborGapSeconds;
+      if (nearby && Number.isInteger(neighbor.point)) {
+        localSupport[neighbor.point] += Math.max(1, Number(neighbor.sampleCount) || 1);
+      }
+    }
+    const competingSupport = localSupport.reduce(
+      (maximum, count, point) => point === current.point ? maximum : Math.max(maximum, count),
+      0,
+    );
+    const transientCrossPoint = readingDuration(current) <= transientMaxSeconds
+      && localSupport[current.point] === 0
+      && competingSupport >= Math.max(3, Number(current.sampleCount) || 1);
+    if (transientCrossPoint) {
+      discardedTransientReadings.push({
+        ...current,
+        discardReason: 'transient-cross-point-island',
+        previousGapSeconds: previous ? readingGap(previous, current) : null,
+        nextGapSeconds: next ? readingGap(current, next) : null,
+        localSupport,
+      });
+      continue;
+    }
+    kept.push(current);
+  }
+
+  const mergedReadings = [];
+  const mergedSameWeighingWindows = [];
+  for (const reading of kept) {
+    const previous = mergedReadings.at(-1);
+    const driftLimit = 10 ** -Number(reading.decimals) * maxDriftD + 1e-12;
     const sameWeighing = previous
       && previous.point === reading.point
-      && reading.segmentStart - previous.segmentEnd <= 5
-      && Math.abs(previous.value - reading.value)
-        <= Math.max(10 ** -previous.decimals, Math.abs(previous.value) * 0.00002);
-    if (sameWeighing) {
-      if (reading.segmentEnd >= previous.segmentEnd) {
-        result[result.length - 1] = reading;
-      }
-    } else {
-      result.push(reading);
+      && previous.deviceId === reading.deviceId
+      && previous.range === reading.range
+      && readingGap(previous, reading) <= mergeGapSeconds
+      && Math.abs(Number(previous.value) - Number(reading.value)) <= driftLimit;
+    if (!sameWeighing) {
+      mergedReadings.push(reading);
+      continue;
     }
+    mergedSameWeighingWindows.push({
+      point: reading.point,
+      gapSeconds: readingGap(previous, reading),
+      fromValue: previous.value,
+      toValue: reading.value,
+      fromStart: previous.observedStart,
+      fromEnd: previous.observedEnd,
+      toStart: reading.observedStart,
+      toEnd: reading.observedEnd,
+    });
+    mergedReadings[mergedReadings.length - 1] = mergeRelatedReadings(previous, reading);
   }
-  return result;
+
+  return {
+    readings: mergedReadings,
+    corrections: {
+      mergedSameWeighingWindows,
+      discardedTransientReadings,
+    },
+  };
+}
+
+function scoreDeviceReadings(readings) {
+  if (!readings.length) return Number.NEGATIVE_INFINITY;
+  const pointCounts = [0, 0, 0];
+  for (const reading of readings) pointCounts[reading.point] += 1;
+  const coveredPoints = pointCounts.filter((count) => count > 0).length;
+  const completePoints = pointCounts.filter((count) => count >= 3).length;
+  const canonicalCoverage = pointCounts.reduce((sum, count) => sum + Math.min(count, 3), 0);
+  const stableCount = readings.filter((reading) => reading.stable).length;
+  const extraPenalty = Math.max(0, readings.length - 12);
+  const confidence = readings.reduce(
+    (sum, reading) => sum + Number(reading.confidence || 0),
+    0,
+  ) / readings.length;
+  return coveredPoints * 1_000_000
+    + completePoints * 100_000
+    + canonicalCoverage * 1_000
+    + stableCount * 100
+    + confidence * 10
+    - extraPenalty;
 }
 
 function qrBounds(result, offsetX = 0, offsetY = 0) {
@@ -997,6 +1181,23 @@ async function decodeCards(ffmpegPath, filePath, media, timeoutMs = 120_000) {
   return found;
 }
 
+function inferDeviceFromCards(cards, devices) {
+  const matches = new Set();
+  for (const card of cards) {
+    const raw = String(card?.data ?? card ?? '').trim();
+    if (!raw || /^(?:PERSON|人员|USER|ACCOUNT)\s*[:：-]/i.test(raw)) continue;
+    const candidate = raw
+      .replace(/^(?:DEVICE|设备|BALANCE|SCALE)\s*[:：-]\s*/i, '')
+      .trim();
+    const device = devices.find((item) => (
+      String(item?.id || '').toUpperCase() === candidate.toUpperCase()
+      || String(item?.uniqueNo || '').toUpperCase() === candidate.toUpperCase()
+    ));
+    if (device) matches.add(device.id);
+  }
+  return matches.size === 1 ? [...matches][0] : null;
+}
+
 export async function recognizeVideo({
   ffmpegPath,
   filePath,
@@ -1037,45 +1238,10 @@ export async function recognizeVideo({
     || DEFAULT_DISPLAY_REGION,
   );
   const cards = await decodeCards(ffmpegPath, filePath, media, config.cardScanTimeoutMs);
+  const cardDeviceId = inferDeviceFromCards(cards, normalizedDevices);
   let worker = null;
-  const samples = [];
-  const completedPoints = [0, 0, 0];
-  let activeRun = null;
-
-  const preferredPoint = () => {
-    if (activeRun) return activeRun.point;
-    return completedPoints.findIndex((count) => count < 3);
-  };
-  const closeActiveRun = () => {
-    if (!activeRun) return;
-    if (activeRun.samples >= 3 && activeRun.point >= 0 && activeRun.point < 3) {
-      completedPoints[activeRun.point] += 1;
-    }
-    activeRun = null;
-  };
-  const observe = (sample, second) => {
-    if (!sample) {
-      if (activeRun) {
-        activeRun.gap += 1;
-        if (activeRun.gap > 2) closeActiveRun();
-      }
-      return;
-    }
-    if (!activeRun
-      || activeRun.point !== sample.point
-      || activeRun.deviceId !== sample.deviceId) {
-      closeActiveRun();
-      activeRun = {
-        point: sample.point,
-        deviceId: sample.deviceId,
-        samples: 1,
-        gap: 0,
-      };
-    } else {
-      activeRun.samples += 1;
-      activeRun.gap = 0;
-    }
-  };
+  const observations = [];
+  const rawObservations = [];
 
   try {
     const extraction = await extractDisplayFrames(
@@ -1101,59 +1267,60 @@ export async function recognizeVideo({
       const sevenSegment = config.disableSevenSegment
         ? null
         : recognizeSevenSegment(image);
-      const useSequencePreference = config.enforceExpectedSequence !== false;
-      const wantedPoint = useSequencePreference ? preferredPoint() : null;
-      const wantedDevice = useSequencePreference ? (activeRun?.deviceId || null) : null;
-      let sample = sevenSegment
+      rawObservations.push(sevenSegment ? {
+        second,
+        text: sevenSegment.text,
+        confidence: sevenSegment.confidence,
+      } : null);
+      const sample = sevenSegment
         ? inferReadout(
           sevenSegment.text,
           normalizedDevices,
           sevenSegment.confidence,
           sevenSegment.method,
           sevenSegment.digits,
-          wantedPoint,
-          wantedDevice,
+          cardDeviceId,
         )
         : null;
-      observe(sample, second);
-      samples.push(sample ? {
-        ...sample,
+      observations.push(sample ? {
         second,
+        text: sevenSegment.text,
+        confidence: sevenSegment.confidence,
+        method: sevenSegment.method,
+        details: sevenSegment.digits,
       } : null);
     }
 
-    if (samples.filter(Boolean).length < 6 && config.enableTesseractFallback !== false) {
-      samples.length = 0;
-      completedPoints.fill(0);
-      activeRun = null;
+    if (observations.filter(Boolean).length < 6 && config.enableTesseractFallback !== false) {
+      observations.length = 0;
+      rawObservations.length = 0;
       worker ||= await getOcrWorker();
       for (let second = 0; second < frames.length; second += 1) {
         const image = decodeJpeg(readFileSync(join(workDir, frames[second])));
         if (!hasDigitBand(image)) {
-          observe(null, second);
-          samples.push(null);
+          observations.push(null);
           continue;
         }
         const result = await recognizeWithTesseract(worker, image);
-        const wantedPoint = config.enforceExpectedSequence === false
-          ? null
-          : preferredPoint();
-        const wantedDevice = config.enforceExpectedSequence === false
-          ? null
-          : (activeRun?.deviceId || null);
+        rawObservations.push({
+          second,
+          text: resultText(result),
+          confidence: resultConfidence(result),
+        });
         const sample = inferReadout(
           resultText(result),
           normalizedDevices,
           resultConfidence(result),
           'tesseract',
           null,
-          wantedPoint,
-          wantedDevice,
+          cardDeviceId,
         );
-        observe(sample, second);
-        samples.push(sample ? {
-          ...sample,
+        observations.push(sample ? {
           second,
+          text: resultText(result),
+          confidence: resultConfidence(result),
+          method: 'tesseract',
+          details: null,
         } : null);
       }
     }
@@ -1161,22 +1328,64 @@ export async function recognizeVideo({
     rmSync(workDir, { recursive: true, force: true });
   }
 
-  const observationGroups = groupObservations(samples);
-  const readings = mergeAdjacentReadings(observationGroups.map(groupToReading));
-  if (!readings.length) throw new Error('OCR 未识别到与天平标称点匹配的稳定示值');
-
-  const deviceVotes = new Map();
-  for (const reading of readings) {
-    deviceVotes.set(reading.deviceId, (deviceVotes.get(reading.deviceId) || 0) + 1);
+  const deviceAnalyses = normalizedDevices.map((device) => {
+    const samplesForDevice = observations.map((observation) => {
+      if (!observation) return null;
+      const sample = inferReadout(
+        observation.text,
+        [device],
+        observation.confidence,
+        observation.method,
+        observation.details,
+        device.id,
+      );
+      return sample ? { ...sample, second: observation.second } : null;
+    });
+    const observationGroups = groupObservationSamples(samplesForDevice);
+    const rawReadings = observationGroups.map(groupToReading)
+      .sort((left, right) => left.off - right.off);
+    const consolidated = consolidateWeighingReadings(rawReadings, {
+      mergeGapSeconds: config.plateauMergeGapSeconds,
+      maxDriftD: config.plateauMergeToleranceD,
+      transientMaxSeconds: config.transientSegmentMaxSeconds,
+      neighborGapSeconds: config.transientNeighborGapSeconds,
+    });
+    return {
+      device,
+      samples: samplesForDevice,
+      observationGroups,
+      rawReadings,
+      readings: consolidated.readings,
+      corrections: consolidated.corrections,
+      score: scoreDeviceReadings(consolidated.readings),
+    };
+  });
+  const preferredAnalysis = cardDeviceId
+    ? deviceAnalyses.find((analysis) => analysis.device.id === cardDeviceId)
+    : null;
+  const selectedAnalysis = preferredAnalysis?.readings.length
+    ? preferredAnalysis
+    : [...deviceAnalyses].sort((left, right) => right.score - left.score)[0];
+  if (!selectedAnalysis?.readings.length) {
+    throw new Error('OCR 未识别到与天平标称点匹配的稳定示值');
   }
-  const deviceId = [...deviceVotes.entries()].sort((left, right) => right[1] - left[1])[0][0];
-  const selected = readings.filter((reading) => reading.deviceId === deviceId);
+
+  const {
+    device,
+    samples,
+    observationGroups,
+    readings,
+    corrections,
+  } = selectedAnalysis;
+  const deviceId = device.id;
+  const selected = readings;
   const finalReadouts = [];
+  const segments = [];
   const pointCounts = [0, 0, 0];
-  for (const reading of selected) {
-    if (pointCounts[reading.point] >= 6) continue;
+  for (const [sequenceIndex, reading] of selected.entries()) {
     pointCounts[reading.point] += 1;
-    finalReadouts.push({
+    const segment = {
+      sequence: sequenceIndex + 1,
       point: reading.point,
       idx: pointCounts[reading.point],
       value: reading.value,
@@ -1186,6 +1395,7 @@ export async function recognizeVideo({
       stable: reading.stable,
       range: reading.range,
       recognizedText: reading.recognizedText,
+      mergedWindowCount: Number(reading.mergedWindowCount) || 1,
       bbox: { ...region },
       ocr: {
         engine: `tesseract.js-7.0.0/eng-4.0.0+seven-segment-template`,
@@ -1196,8 +1406,14 @@ export async function recognizeVideo({
         observedMax: reading.observedMax,
         segmentStart: reading.segmentStart,
         segmentEnd: reading.segmentEnd,
+        observedStart: reading.observedStart,
+        observedEnd: reading.observedEnd,
+        mergedWindows: reading.mergedWindows || undefined,
+        consolidationReason: reading.consolidationReason || null,
       },
-    });
+    };
+    segments.push(segment);
+    if (segment.idx <= 3) finalReadouts.push(segment);
   }
 
   finalReadouts.sort((left, right) => Number(left.off) - Number(right.off));
@@ -1205,15 +1421,15 @@ export async function recognizeVideo({
   let rangeSwitch = true;
   let rangeTransition = null;
   if (Number(selectedDevice?.ranges) === 2) {
-    const firstLow = finalReadouts.findIndex((readout) => Number(readout.range) === 2);
+    const firstLow = segments.findIndex((readout) => Number(readout.range) === 2);
     const highBeforeSwitch = firstLow > 0
-      && finalReadouts.slice(0, firstLow).every((readout) => Number(readout.range) === 1);
+      && segments.slice(0, firstLow).every((readout) => Number(readout.range) === 1);
     const noHighAfterSwitch = firstLow >= 0
-      && finalReadouts.slice(firstLow).every((readout) => Number(readout.range) === 2);
+      && segments.slice(firstLow).every((readout) => Number(readout.range) === 2);
     rangeSwitch = highBeforeSwitch && noHighAfterSwitch;
     if (rangeSwitch) {
-      const lastHigh = finalReadouts[firstLow - 1];
-      const firstAfterSwitch = finalReadouts[firstLow];
+      const lastHigh = segments[firstLow - 1];
+      const firstAfterSwitch = segments[firstLow];
       const gapSeconds = Math.max(
         0,
         Number(firstAfterSwitch.off) - Number(lastHigh.off),
@@ -1228,7 +1444,7 @@ export async function recognizeVideo({
         endOffsetSeconds: Number(firstAfterSwitch.off),
         gapSeconds,
         sampleCountBefore: firstLow,
-        sampleCountAfter: finalReadouts.length - firstLow
+        sampleCountAfter: segments.length - firstLow
       };
     }
   }
@@ -1236,9 +1452,13 @@ export async function recognizeVideo({
   return {
     deviceId,
     readouts: finalReadouts,
+    segments,
+    pointCounts,
+    corrections,
     rangeSwitch,
     rangeTransition,
     cards,
+    cardDeviceId,
     displayRegion: region,
     displayRegionSource,
     displayRegionConfidence: regionResult?.confidence ?? null,
@@ -1266,6 +1486,9 @@ export async function recognizeVideo({
         value: sample.value,
         text: sample.displayText,
       }))
+      : undefined,
+    debugRawSamples: config.debugOcr
+      ? rawObservations.filter(Boolean)
       : undefined,
   };
 }

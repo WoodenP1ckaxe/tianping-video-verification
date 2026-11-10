@@ -10,6 +10,7 @@ import path from 'node:path';
 import {
   addMinutes,
   audit,
+  createNotification,
   getAccounts,
   getDevice,
   getDevices,
@@ -26,6 +27,10 @@ import {
 } from '../db.js';
 import { HttpError } from '../auth.js';
 import { terminateDisplayOcr } from './display-ocr.js';
+import {
+  evaluateAndSnapshot,
+  recordTolerance
+} from './judgments.js';
 
 function cleanError(error) {
   return {
@@ -135,6 +140,7 @@ export class AnalysisQueue {
     this.timer = null;
     this.running = false;
     this.stopping = false;
+    this.activeTaskId = null;
     this.analyzer = typeof analyzer === 'function' ? analyzer : null;
   }
 
@@ -175,6 +181,20 @@ export class AnalysisQueue {
     clearTimeout(this.timer);
     this.timer = null;
     await terminateDisplayOcr();
+    if (this.activeTaskId) {
+      try {
+        this.failTask(
+          this.activeTaskId,
+          {
+            code: 'E-SHUTDOWN',
+            message: '服务停止时任务正在分析，已终止并标记失败，重启后可人工重试'
+          }
+        );
+      } catch (error) {
+        this.logger.error?.('[queue] 停止时更新任务失败', error);
+      }
+      this.activeTaskId = null;
+    }
   }
 
   recoverInterruptedTasks() {
@@ -201,6 +221,15 @@ export class AnalysisQueue {
           reason: '服务重启恢复规则：中断任务标记失败，排队任务保留',
           result: '失败'
         });
+        createNotification(this.db, {
+          recipientId: row.user_id,
+          type: '分析任务失败',
+          title: `任务 ${row.id} 因服务重启而失败`,
+          body: '任务中断，可在分析任务页人工重试；排队任务已保留。',
+          objectType: '分析任务',
+          objectId: row.id,
+          createdAt: time
+        });
       }
     });
   }
@@ -212,9 +241,11 @@ export class AnalysisQueue {
       this.schedule();
       return;
     }
+    this.activeTaskId = task.id;
 
     try {
       const analyzeVideo = await this.loadAnalyzer();
+      if (this.stopping) return;
       const analysisTemplate = getTemplate(this.db);
       const activeDevices = getDevices(this.db, { status: '在用' }).map((device) => (
         analysisTemplate?.useTemplatePoints
@@ -231,12 +262,14 @@ export class AnalysisQueue {
         config: this.config
       });
       result.analysisTemplate = analysisTemplate;
+      if (this.stopping) return;
       await this.completeWithResult(task.id, result, null);
     } catch (error) {
-      this.failTask(task.id, cleanError(error));
+      if (!this.stopping) this.failTask(task.id, cleanError(error));
     } finally {
+      this.activeTaskId = null;
       this.schedule();
-      this.storage.enforceQuota(null);
+      if (!this.stopping) this.storage.enforceQuota(null);
     }
   }
 
@@ -359,6 +392,11 @@ export class AnalysisQueue {
     if (sameDayCount > 0) {
       warnings.push(`该天平当日已有 ${sameDayCount} 条记录；本记录独立生成并独立复核，不覆盖既有记录`);
     }
+    if (task.expectedDevice && task.expectedDevice !== device.id) {
+      warnings.push(
+        `上传时预计天平为 ${task.expectedDevice}，视频实际识别为 ${device.id}；正式记录已按设备卡/读数的实际设备 ${device.id} 生成`
+      );
+    }
     const sourceScreenshots = Array.isArray(result.screenshots) ? result.screenshots : [];
     if (!manual) {
       const sourceKeys = new Set(sourceScreenshots.map((entry) => entry?.key).filter(Boolean));
@@ -373,6 +411,16 @@ export class AnalysisQueue {
       }
     }
     const screenshots = this.copyScreenshots(recordId, sourceScreenshots);
+    if (Array.isArray(result.recognition?.segments)) {
+      const copiedByKey = new Map(screenshots.map((entry) => [entry.key, entry.relativePath]));
+      result.recognition = {
+        ...result.recognition,
+        segments: result.recognition.segments.map((segment) => ({
+          ...segment,
+          screenshot: copiedByKey.get(segment.key) || segment.screenshot || null,
+        })),
+      };
+    }
     readouts.forEach((item, index) => {
       const key = `I${item.point + 1}-${item.idx}`;
       const match = screenshots.find((entry) => entry.key === key);
@@ -398,6 +446,27 @@ export class AnalysisQueue {
     );
     const finalPath = stagedVideo.target;
     const time = nowDateTime();
+    const tolerance = recordTolerance(
+      {
+        deviceSnapshot: device,
+        templateSnapshot: template || {}
+      },
+      device,
+      template
+    );
+    const judgment = evaluateAndSnapshot(
+      {
+        readouts,
+        rangeSwitch: result.rangeSwitch !== false,
+        rangeTransition: result.rangeTransition || null,
+        recognition: result.recognition || {},
+        deviceSnapshot: device,
+        templateSnapshot: template || {}
+      },
+      device,
+      tolerance,
+      time
+    );
     const elapsed = task.startedAt
       ? Math.max(0, new Date().getTime() - new Date(
         task.startedAt.replace(' ', 'T') + ':00+08:00'
@@ -411,12 +480,14 @@ export class AnalysisQueue {
           id, date, device_id, inspector_id, box_id, started_at, duration_seconds,
           file_name, file_size_mb, sha256, status, cleanliness, level_result,
           internal_cal, remark, readouts_json, speech_json, person_card_json,
-          device_card_json, range_switch, range_transition_json, checks_json, modifications_json,
+          device_card_json, range_switch, range_transition_json, recognition_json,
+          conclusion, judgment_json, judged_at, rule_version,
+          checks_json, modifications_json,
           template_version, tolerance_percent, device_snapshot_json,
           template_snapshot_json, analyzed_at, task_id, created_at, updated_at
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '待提交', ?, ?, ?, '无', ?, ?, ?, ?, ?,
-          ?,
+          ?, ?, ?, ?, ?, ?,
           '{}', '[]', ?, ?, ?, ?, ?, ?, ?, ?
         )
         `).run(
@@ -439,8 +510,13 @@ export class AnalysisQueue {
         jsonString(result.deviceCard || { code: device.id, conf: 1 }),
         result.rangeSwitch === false ? 0 : 1,
         jsonString(result.rangeTransition || {}),
+        jsonString(result.recognition || {}),
+        judgment.conclusion,
+        jsonString(judgment),
+        judgment.judgedAt,
+        judgment.ruleVersion,
         template?.version || 'v1',
-        Number(template?.tol ?? device.tol ?? 0.05),
+        tolerance,
         jsonString(device),
         jsonString(template || {}),
         time,
@@ -573,6 +649,15 @@ export class AnalysisQueue {
       after: status,
       reason: `${failure.code} ${failure.message}`,
       result: status === '待人工处理' ? '待处理' : '失败'
+    });
+    createNotification(this.db, {
+      recipientId: task.user,
+      type: status === '待人工处理' ? '任务待人工处理' : '分析任务失败',
+      title: `任务 ${task.id} ${status}`,
+      body: failure.message,
+      objectType: '分析任务',
+      objectId: task.id,
+      createdAt: time
     });
   }
 

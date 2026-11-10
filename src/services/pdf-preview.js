@@ -9,13 +9,13 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { HttpError } from '../auth.js';
 
+const previewStatusCache = new Map();
+
 function findPdfToPpm(config = {}) {
-  const candidates = [
-    config.pdftoppmPath,
-    process.env.PDFTOPPM_PATH,
-    'pdftoppm',
-    '/usr/bin/pdftoppm',
-  ].filter(Boolean);
+  const configured = config.pdftoppmPath || process.env.PDFTOPPM_PATH;
+  const candidates = configured
+    ? [configured]
+    : ['pdftoppm', '/usr/bin/pdftoppm'];
   for (const candidate of candidates) {
     const checked = spawnSync(candidate, ['-v'], {
       encoding: 'utf8',
@@ -29,13 +29,32 @@ function findPdfToPpm(config = {}) {
   return null;
 }
 
+export function getPdfPreviewStatus(config = {}) {
+  const configured = config.pdftoppmPath || process.env.PDFTOPPM_PATH || '';
+  const cached = previewStatusCache.get(configured);
+  if (cached && Date.now() - cached.checkedAt < 60_000) {
+    return cached.value;
+  }
+  const executable = findPdfToPpm(config);
+  const value = {
+    available: Boolean(executable),
+    executable
+  };
+  previewStatusCache.set(configured, {
+    checkedAt: Date.now(),
+    value
+  });
+  return value;
+}
+
 /**
  * Preview uses a raster of the exact generated PDF, not a second HTML layout.
  * Poppler is an optional runtime tool; the download/print PDF remains available
  * even when image preview support is unavailable.
  */
 export function renderPdfPagePng(pdfBuffer, page = 1, config = {}) {
-  const executable = findPdfToPpm(config);
+  const status = getPdfPreviewStatus(config);
+  const executable = status.executable;
   if (!executable) {
     throw new HttpError(
       501,

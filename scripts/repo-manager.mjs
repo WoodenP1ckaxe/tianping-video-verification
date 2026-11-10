@@ -60,6 +60,13 @@ const requiredFiles = [
   'src/services/display-ocr.js',
   'src/rules.js',
   'src/version.js',
+  'docs/README.md',
+  'docs/DEPLOYMENT.md',
+  'docs/USER_GUIDE.md',
+  'docs/TEST_REPORT.md',
+  'docs/ACCEPTANCE_TRACE.md',
+  'docs/PRODUCT_DECISIONS.md',
+  'tests',
 ];
 
 const secretPatterns = [
@@ -267,14 +274,14 @@ function isAllowed(path) {
   if (/^src\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.js$/.test(normalized)) return true;
   if (/^samples\/manifests\/[A-F0-9]{64}\.json$/.test(normalized)) return true;
   if (/^scripts\/[A-Za-z0-9._-]+\.(?:js|mjs|ps1|sh)$/.test(normalized)) return true;
+  if (/^docs\/[A-Za-z0-9._-]+\.md$/.test(normalized)) return true;
+  if (/^tests\/[A-Za-z0-9._-]+\.js$/.test(normalized)) return true;
   return false;
 }
 
 function forbiddenReason(path) {
   const normalized = normalize(path);
   const deliveryOnly = [
-    /^docs\//i,
-    /^tests\//i,
     /^verification\//i,
     /^data(?:\/|$)/i,
     /^backups(?:\/|$)/i,

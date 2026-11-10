@@ -21,6 +21,10 @@ export const SESSION_IDLE_MINUTES = 30;
 export const SESSION_ABSOLUTE_HOURS = 12;
 export const CAPTCHA_REQUIRED_AFTER = 5;
 export const CAPTCHA_TTL_MINUTES = 5;
+export const LOCKOUT_AFTER_ATTEMPTS = 5;
+export const LOCKOUT_MINUTES = 10;
+export const UNKNOWN_LOGIN_LIMIT = 20;
+export const LOGIN_RATE_WINDOW_MINUTES = 5;
 
 export class HttpError extends Error {
   constructor(status, code, message, details = undefined) {
@@ -350,10 +354,91 @@ export function verifyCsrf(actor, req) {
   }
 }
 
+function enforceUnknownAccountRateLimit(db, req, options = {}) {
+  const sourceIp = clientIp(req, options.trustProxy);
+  const sourceKey = `unknown:${sourceIp || 'unknown'}`;
+  const now = Date.now();
+  const windowMs = LOGIN_RATE_WINDOW_MINUTES * 60 * 1000;
+  const blockedUntil = now + windowMs;
+  let outcome = null;
+  withTransaction(db, () => {
+    const row = db.prepare(
+      'SELECT * FROM login_rate_limits WHERE source_key = ?'
+    ).get(sourceKey);
+    if (row?.blocked_until && Number(row.blocked_until) > now) {
+      outcome = {
+        blockedUntil: Number(row.blocked_until),
+        attemptCount: Number(row.attempt_count || 0),
+        blocked: true
+      };
+      return;
+    }
+    if (!row || now - Number(row.window_started_at) >= windowMs) {
+      db.prepare(`
+        INSERT INTO login_rate_limits (
+          source_key, window_started_at, attempt_count, blocked_until, updated_at
+        ) VALUES (?, ?, 1, NULL, ?)
+        ON CONFLICT(source_key) DO UPDATE SET
+          window_started_at = excluded.window_started_at,
+          attempt_count = 1,
+          blocked_until = NULL,
+          updated_at = excluded.updated_at
+      `).run(sourceKey, now, now);
+      outcome = { blockedUntil: null, attemptCount: 1, blocked: false };
+      return;
+    }
+    const attempts = Number(row.attempt_count || 0) + 1;
+    if (attempts > UNKNOWN_LOGIN_LIMIT) {
+      db.prepare(`
+        UPDATE login_rate_limits
+        SET attempt_count = ?, blocked_until = ?, updated_at = ?
+        WHERE source_key = ?
+      `).run(attempts, blockedUntil, now, sourceKey);
+      outcome = {
+        blockedUntil,
+        attemptCount: attempts,
+        blocked: true
+      };
+      return;
+    }
+    db.prepare(`
+      UPDATE login_rate_limits
+      SET attempt_count = ?, blocked_until = NULL, updated_at = ?
+      WHERE source_key = ?
+    `).run(attempts, now, sourceKey);
+    outcome = { blockedUntil: null, attemptCount: attempts, blocked: false };
+  });
+  if (outcome?.blocked) {
+    audit(db, null, {
+      account: '未知账号',
+      name: '未知账号',
+      type: '登录限流',
+      objectType: '登录来源',
+      objectId: sourceIp || 'unknown',
+      reason: `未知账号连续尝试超过 ${UNKNOWN_LOGIN_LIMIT} 次，来源暂时限制登录`,
+      sourceIp,
+      result: '失败'
+    });
+    throw new HttpError(
+      429,
+      'LOGIN_RATE_LIMITED',
+      '登录尝试过于频繁，请稍后再试',
+      {
+        retryAfterSeconds: Math.max(
+          1,
+          Math.ceil((outcome.blockedUntil - Date.now()) / 1000)
+        )
+      }
+    );
+  }
+  return sourceIp;
+}
+
 export function login(db, req, accountId, password, options = {}) {
   const id = String(accountId || '').trim();
   const raw = getRawAccount(db, id);
   if (!raw) {
+    const sourceIp = enforceUnknownAccountRateLimit(db, req, options);
     audit(db, null, {
       account: id || '未知账号',
       name: '未知账号',
@@ -361,7 +446,7 @@ export function login(db, req, accountId, password, options = {}) {
       objectType: '账号',
       objectId: id,
       reason: '账号不存在',
-      sourceIp: clientIp(req, options.trustProxy),
+      sourceIp,
       result: '失败'
     });
     throw new HttpError(401, 'LOGIN_FAILED', '账号或口令错误');
@@ -379,81 +464,82 @@ export function login(db, req, accountId, password, options = {}) {
       sourceIp: clientIp(req, options.trustProxy),
       result: '失败'
     });
-    throw new HttpError(401, 'ACCOUNT_DISABLED', '该账号已停用，无法登录');
+    throw new HttpError(401, 'LOGIN_FAILED', '账号或口令错误');
   }
 
-  const failuresBefore = Number(raw.failed_attempts || 0);
-  if (failuresBefore >= CAPTCHA_REQUIRED_AFTER) {
-    const captchaValid = consumeLoginCaptcha(
-      db,
-      raw.id,
-      options.captchaToken,
-      options.captchaAnswer
+  const now = Date.now();
+  const currentLockedUntil = Number(raw.locked_until || 0);
+  if (currentLockedUntil > now) {
+    throw new HttpError(
+      423,
+      'ACCOUNT_LOCKED',
+      '账号因连续口令错误已锁定，请稍后再试',
+      {
+        lockedUntil: currentLockedUntil,
+        retryAfterSeconds: Math.max(1, Math.ceil((currentLockedUntil - now) / 1000))
+      }
     );
-    if (!captchaValid) {
-      audit(db, null, {
-        account: raw.id,
-        name: raw.name,
-        role: raw.role === 'admin' ? '管理员' : raw.role === 'verifier' ? '复核确认人员' : '检验人员',
-        type: '登录验证码',
-        objectType: '账号',
-        objectId: id,
-        reason: '连续口令错误达到 5 次，验证码缺失、错误或已过期',
-        sourceIp: clientIp(req, options.trustProxy),
-        result: '失败'
-      });
-      throw new HttpError(
-        400,
-        'CAPTCHA_REQUIRED',
-        '口令错误次数已达到 5 次，请输入验证码后继续登录',
-        {
-          captchaRequired: true,
-          failedAttempts: failuresBefore,
-          captchaRequiredAfter: CAPTCHA_REQUIRED_AFTER,
-          captcha: createLoginCaptcha(db, raw.id)
-        }
-      );
-    }
   }
+  const failuresBefore = currentLockedUntil && currentLockedUntil <= now
+    ? 0
+    : Number(raw.failed_attempts || 0);
 
   if (!verifyPassword(password, raw.password_hash)) {
     const failures = failuresBefore + 1;
-    const captchaRequired = failures >= CAPTCHA_REQUIRED_AFTER;
+    const shouldLock = failures >= LOCKOUT_AFTER_ATTEMPTS;
+    const lockedUntil = shouldLock
+      ? Date.now() + LOCKOUT_MINUTES * 60 * 1000
+      : null;
     withTransaction(db, () => {
       db.prepare(`
         UPDATE users
         SET failed_attempts = ?, locked_until = ?, updated_at = ?
         WHERE id = ?
-      `).run(failures, null, nowIso(), id);
+      `).run(failures, lockedUntil, nowIso(), id);
 
       audit(db, null, {
         account: raw.id,
         name: raw.name,
         role: raw.role === 'admin' ? '管理员' : raw.role === 'verifier' ? '复核确认人员' : '检验人员',
-        type: captchaRequired ? '登录失败（验证码保护）' : '登录失败',
+        type: '登录失败',
         objectType: '账号',
         objectId: id,
         before: '',
-        after: captchaRequired ? `失败 ${failures} 次；后续需验证码` : `失败 ${failures} 次`,
+        after: shouldLock ? `失败 ${failures} 次；账号锁定 ${LOCKOUT_MINUTES} 分钟` : `失败 ${failures} 次`,
         reason: '口令错误',
         sourceIp: clientIp(req, options.trustProxy),
         result: '失败'
       });
+      if (shouldLock) {
+        audit(db, null, {
+          account: raw.id,
+          name: raw.name,
+          role: raw.role === 'admin' ? '管理员' : raw.role === 'verifier' ? '复核确认人员' : '检验人员',
+          type: '账号锁定',
+          objectType: '账号',
+          objectId: id,
+          before: `${failures - 1} 次失败`,
+          after: `${failures} 次失败；锁定至 ${new Date(lockedUntil).toISOString()}`,
+          reason: `连续 ${LOCKOUT_AFTER_ATTEMPTS} 次口令错误，自动锁定 ${LOCKOUT_MINUTES} 分钟`,
+          sourceIp: clientIp(req, options.trustProxy),
+          result: '失败'
+        });
+      }
     });
 
-    const challenge = captchaRequired ? createLoginCaptcha(db, raw.id) : null;
     throw new HttpError(
-      captchaRequired ? 400 : 401,
-      captchaRequired ? 'CAPTCHA_REQUIRED' : 'LOGIN_FAILED',
-      captchaRequired
-        ? `账号或口令错误（已错误 ${failures} 次）。后续每次登录均需输入验证码，可无限次重试`
-        : `账号或口令错误（第 ${failures} 次）`,
-      {
-        captchaRequired,
-        failedAttempts: failures,
-        captchaRequiredAfter: CAPTCHA_REQUIRED_AFTER,
-        captcha: challenge
-      }
+      shouldLock ? 423 : 401,
+      shouldLock ? 'ACCOUNT_LOCKED' : 'LOGIN_FAILED',
+      shouldLock
+        ? `账号或口令错误（已错误 ${failures} 次），账号已锁定 ${LOCKOUT_MINUTES} 分钟`
+        : '账号或口令错误',
+      shouldLock
+        ? {
+          failedAttempts: failures,
+          lockedUntil,
+          retryAfterSeconds: Math.ceil((lockedUntil - Date.now()) / 1000)
+        }
+        : null
     );
   }
 
@@ -514,6 +600,10 @@ export function changePassword(db, actor, oldPassword, newPassword) {
           locked_until = NULL, updated_at = ?
       WHERE id = ?
     `).run(hash, nowIso(), actor.user.id);
+    db.prepare(`
+      DELETE FROM sessions
+      WHERE user_id = ? AND id <> ?
+    `).run(actor.user.id, actor.session.id);
     audit(db, actor, {
       type: '口令修改',
       objectType: '账号',

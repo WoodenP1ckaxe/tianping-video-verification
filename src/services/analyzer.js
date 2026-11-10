@@ -3,6 +3,7 @@ import { accessSync, constants, createReadStream, existsSync, mkdirSync, statSyn
 import { delimiter, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { locateDisplayRegion, recognizeVideo } from './display-ocr.js';
+import { findSequenceOrderViolation } from '../rules.js';
 
 const MAX_FILE_BYTES = 500 * 1024 * 1024;
 const MAX_DURATION_SECONDS = 30 * 60;
@@ -14,6 +15,29 @@ export class AnalyzerError extends Error {
     this.code = code;
     this.status = status === '待人工处理' ? '待人工处理' : '失败';
     this.details = details;
+    this.httpStatus = {
+      E_VIDEO_CORRUPT: 422,
+      E_VIDEO_INVALID: 422,
+      E_VIDEO_TOO_LARGE: 413,
+      E_TOO_LARGE: 413,
+      E_TOO_LONG: 422,
+      E_PROBE_INVALID: 422,
+      E_NO_VIDEO_STREAM: 422,
+      E_DURATION_UNKNOWN: 422,
+      E_FILE_MISSING: 410,
+      E_EXTENSION_UNSUPPORTED: 415,
+      E_CODEC_UNSUPPORTED: 415,
+      E_AUDIO_CODEC_UNSUPPORTED: 415,
+      E_EMPTY_VIDEO: 422,
+      E_MEDIA_TOOL_MISSING: 503,
+      E_DISPLAY_OCR_FAILED: 422,
+      E_DEVICE_IDENTITY_CONFLICT: 422,
+      E_DEVICE_NOT_REGISTERED: 422
+    }[code] || 500;
+    this.exposeDetails = [
+      'E_DEVICE_IDENTITY_CONFLICT',
+      'E_DEVICE_NOT_REGISTERED'
+    ].includes(code);
   }
 }
 
@@ -47,20 +71,14 @@ function findExecutable(candidates) {
 }
 
 export function getAnalyzerStatus(config = {}) {
-  const ffprobe = findExecutable([
-    config.ffprobePath,
-    process.env.FFPROBE_PATH,
-    'ffprobe',
-    'C:\\ffmpeg\\bin\\ffprobe.exe',
-    'D:\\ffmpeg\\ffmpeg-7.1-full_build\\bin\\ffprobe.exe',
-  ]);
-  const ffmpeg = findExecutable([
-    config.ffmpegPath,
-    process.env.FFMPEG_PATH,
-    'ffmpeg',
-    'C:\\ffmpeg\\bin\\ffmpeg.exe',
-    'D:\\ffmpeg\\ffmpeg-7.1-full_build\\bin\\ffmpeg.exe',
-  ]);
+  const configuredProbe = config.ffprobePath || process.env.FFPROBE_PATH;
+  const configuredFfmpeg = config.ffmpegPath || process.env.FFMPEG_PATH;
+  const ffprobe = findExecutable(
+    configuredProbe ? [configuredProbe] : ['ffprobe']
+  );
+  const ffmpeg = findExecutable(
+    configuredFfmpeg ? [configuredFfmpeg] : ['ffmpeg']
+  );
   return {
     available: Boolean(ffprobe && ffmpeg),
     mode: 'local-display-ocr',
@@ -72,6 +90,9 @@ export function getAnalyzerStatus(config = {}) {
     supportsDisplayOcr: true,
     supportsArbitraryVideoOcr: true,
     supportsMultipleQrCodesPerFrame: true,
+    supportsTimeOrderRecognition: true,
+    supportsExtraWeighingDetection: true,
+    supportsWeighingPlateauMerge: true,
     speechRecognition: 'removed',
     displayRegionConfigurable: true,
     supportsAutomaticDisplayRegion: true,
@@ -424,8 +445,12 @@ function cardIdentity(rawValue, accounts, devices) {
 }
 
 export function parseCardIdentities(decodedCards, accounts = [], devices = []) {
-  const identities = (Array.isArray(decodedCards) ? decodedCards : [])
-    .map((card) => cardIdentity(card?.data ?? card, accounts, devices));
+  const records = (Array.isArray(decodedCards) ? decodedCards : [])
+    .map((card) => ({
+      card,
+      identity: cardIdentity(card?.data ?? card, accounts, devices)
+    }));
+  const identities = records.map((record) => record.identity);
   const personIdentities = [...new Set(
     identities.filter((item) => item.kind === 'person').map((item) => item.value),
   )];
@@ -443,12 +468,34 @@ export function parseCardIdentities(decodedCards, accounts = [], devices = []) {
   if (ambiguousCards.length) {
     cardConflicts.push('卡面内容同时匹配人员账号与设备编号，无法确认身份');
   }
+  const evidenceFor = (kind, value) => {
+    const matches = records.filter((record) => (
+      record.identity.kind === kind && record.identity.value === value
+    ));
+    const frames = new Set(matches
+      .map((record) => Number(record.card?.frameOffsetSeconds))
+      .filter(Number.isFinite));
+    return {
+      decodedCount: matches.length,
+      frameCount: frames.size,
+      firstFrameOffsetSeconds: frames.size ? Math.min(...frames) : null,
+      lastFrameOffsetSeconds: frames.size ? Math.max(...frames) : null
+    };
+  };
   return {
     identities,
     personIdentities,
     deviceIdentities,
     ambiguousCards,
-    cardConflicts
+    cardConflicts,
+    evidence: {
+      persons: Object.fromEntries(
+        personIdentities.map((value) => [value, evidenceFor('person', value)])
+      ),
+      devices: Object.fromEntries(
+        deviceIdentities.map((value) => [value, evidenceFor('device', value)])
+      )
+    }
   };
 }
 
@@ -582,6 +629,54 @@ function validateFrameEvidence(readout, bbox, media, device) {
   }
 }
 
+function detectedSegmentTimeline(recognition) {
+  const source = Array.isArray(recognition?.segments)
+    ? recognition.segments
+    : (Array.isArray(recognition?.readouts) ? recognition.readouts : []);
+  const sorted = source
+    .filter((segment) => {
+      const point = Number(segment?.point);
+      const off = Number(segment?.off);
+      return Number.isInteger(point) && point >= 0 && point <= 2 && Number.isFinite(off);
+    })
+    .sort((left, right) => {
+      const leftSequence = Number(left?.sequence);
+      const rightSequence = Number(right?.sequence);
+      if (Number.isFinite(leftSequence) && Number.isFinite(rightSequence)) {
+        return leftSequence - rightSequence;
+      }
+      return Number(left.off) - Number(right.off);
+    });
+  const counts = [0, 0, 0];
+  return sorted.map((segment, index) => {
+    const point = Number(segment.point);
+    counts[point] += 1;
+    const ocr = segment.ocr || {};
+    return {
+      sequence: index + 1,
+      point,
+      idx: counts[point],
+      value: Number(segment.value),
+      unit: segment.unit || 'g',
+      off: Number(segment.off),
+      segmentStart: Number(ocr.segmentStart ?? segment.segmentStart ?? segment.off),
+      segmentEnd: Number(ocr.segmentEnd ?? segment.segmentEnd ?? segment.off),
+      observedStart: Number(ocr.observedStart ?? ocr.segmentStart ?? segment.off),
+      observedEnd: Number(ocr.observedEnd ?? ocr.segmentEnd ?? segment.off),
+      stable: segment.stable !== false,
+      conf: Number(segment.conf ?? segment.confidence ?? 0),
+      range: Number(segment.range) === 2 ? 2 : 1,
+      mergedWindowCount: Number(
+        segment.mergedWindowCount
+        ?? ocr.mergedWindows?.length
+        ?? 1,
+      ) || 1,
+      recognizedText: segment.recognizedText || '',
+      method: ocr.method || segment.ocrMethod || 'unknown',
+    };
+  });
+}
+
 /**
  * 分析上传视频。读数来自视频真实帧的本地显示屏 OCR，不使用文件名或哈希查表。
  */
@@ -654,7 +749,8 @@ export async function analyzeVideo(context = {}) {
   const {
     personIdentities,
     deviceIdentities,
-    cardConflicts
+    cardConflicts,
+    evidence: cardEvidence
   } = parseCardIdentities(decodedCards, knownAccounts, devices);
 
   const inferredDevice = findDevice(devices, recognition.deviceId);
@@ -683,6 +779,32 @@ export async function analyzeVideo(context = {}) {
   const targetFolder = root ? join(root, context.recordId || sha256.slice(0, 12)) : null;
   const warnings = [];
   const screenshots = [];
+  const detectedSegments = detectedSegmentTimeline(recognition);
+  const detectedCounts = [0, 0, 0];
+  for (const segment of detectedSegments) detectedCounts[segment.point] += 1;
+  const sequence = detectedSegments.map((segment) => segment.point);
+  const orderViolation = findSequenceOrderViolation(sequence);
+  if (orderViolation) {
+    warnings.push(
+      `称重顺序不符合 L1×3 → L2×3 → L3×3：` +
+      `L${orderViolation.expectedMinimumPoint + 1} 之后又识别到 ` +
+      `L${orderViolation.actualPoint + 1}；完整时序已保留并参与判定`,
+    );
+  }
+  for (let point = 0; point < 3; point += 1) {
+    if (detectedCounts[point] > 3) {
+      warnings.push(
+        `L${point + 1} 识别到 ${detectedCounts[point]} 个称重段，多于要求的 3 次；` +
+        '完整次数已保留并参与判定',
+      );
+    }
+  }
+  if (detectedSegments.length > 9) {
+    warnings.push(
+      `共识别到 ${detectedSegments.length} 个称重段，完整校验应为 9 个；` +
+      '多余段不会在规则判定前被截断',
+    );
+  }
   const grouped = [[], [], []];
   for (const readout of recognition.readouts) {
     if (readout.point >= 0 && readout.point < 3) grouped[readout.point].push(readout);
@@ -719,11 +841,6 @@ export async function analyzeVideo(context = {}) {
         idx,
         evidenceStatus: 'ocr-frame',
       });
-    }
-    if (grouped[point].length > 3) {
-      warnings.push(
-        `L${point + 1} 识别到 ${grouped[point].length} 个候选称重段，记录仅保留前 3 个；请人工核对是否存在重复称重`,
-      );
     }
   }
 
@@ -780,11 +897,98 @@ export async function analyzeVideo(context = {}) {
     }
   }
 
+  const segmentSignature = (point, start, end) => `${point}:${Number(start)}:${Number(end)}`;
+  const screenshotBySegment = new Map();
+  for (const readout of readouts) {
+    if (!readout.screenshot || !readout.ocr) continue;
+    screenshotBySegment.set(
+      segmentSignature(
+        readout.point,
+        readout.ocr.segmentStart ?? readout.off,
+        readout.ocr.segmentEnd ?? readout.off,
+      ),
+      readout.screenshot,
+    );
+  }
+  for (const segment of detectedSegments.filter((item) => item.idx > 3)) {
+    const evidenceKey = `R${String(segment.sequence).padStart(2, '0')}`;
+    const bbox = {
+      ...recognition.displayRegion,
+      coordinateSpace: 'normalized-video-frame',
+    };
+    const evidenceReadout = {
+      key: evidenceKey,
+      value: segment.value,
+      range: segment.range,
+      off: segment.off,
+      recognizedText: segment.recognizedText || `${segment.value} ${segment.unit}`,
+    };
+    validateFrameEvidence(evidenceReadout, bbox, media, device);
+    if (!targetFolder || !ffmpegPath) {
+      warnings.push(`${evidenceKey} 的额外称重段未能保存识别截图`);
+      continue;
+    }
+    const filename = `${evidenceKey}.jpg`;
+    const outputPath = join(targetFolder, filename);
+    const capture = await captureScreenshot({
+      ffmpegPath,
+      filePath,
+      offsetSeconds: segment.off,
+      outputPath,
+      timeoutMs,
+      bbox,
+      media,
+    });
+    if (!capture.ok) {
+      warnings.push(`${evidenceKey} 的额外称重段截图生成失败：${capture.reason}`);
+      continue;
+    }
+    const configuredDataDir = config.dataDir ? resolve(config.dataDir) : null;
+    const screenshot = configuredDataDir
+      ? relative(configuredDataDir, outputPath).replaceAll('\\', '/')
+      : outputPath.replaceAll('\\', '/');
+    screenshotBySegment.set(
+      segmentSignature(segment.point, segment.segmentStart, segment.segmentEnd),
+      screenshot,
+    );
+    screenshots.push({
+      key: evidenceKey,
+      path: screenshot,
+      offsetSeconds: segment.off,
+      bbox,
+      displayText: evidenceReadout.recognizedText,
+      sequence: segment.sequence,
+    });
+  }
+
+  const recognitionSegments = detectedSegments.map((segment) => ({
+    ...segment,
+    key: segment.idx <= 3 ? `I${segment.point + 1}-${segment.idx}` : `R${String(segment.sequence).padStart(2, '0')}`,
+    time: timeAt(effectiveStartedAt, segment.off),
+    bbox: {
+      ...recognition.displayRegion,
+      coordinateSpace: 'normalized-video-frame',
+    },
+    screenshot: screenshotBySegment.get(
+      segmentSignature(segment.point, segment.segmentStart, segment.segmentEnd),
+    ) || null,
+  }));
+
   const personCard = personIdentities.length === 1
-    ? { account: personIdentities[0], conf: 0.98, source: 'qr' }
+    ? {
+      account: personIdentities[0],
+      conf: null,
+      source: 'qr',
+      evidence: cardEvidence.persons[personIdentities[0]]
+    }
     : null;
   const deviceCard = deviceIdentities.length === 1
-    ? { code: deviceIdentities[0], conf: 0.98, source: 'qr' }
+    ? {
+      code: deviceIdentities[0],
+      conf: null,
+      source: 'qr',
+      evidence: cardEvidence.devices[deviceIdentities[0]]
+    }
     : null;
   if (!personCard) {
     warnings.push('未识别到唯一且有效的人员卡；不能生成正式记录');
@@ -811,6 +1015,20 @@ export async function analyzeVideo(context = {}) {
     readouts,
     screenshots,
     warnings,
+    recognition: {
+      schemaVersion: 1,
+      strategy: 'independent-time-ordered-weighing-segments',
+      segments: recognitionSegments,
+      sequence,
+      pointCounts: detectedCounts,
+      totalSegments: recognitionSegments.length,
+      orderViolation,
+      stableWindowSeconds: 3,
+      corrections: recognition.corrections || {
+        mergedSameWeighingWindows: [],
+        discardedTransientReadings: [],
+      },
+    },
     ocr: {
       engine: recognition.ocrEngine,
       scannedFrames: recognition.scannedFrames,
@@ -824,6 +1042,8 @@ export async function analyzeVideo(context = {}) {
       personInference: personCard ? 'qr' : 'missing',
       decodedCardCount: decodedCards.length,
       cardConflicts,
+      recognizedSegments: recognitionSegments.length,
+      sequenceStrategy: 'independent-time-ordered-weighing-segments',
     },
     capabilityNote: '读数由本地视频帧 OCR 和稳定段检测生成；低置信或缺失项必须人工核对。',
   };

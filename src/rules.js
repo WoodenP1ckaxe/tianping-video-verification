@@ -7,6 +7,7 @@
 
 export const DEFAULT_TOLERANCE_PERCENT = 0.05;
 export const LOW_CONFIDENCE_THRESHOLD = 0.9;
+export const RULE_VERSION = '2026.11.1';
 const EPSILON = 1e-10;
 
 function finiteNumber(value) {
@@ -95,6 +96,79 @@ function normalizeReadouts(record) {
   }));
 }
 
+function finiteOffset(readout) {
+  const value = finiteNumber(readout?.segmentStart ?? readout?.off);
+  return value === null ? null : value;
+}
+
+/**
+ * 新识别结果保存全局时间序列；旧记录退回按读数帧偏移还原顺序。
+ */
+function recognitionTimeline(record, sourceReadouts) {
+  const storedSegments = Array.isArray(record?.recognition?.segments)
+    ? record.recognition.segments.filter((segment) => {
+      const point = Number(segment?.point);
+      return Number.isInteger(point) && point >= 0 && point <= 2;
+    })
+    : [];
+  if (storedSegments.length) {
+    const sorted = [...storedSegments].sort((left, right) => {
+      const leftSequence = finiteNumber(left?.sequence);
+      const rightSequence = finiteNumber(right?.sequence);
+      if (leftSequence !== null && rightSequence !== null) {
+        return leftSequence - rightSequence;
+      }
+      return (finiteOffset(left) ?? 0) - (finiteOffset(right) ?? 0);
+    });
+    return {
+      source: 'recognition-segments',
+      sequence: sorted.map((item) => Number(item.point)),
+    };
+  }
+
+  const arraySequence = sourceReadouts
+    .filter((readout) => readout.value !== null
+      && Number.isInteger(readout.point)
+      && readout.point >= 0
+      && readout.point <= 2)
+    .map((readout) => readout.point);
+  const timed = sourceReadouts
+    .filter((readout) => readout.value !== null && finiteOffset(readout) !== null)
+    .sort((left, right) => finiteOffset(left) - finiteOffset(right));
+  const timedSequence = timed
+    .filter((readout) => Number.isInteger(readout.point) && readout.point >= 0 && readout.point <= 2)
+    .map((readout) => readout.point);
+  const useTimed = findSequenceOrderViolation(timedSequence)
+    && !findSequenceOrderViolation(arraySequence);
+  return {
+    source: useTimed ? 'readout-offsets' : 'canonical-readouts',
+    sequence: useTimed ? timedSequence : arraySequence,
+  };
+}
+
+export function findSequenceOrderViolation(sequence) {
+  let highestPoint = -1;
+  for (let index = 0; index < sequence.length; index += 1) {
+    const point = Number(sequence[index]);
+    if (!Number.isInteger(point) || point < 0 || point > 2) continue;
+    if (point < highestPoint) {
+      return {
+        index,
+        expectedMinimumPoint: highestPoint,
+        actualPoint: point,
+      };
+    }
+    highestPoint = Math.max(highestPoint, point);
+  }
+  return null;
+}
+
+function compactSequence(sequence, limit = 15) {
+  const labels = sequence.map((point) => `L${Number(point) + 1}`);
+  if (labels.length <= limit) return labels.join(' → ');
+  return `${labels.slice(0, limit).join(' → ')} → …（共 ${labels.length} 段）`;
+}
+
 function addReason(reasons, code, label, detail) {
   const signature = `${code}\u0000${detail}`;
   if (reasons.some((item) => item.signature === signature)) return;
@@ -122,7 +196,9 @@ export function evaluateRecord(record, device, tolerancePercent) {
   const groups = [[], [], []];
   const items = [];
   const reasons = [];
-  const sequence = [];
+  const timeline = recognitionTimeline(record, sourceReadouts);
+  const timelineCounts = [0, 0, 0];
+  for (const point of timeline.sequence) timelineCounts[point] += 1;
 
   for (let index = 0; index < sourceReadouts.length; index += 1) {
     const readout = sourceReadouts[index];
@@ -137,7 +213,6 @@ export function evaluateRecord(record, device, tolerancePercent) {
       continue;
     }
     groups[point].push(readout);
-    sequence.push(point);
 
     const nominal = finiteNumber(device.points[point]);
     const expectedRange = Number(device.ranges) === 2
@@ -197,25 +272,25 @@ export function evaluateRecord(record, device, tolerancePercent) {
           (missingKeys.length ? `（${missingKeys.join('、')} 未识别到有效读数）` : ''),
       );
     }
-    if (group.length > 3) {
+    if (timelineCounts[point] > 3) {
       addReason(
         reasons,
         'DUPLICATE',
-        '重复称重',
-        `L${point + 1}（${nominal}g）识别到 ${group.length} 次称重，多于要求的 3 次`,
+        '重复/多次称重',
+        `L${point + 1}（${nominal}g）识别到 ${timelineCounts[point]} 个称重段，多于要求的 3 次`,
       );
     }
   });
 
-  const expectedSequence = [0, 0, 0, 1, 1, 1, 2, 2, 2];
-  const sequenceMismatch = sequence.some((point, index) => point !== expectedSequence[index]);
-  if (sequenceMismatch) {
-    const actual = sequence.map((point) => `L${point + 1}`).join(' → ') || '（无有效读数）';
+  const orderViolation = findSequenceOrderViolation(timeline.sequence);
+  if (orderViolation) {
     addReason(
       reasons,
       'ORDER',
       '顺序错误',
-      `实际称重顺序为 ${actual}，与要求的 L1×3 → L2×3 → L3×3 不一致`,
+      `实际称重顺序为 ${compactSequence(timeline.sequence)}，` +
+        `在 L${orderViolation.expectedMinimumPoint + 1} 之后重新识别到 ` +
+        `L${orderViolation.actualPoint + 1}，与要求的 L1×3 → L2×3 → L3×3 不一致`,
     );
   }
 
@@ -258,12 +333,12 @@ export function evaluateRecord(record, device, tolerancePercent) {
     }
   });
 
-  if (sourceReadouts.length > 9 && sequence.length === 9) {
+  if (timeline.sequence.length > 9) {
     addReason(
       reasons,
       'EXTRA_READING',
       '多余读数',
-      `识别到 ${sourceReadouts.length} 个读数，完整校验应为 9 个读数`,
+      `识别到 ${timeline.sequence.length} 个称重段，完整校验应为 9 个称重段`,
     );
   }
 
@@ -272,9 +347,16 @@ export function evaluateRecord(record, device, tolerancePercent) {
     conclusion: cleanReasons.length === 0 ? '通过' : '不通过',
     pass: cleanReasons.length === 0,
     tol,
+    ruleVersion: RULE_VERSION,
     reasons: cleanReasons,
     items,
     groups,
+    recognition: {
+      timelineSource: timeline.source,
+      sequence: timeline.sequence,
+      counts: timelineCounts,
+      orderViolation,
+    },
   };
 }
 
@@ -343,6 +425,7 @@ export const rules = {
   getRange,
   getRangeDecimals,
   recommendPoints,
+  findSequenceOrderViolation,
   evaluateRecord,
   judgementBasis,
   lowConfidenceItems,

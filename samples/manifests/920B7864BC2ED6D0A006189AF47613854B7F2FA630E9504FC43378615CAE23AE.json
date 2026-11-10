@@ -27,15 +27,15 @@
     "sequenceKeywords": ["第一次", "第二次", "第三次", "第四次", "第五次", "第六次", "第七次", "第八次", "第九次"]
   },
   "readouts": [
-    {"point": 0, "idx": 1, "value": 200.0009, "unit": "g", "off": 40, "conf": 0.997, "stable": true, "range": 1, "recognizedText": "200.0009 g"},
-    {"point": 0, "idx": 2, "value": 200.0008, "unit": "g", "off": 70, "conf": 0.995, "stable": true, "range": 1, "recognizedText": "200.0008 g"},
-    {"point": 0, "idx": 3, "value": 200.0009, "unit": "g", "off": 100, "conf": 0.996, "stable": true, "range": 1, "recognizedText": "200.0009 g"},
-    {"point": 1, "idx": 1, "value": 50.0003, "unit": "g", "off": 130, "conf": 0.996, "stable": true, "range": 1, "recognizedText": "50.0003 g"},
-    {"point": 1, "idx": 2, "value": 50.0002, "unit": "g", "off": 150, "conf": 0.993, "stable": true, "range": 1, "recognizedText": "50.0002 g"},
-    {"point": 1, "idx": 3, "value": 50.0003, "unit": "g", "off": 175, "conf": 0.994, "stable": true, "range": 1, "recognizedText": "50.0003 g"},
-    {"point": 2, "idx": 1, "value": 10.0001, "unit": "g", "off": 210, "conf": 0.995, "stable": true, "range": 1, "recognizedText": "10.0001 g"},
-    {"point": 2, "idx": 2, "value": 10.0001, "unit": "g", "off": 225, "conf": 0.992, "stable": true, "range": 1, "recognizedText": "10.0001 g"},
-    {"point": 2, "idx": 3, "value": 10.0001, "unit": "g", "off": 250, "conf": 0.994, "stable": true, "range": 1, "recognizedText": "10.0001 g"}
+    {"point": 0, "idx": 1, "value": 200.0009, "unit": "g", "off": 42, "conf": 0.98, "stable": true, "range": 1, "recognizedText": "200.0009 g"},
+    {"point": 0, "idx": 2, "value": 200.0008, "unit": "g", "off": 74, "conf": 0.98, "stable": true, "range": 1, "recognizedText": "200.0008 g"},
+    {"point": 0, "idx": 3, "value": 200.0009, "unit": "g", "off": 102, "conf": 0.979, "stable": true, "range": 1, "recognizedText": "200.0009 g"},
+    {"point": 1, "idx": 1, "value": 50.0003, "unit": "g", "off": 132, "conf": 1, "stable": true, "range": 1, "recognizedText": "50.0003 g"},
+    {"point": 1, "idx": 2, "value": 50.0002, "unit": "g", "off": 152, "conf": 0.976, "stable": true, "range": 1, "recognizedText": "50.0002 g"},
+    {"point": 1, "idx": 3, "value": 50.0003, "unit": "g", "off": 177, "conf": 1, "stable": true, "range": 1, "recognizedText": "50.0003 g"},
+    {"point": 2, "idx": 1, "value": 10.0001, "unit": "g", "off": 210, "conf": 0.991, "stable": true, "range": 1, "recognizedText": "10.0001 g"},
+    {"point": 2, "idx": 2, "value": 10.0001, "unit": "g", "off": 231, "conf": 0.993, "stable": true, "range": 1, "recognizedText": "10.0001 g"},
+    {"point": 2, "idx": 3, "value": 10.0001, "unit": "g", "off": 257, "conf": 0.993, "stable": true, "range": 1, "recognizedText": "10.0001 g"}
   ],
-  "notes": "读数偏移、显示区框选与识别值已按客户样例真实画面校正；帧时间均为视频内绝对秒数。"
+  "notes": "本清单是当前稳定段识别器的回归基准，不对应人工字段准确率。偏移、显示区框选与识别值已按客户样例真实画面校正；帧时间均为视频内绝对秒数。"
 }

@@ -23,9 +23,7 @@ function walk(directory) {
       '.git',
       'backups',
       'data',
-      'docs',
       'node_modules',
-      'tests',
       'verification',
     ]);
     if (localOnly.has(entry.name)) return [];
@@ -51,6 +49,38 @@ for (const name of manifests) {
     const manifest = JSON.parse(readFileSync(join(manifestDir, name), 'utf8'));
     if (!Array.isArray(manifest.readouts) || manifest.readouts.length !== 9) {
       errors.push(`样例清单 ${name} 必须包含 9 个读数`);
+    }
+    const readoutKeys = new Set();
+    for (const readout of manifest.readouts || []) {
+      const key = `${readout.point}:${readout.idx}`;
+      if (!Number.isInteger(Number(readout.point))
+        || Number(readout.point) < 0
+        || Number(readout.point) > 2
+        || !Number.isInteger(Number(readout.idx))
+        || Number(readout.idx) < 1
+        || Number(readout.idx) > 3) {
+        errors.push(`样例清单 ${name} 的读数键 ${key} 超出 I1-1~I3-3`);
+      }
+      if (readoutKeys.has(key)) {
+        errors.push(`样例清单 ${name} 的读数键 ${key} 重复`);
+      }
+      readoutKeys.add(key);
+      if (!Number.isFinite(Number(readout.value))
+        || !Number.isFinite(Number(readout.off))
+        || typeof readout.stable !== 'boolean'
+        || ![1, 2].includes(Number(readout.range))) {
+        errors.push(`样例清单 ${name} 的读数 ${key} 字段不完整`);
+      }
+    }
+    const allowedDeviceCodes = {
+      F001: ['F001', 'DZTP170911C'],
+      F002: ['F002', 'SJS2605002']
+    }[manifest.deviceId] || [manifest.deviceId];
+    if (manifest.deviceCard?.code
+      && !allowedDeviceCodes.includes(manifest.deviceCard.code)) {
+      errors.push(
+        `样例清单 ${name} 的设备卡 ${manifest.deviceCard.code} 与 deviceId ${manifest.deviceId} 不一致`
+      );
     }
     if (!expectedHashes.has(name.replace(/\.json$/i, '').toUpperCase())) {
       warnings.push(`样例清单 ${name} 不在当前客户三段视频哈希清单中`);
@@ -117,6 +147,13 @@ const required = [
   'LICENSE',
   'scripts/repo-manager.mjs',
   '.github/workflows/verify.yml',
+  'docs/README.md',
+  'docs/DEPLOYMENT.md',
+  'docs/USER_GUIDE.md',
+  'docs/TEST_REPORT.md',
+  'docs/ACCEPTANCE_TRACE.md',
+  'docs/PRODUCT_DECISIONS.md',
+  'tests/regressions.test.js',
 ];
 for (const path of required) {
   if (!existsSync(join(root, path))) errors.push(`缺少交付文件：${path}`);

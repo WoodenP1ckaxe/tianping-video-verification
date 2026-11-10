@@ -9,8 +9,10 @@ import { spawnSync } from 'node:child_process';
 import {
   audit,
   boolInt,
+  createNotification,
   getAccount,
   getAccounts,
+  getAuditLogCount,
   getAuditLogs,
   getBackups,
   getDevice,
@@ -36,8 +38,12 @@ import {
   jsonParse,
   jsonString,
   mapAccount,
+  markAllNotificationsRead,
+  markNotificationRead,
   nowDateTime,
   nowIso,
+  getNotificationCount,
+  getNotifications,
   setSetting,
   withTransaction
 } from './db.js';
@@ -45,7 +51,6 @@ import {
   HttpError,
   SESSION_COOKIE,
   authenticate,
-  createLoginCaptcha,
   changePassword,
   clearSessionCookie,
   clientIp,
@@ -60,7 +65,20 @@ import {
   verifyCsrf
 } from './auth.js';
 import { getAnalyzerStatus } from './services/analyzer.js';
+import { getPdfExportStatus } from './services/exporter.js';
+import {
+  evaluateAndSnapshot,
+  recordDevice,
+  recordTolerance,
+  snapshotEvaluation,
+  storedJudgment
+} from './services/judgments.js';
+import { getPdfPreviewStatus } from './services/pdf-preview.js';
 import { APP_VERSION } from './version.js';
+import {
+  isValidCalendarDate,
+  isValidDateTimeMinute
+} from './time.js';
 
 const JSON_LIMIT = 2 * 1024 * 1024;
 const EXPORT_LIMIT = 1000;
@@ -83,7 +101,11 @@ function sendError(res, error) {
     res.destroy(error);
     return;
   }
-  const status = Number.isInteger(error?.status) ? error.status : 500;
+  const status = Number.isInteger(error?.httpStatus)
+    ? error.httpStatus
+    : Number.isInteger(error?.status)
+      ? error.status
+      : 500;
   const code = error?.code || 'INTERNAL_ERROR';
   const message = status >= 500 && !(error instanceof HttpError)
     ? '服务器处理请求时发生错误'
@@ -92,7 +114,9 @@ function sendError(res, error) {
     error: {
       code,
       message,
-      details: error?.details ?? null
+      details: error instanceof HttpError || error?.exposeDetails === true
+        ? (error?.details ?? null)
+        : null
     }
   });
 }
@@ -110,7 +134,15 @@ async function readJson(req, limit = JSON_LIMIT) {
   if (!chunks.length) return {};
   const text = Buffer.concat(chunks).toString('utf8');
   try {
-    return JSON.parse(text);
+    const value = JSON.parse(text);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new HttpError(
+        400,
+        'INVALID_JSON',
+        '请求内容必须是 JSON 对象'
+      );
+    }
+    return value;
   } catch {
     throw new HttpError(400, 'INVALID_JSON', '请求内容不是有效 JSON');
   }
@@ -156,10 +188,39 @@ function newTemporaryPassword() {
 
 function normalizeDate(value, label) {
   const text = String(value || '');
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(text) || Number.isNaN(Date.parse(`${text}T00:00:00Z`))) {
+  if (!isValidCalendarDate(text)) {
     throw new HttpError(400, 'VALIDATION_ERROR', `${label}格式应为 YYYY-MM-DD`);
   }
   return text;
+}
+
+function normalizeDateTimeMinute(value, label) {
+  const text = String(value || '').trim().replace('T', ' ');
+  if (!isValidDateTimeMinute(text)) {
+    throw new HttpError(
+      400,
+      'VALIDATION_ERROR',
+      `${label}格式应为 YYYY-MM-DD HH:mm`
+    );
+  }
+  return text;
+}
+
+function decodePathSegment(value, label = '路径参数') {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw new HttpError(400, 'INVALID_PATH_ENCODING', `${label}编码无效`);
+  }
+}
+
+function parsePositiveInteger(value, fallback, label) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number <= 0) {
+    throw new HttpError(400, 'VALIDATION_ERROR', `${label}必须为正整数`);
+  }
+  return number;
 }
 
 function requireNaturalWeek(from, to) {
@@ -277,27 +338,19 @@ async function getRules() {
   return rulesPromise;
 }
 
-async function evaluate(record, device) {
+async function evaluate(record, device, options = {}) {
   if (!record || !device) return null;
+  const stored = storedJudgment(record);
+  if (stored && options.refresh !== true) return stored;
   const rules = await getRules();
-  const historicalDevice = {
-    ...device,
-    ...(record.deviceSnapshot || {})
-  };
-  const tolerance = Number(
-    record.tolerancePercent
-    ?? record.templateSnapshot?.tol
-    ?? historicalDevice.tol
-    ?? 0.05
-  );
-  return rules.evaluateRecord(record, historicalDevice, tolerance);
+  const historicalDevice = recordDevice(record, device);
+  const tolerance = recordTolerance(record, historicalDevice);
+  const evaluation = rules.evaluateRecord(record, historicalDevice, tolerance);
+  return snapshotEvaluation(evaluation);
 }
 
 function deviceForRecord(record, currentDevice) {
-  return {
-    ...(currentDevice || {}),
-    ...(record?.deviceSnapshot || {})
-  };
+  return recordDevice(record, currentDevice);
 }
 
 function ensureOwner(actor, record, edit = false) {
@@ -393,11 +446,35 @@ function streamFile(req, res, filePath, inline = false, downloadName = null) {
   if (range) {
     const match = /^bytes=(\d*)-(\d*)$/.exec(range);
     if (!match) throw new HttpError(416, 'INVALID_RANGE', '视频范围请求无效');
-    const start = match[1] ? Number(match[1]) : 0;
-    const end = match[2] ? Math.min(Number(match[2]), size - 1) : size - 1;
-    if (start > end || start >= size) {
-      res.writeHead(416, { 'Content-Range': `bytes */${size}` });
-      res.end();
+    if (!match[1] && !match[2]) {
+      throw new HttpError(416, 'INVALID_RANGE', '视频范围请求无效');
+    }
+    let start;
+    let end;
+    if (!match[1]) {
+      const suffixLength = Number(match[2]);
+      if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) {
+        throw new HttpError(416, 'INVALID_RANGE', '视频范围请求无效');
+      }
+      start = Math.max(0, size - suffixLength);
+      end = size - 1;
+    } else {
+      start = Number(match[1]);
+      end = match[2] ? Math.min(Number(match[2]), size - 1) : size - 1;
+    }
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)
+      || start > end || start >= size) {
+      res.writeHead(416, {
+        'Content-Range': `bytes */${size}`,
+        'Content-Type': 'application/json; charset=utf-8'
+      });
+      res.end(JSON.stringify({
+        error: {
+          code: 'INVALID_RANGE',
+          message: '视频范围请求无效',
+          details: null
+        }
+      }));
       return;
     }
     res.writeHead(206, {
@@ -423,7 +500,10 @@ function taskOwnership(actor, task) {
 function publicTask(task) {
   if (!task) return task;
   const { filePath, ...safe } = task;
-  return safe;
+  return {
+    ...safe,
+    fileAvailable: Boolean(filePath && existsSync(filePath))
+  };
 }
 
 function validateDevicePayload(payload, existing = null) {
@@ -554,6 +634,7 @@ export class ApiRouter {
     if (pathname !== '/healthz' && pathname !== '/api/health'
       && !pathname.startsWith('/api/')) return false;
     let actorForAudit = null;
+    let match;
 
     try {
       if (req.method === 'GET' && (pathname === '/healthz' || pathname === '/api/health')) {
@@ -563,12 +644,29 @@ export class ApiRouter {
         } catch {
           database = 'error';
         }
-        const healthy = database === 'ok';
+        const analyzer = getAnalyzerStatus(this.config);
+        const pdfFont = getPdfExportStatus();
+        const pdfPreview = getPdfPreviewStatus(this.config);
+        const queue = {
+          running: this.queue.running === true,
+          stats: getQueueStats(this.db)
+        };
+        const healthy = database === 'ok'
+          && analyzer.available
+          && pdfFont.available
+          && pdfPreview.available
+          && queue.running;
         sendJson(res, healthy ? 200 : 503, {
           status: healthy ? 'ok' : 'error',
           service: 'tianping-video-verification',
           version: APP_VERSION,
           database,
+          analyzer,
+          pdf: {
+            fontAvailable: pdfFont.available,
+            previewAvailable: pdfPreview.available
+          },
+          queue,
           time: nowDateTime(),
           timezone: 'Asia/Shanghai'
         });
@@ -603,12 +701,11 @@ export class ApiRouter {
       }
 
       if (req.method === 'GET' && pathname === '/api/auth/captcha') {
-        const account = String(url.searchParams.get('account') || '').trim();
-        if (!account) {
-          throw new HttpError(400, 'CAPTCHA_ACCOUNT_REQUIRED', '请先填写账号编号');
-        }
-        sendJson(res, 200, createLoginCaptcha(this.db, account));
-        return true;
+        throw new HttpError(
+          410,
+          'CAPTCHA_DISABLED',
+          '当前登录策略采用账号锁定，不再使用图片验证码'
+        );
       }
 
       const actor = requireAuth(this.db, req, {
@@ -673,6 +770,98 @@ export class ApiRouter {
         return true;
       }
 
+      if (pathname === '/api/notifications') {
+        if (req.method === 'GET') {
+          const q = queryObject(url);
+          const page = parsePositiveInteger(q.page, 1, '页码');
+          const pageSize = Math.min(
+            100,
+            parsePositiveInteger(q.pageSize, 20, '每页条数')
+          );
+          const unread = boolQuery(q.unread) === true;
+          const total = getNotificationCount(this.db, actor.user.id, { unread });
+          sendJson(res, 200, {
+            items: getNotifications(this.db, actor.user.id, {
+              unread,
+              limit: pageSize,
+              offset: (page - 1) * pageSize
+            }),
+            total,
+            unreadCount: getNotificationCount(this.db, actor.user.id, {
+              unread: true
+            }),
+            page,
+            pageSize,
+            totalPages: Math.max(1, Math.ceil(total / pageSize))
+          });
+          return true;
+        }
+      }
+
+      if (req.method === 'POST' && pathname === '/api/notifications/read-all') {
+        const changed = markAllNotificationsRead(this.db, actor.user.id);
+        sendJson(res, 200, { ok: true, changed });
+        return true;
+      }
+
+      match = /^\/api\/notifications\/(\d+)\/read$/.exec(pathname);
+      if (req.method === 'POST' && match) {
+        const changed = markNotificationRead(
+          this.db,
+          actor.user.id,
+          Number(match[1])
+        );
+        if (!changed) {
+          throw new HttpError(404, 'NOTIFICATION_NOT_FOUND', '通知不存在或已读');
+        }
+        sendJson(res, 200, { ok: true });
+        return true;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/qr/cards.csv') {
+        requireRole(actor, 'admin');
+        const rows = [
+          ...getAccounts(this.db)
+            .filter((account) => account.role !== 'verifier')
+            .map((account) => [
+              '人员卡',
+              account.id,
+              account.name,
+              roleLabel(account.role),
+              account.status,
+              `PERSON:${account.id}`
+            ]),
+          ...getDevices(this.db).map((device) => [
+            '设备卡',
+            device.id,
+            device.uniqueNo,
+            device.dept,
+            device.status,
+            `DEVICE:${device.id}`
+          ])
+        ];
+        const csv = toCsv(
+          ['卡片类型', '卡片编号', '姓名或唯一号', '角色或科室', '状态', '二维码内容'],
+          rows
+        );
+        const fileName = `二维码卡片内容清单_${nowDateTime().slice(0, 10).replaceAll('-', '')}.csv`;
+        audit(this.db, actor, {
+          type: '导出',
+          objectType: '二维码卡片',
+          objectId: 'inventory',
+          after: `${rows.length} 条`,
+          reason: '管理员批量导出人员卡与设备卡内容清单',
+          result: '成功'
+        });
+        sendBuffer(
+          res,
+          Buffer.from(`\uFEFF${csv}`, 'utf8'),
+          'text/csv; charset=utf-8',
+          fileName
+        );
+        return true;
+      }
+
       if (req.method === 'GET' && pathname === '/api/qr/person.svg') {
         requireRole(actor, ['inspector', 'admin']);
         const requestedId = String(url.searchParams.get('account') || actor.user.id).trim();
@@ -713,11 +902,10 @@ export class ApiRouter {
         return true;
       }
 
-      let match;
       match = /^\/api\/qr\/device\/([^/]+)\.svg$/.exec(pathname);
       if (req.method === 'GET' && match) {
         requireRole(actor, ['inspector', 'verifier', 'admin']);
-        const device = getDevice(this.db, decodeURIComponent(match[1]));
+        const device = getDevice(this.db, decodePathSegment(match[1], '天平编号'));
         if (!device) throw new HttpError(404, 'DEVICE_NOT_FOUND', '天平档案不存在');
         const { generateDeviceCardSvg } = await import('./services/qr.js');
         const fileLabel = `天平二维码_${device.id}.svg`;
@@ -797,11 +985,62 @@ export class ApiRouter {
         return true;
       }
 
-      match = /^\/api\/tasks\/([^/]+)\/(retry|cancel|manual-complete)$/.exec(pathname);
+      match = /^\/api\/tasks\/([^/]+)\/(retry|cancel|manual-complete|purge)$/.exec(pathname);
       if (match && req.method === 'POST') {
-        requirePermission(actor, 'tasks.manage');
         const task = getTask(this.db, match[1]);
         if (!task) throw new HttpError(404, 'TASK_NOT_FOUND', '分析任务不存在');
+        if (match[2] === 'purge') {
+          requireRole(actor, 'admin');
+          const linkedRecord = this.db.prepare(
+            'SELECT id FROM records WHERE task_id = ? LIMIT 1'
+          ).get(task.id);
+          if ((task.recordId && getRawRecord(this.db, task.recordId))
+            || linkedRecord) {
+            throw new HttpError(
+              409,
+              'TASK_HAS_RECORD',
+              '任务已生成记录，只能归档记录，不能清理任务'
+            );
+          }
+          if (!['失败', '待人工处理', '已取消'].includes(task.status)) {
+            throw new HttpError(
+              409,
+              'TASK_NOT_PURGEABLE',
+              '仅失败、待人工处理或已取消任务可以清理'
+            );
+          }
+          if (task.filePath && existsSync(task.filePath)) {
+            throw new HttpError(
+              409,
+              'TASK_FILE_PRESENT',
+              '任务源文件仍存在，不能按无效任务清理；请先核实文件或改用取消/归档流程'
+            );
+          }
+          const body = await readJson(req);
+          const reason = requireString(body.reason, '清理理由', 1000);
+          withTransaction(this.db, () => {
+            this.db.prepare(
+              'UPDATE uploads SET task_id = NULL WHERE task_id = ?'
+            ).run(task.id);
+            this.db.prepare('DELETE FROM tasks WHERE id = ?').run(task.id);
+            audit(this.db, actor, {
+              type: '无效任务清理',
+              objectType: '分析任务',
+              objectId: task.id,
+              before: `${task.status} / ${task.code || '无错误码'}`,
+              after: '已清理',
+              reason,
+              result: '成功'
+            });
+          });
+          sendJson(res, 200, { ok: true, taskId: task.id });
+          return true;
+        }
+        const verifierRecovery = match[2] === 'retry'
+          && actor.user.role === 'verifier'
+          && task.status === '待人工处理'
+          && actor.user.permissions.includes('masterdata.write');
+        if (!verifierRecovery) requirePermission(actor, 'tasks.manage');
         if (match[2] === 'retry') {
           sendJson(res, 200, publicTask(this.queue.enqueue(task.id, actor)));
         } else if (match[2] === 'cancel') {
@@ -838,10 +1077,10 @@ export class ApiRouter {
           .map((value) => value.trim())
           .filter(Boolean);
         const devices = [...new Set(requestedDevices)].slice(0, 100);
-        const page = Math.max(1, Math.floor(Number(q.page || 1)) || 1);
+        const page = parsePositiveInteger(q.page, 1, '页码');
         const pageSize = Math.min(
           200,
-          Math.max(1, Math.floor(Number(q.pageSize || q.limit || 50)) || 50),
+          parsePositiveInteger(q.pageSize ?? q.limit, 50, '每页条数')
         );
         const filters = {
           devices: devices.length ? devices : undefined,
@@ -849,38 +1088,38 @@ export class ApiRouter {
           from: q.from ? normalizeDate(q.from, '起始日期') : undefined,
           to: q.to ? normalizeDate(q.to, '结束日期') : undefined,
           status: q.status || undefined,
+          conclusion: ['通过', '不通过'].includes(q.conclusion)
+            ? q.conclusion
+            : undefined,
+          submittedFrom: q.submittedFrom
+            ? normalizeDate(q.submittedFrom, '提交起始日期')
+            : undefined,
+          submittedTo: q.submittedTo
+            ? normalizeDate(q.submittedTo, '提交结束日期')
+            : undefined,
           includeVoided: undefined
         };
         if (filters.from && filters.to && filters.from > filters.to) {
           throw new HttpError(400, 'INVALID_DATE_RANGE', '起始日期不能晚于结束日期');
         }
-        let total;
-        let pageRecords;
-        if (q.conclusion === '通过' || q.conclusion === '不通过') {
-          const candidates = getRecords(this.db, { ...filters, limit: 10000 });
-          const evaluated = await Promise.all(candidates.map(async (record) => ({
-            record,
-            evaluation: await evaluate(record, getDevice(this.db, record.device))
-          })));
-          const matched = evaluated.filter((item) => item.evaluation?.conclusion === q.conclusion);
-          total = matched.length;
-          const start = (page - 1) * pageSize;
-          pageRecords = matched.slice(start, start + pageSize).map((item) => ({
-            ...item.record,
-            evaluation: item.evaluation
-          }));
-        } else {
-          total = getRecordCount(this.db, filters);
-          const records = getRecords(this.db, {
-            ...filters,
-            limit: pageSize,
-            offset: (page - 1) * pageSize
-          });
-          pageRecords = await Promise.all(records.map(async (record) => ({
-            ...record,
-            evaluation: await evaluate(record, getDevice(this.db, record.device))
-          })));
+        if (filters.submittedFrom && filters.submittedTo
+          && filters.submittedFrom > filters.submittedTo) {
+          throw new HttpError(
+            400,
+            'INVALID_DATE_RANGE',
+            '提交起始日期不能晚于提交结束日期'
+          );
         }
+        const total = getRecordCount(this.db, filters);
+        const records = getRecords(this.db, {
+          ...filters,
+          limit: pageSize,
+          offset: (page - 1) * pageSize
+        });
+        const pageRecords = await Promise.all(records.map(async (record) => ({
+          ...record,
+          evaluation: await evaluate(record, getDevice(this.db, record.device))
+        })));
         const totalPages = Math.max(1, Math.ceil(total / pageSize));
         this.auditQuery(
           actor,
@@ -924,7 +1163,7 @@ export class ApiRouter {
       match = /^\/api\/records\/([^/]+)\/screenshots\/([^/]+)$/.exec(pathname);
       if (match && req.method === 'GET') {
         requirePermission(actor, 'records.read');
-        if (!/^I[1-3]-[1-3]\.(jpg|jpeg|png)$/i.test(match[2])) {
+        if (!/^(?:I[1-3]-[1-3]|R\d{1,3})\.(jpg|jpeg|png)$/i.test(match[2])) {
           throw new HttpError(400, 'INVALID_FILE', '截图文件名无效');
         }
         const record = getRecord(this.db, match[1]);
@@ -963,7 +1202,12 @@ export class ApiRouter {
       if (match && req.method === 'POST') {
         requireRole(actor, 'inspector');
         const body = await readJson(req);
-        const updated = this.checkField(actor, match[1], decodeURIComponent(match[2]), body);
+        const updated = this.checkField(
+          actor,
+          match[1],
+          decodePathSegment(match[2], '核对字段'),
+          body
+        );
         sendJson(res, 200, { record: updated });
         return true;
       }
@@ -1154,14 +1398,36 @@ export class ApiRouter {
       if (req.method === 'GET' && pathname === '/api/audit') {
         requirePermission(actor, 'audit.read');
         const q = queryObject(url);
-        const rows = getAuditLogs(this.db, {
-          from: q.from,
-          to: q.to,
-          account: q.account,
-          type: q.type,
-          objectId: q.objectId,
-          limit: q.limit
-        });
+        const page = parsePositiveInteger(q.page, 1, '页码');
+        const pageSize = Math.min(
+          200,
+          parsePositiveInteger(q.pageSize ?? q.limit, 60, '每页条数')
+        );
+        const filters = {
+          from: q.from ? normalizeDate(q.from, '起始日期') : undefined,
+          to: q.to ? normalizeDate(q.to, '结束日期') : undefined,
+          account: q.account || undefined,
+          type: q.type || undefined,
+          objectId: q.objectId || undefined
+        };
+        const total = getAuditLogCount(this.db, filters);
+        let rows;
+        if (q.format === 'csv') {
+          rows = [];
+          for (let offset = 0; offset < total; offset += 5000) {
+            rows.push(...getAuditLogs(this.db, {
+              ...filters,
+              limit: Math.min(5000, total - offset),
+              offset
+            }));
+          }
+        } else {
+          rows = getAuditLogs(this.db, {
+            ...filters,
+            limit: pageSize,
+            offset: (page - 1) * pageSize
+          });
+        }
         if (q.format === 'csv') {
           const csv = toCsv(
             ['时间', '操作人', '姓名', '角色', '类型', '对象类型', '对象标识', '修改前', '修改后', '理由', '来源', '结果'],
@@ -1185,7 +1451,13 @@ export class ApiRouter {
             result: '成功'
           });
         } else {
-          sendJson(res, 200, { items: rows, total: rows.length });
+          sendJson(res, 200, {
+            items: rows,
+            total,
+            page,
+            pageSize,
+            totalPages: Math.max(1, Math.ceil(total / pageSize))
+          });
         }
         return true;
       }
@@ -1312,7 +1584,7 @@ export class ApiRouter {
         const generated = await this.handleExport(
           actor,
           res,
-          `/api/exports/record/${encodeURIComponent(decodeURIComponent(previewRecordPngMatch[1]))}`,
+          `/api/exports/record/${encodeURIComponent(decodePathSegment(previewRecordPngMatch[1], '记录编号'))}`,
           {},
           { preview: true, capture: true }
         );
@@ -1380,7 +1652,7 @@ export class ApiRouter {
         await this.handleExport(
           actor,
           res,
-          `/api/exports/record/${encodeURIComponent(decodeURIComponent(previewRecordMatch[1]))}`,
+          `/api/exports/record/${encodeURIComponent(decodePathSegment(previewRecordMatch[1], '记录编号'))}`,
           {},
           { preview: true }
         );
@@ -1466,6 +1738,12 @@ export class ApiRouter {
     const canSystem = actor.user.permissions.includes('system.read');
     const canAudit = actor.user.permissions.includes('audit.read');
     const canAccounts = actor.user.permissions.includes('accounts.write');
+    const notifications = getNotifications(this.db, actor.user.id, { limit: 20 });
+    const unreadNotifications = getNotificationCount(
+      this.db,
+      actor.user.id,
+      { unread: true }
+    );
     return {
       user: actor.user,
       csrfToken: actor.session.csrfToken,
@@ -1488,7 +1766,9 @@ export class ApiRouter {
       recordSummary,
       tasks: tasks.map(publicTask),
       evaluations,
-      audit: canAudit ? getAuditLogs(this.db, { limit: 5000 }) : [],
+      audit: canAudit ? getAuditLogs(this.db, { limit: 100 }) : [],
+      notifications,
+      unreadNotifications,
       template: getTemplate(this.db),
       templateVersions: getTemplateVersions(this.db),
       exports: getExports(this.db, actor),
@@ -1549,6 +1829,9 @@ export class ApiRouter {
       message: row.reason
     }));
     const analyzerMode = getSetting(this.db, 'analyzerMode', 'local-display-ocr');
+    const analyzer = getAnalyzerStatus(this.config);
+    const pdfPreview = getPdfPreviewStatus(this.config);
+    const pdfFont = getPdfExportStatus();
     const ntp = detectNtpSync();
     if (persistAudit && actor) {
       audit(this.db, actor, {
@@ -1565,8 +1848,8 @@ export class ApiRouter {
         { name: 'Web/应用服务', status: '运行中', detail: `Node ${process.version}` },
         {
           name: '分析服务',
-          status: this.queue.running ? '运行中' : '已停止',
-          detail: `单机串行队列；适配器 ${analyzerMode}`
+          status: this.queue.running && analyzer.available ? '运行中' : '异常',
+          detail: `单机串行队列；媒体工具 ${analyzer.available ? '可用' : '缺失'}；适配器 ${analyzerMode}`
         },
         {
           name: '数据库',
@@ -1577,6 +1860,11 @@ export class ApiRouter {
           name: '文件存储',
           status: '运行中',
           detail: this.config.dataDir
+        },
+        {
+          name: 'PDF 预览',
+          status: pdfPreview.available ? '运行中' : '异常',
+          detail: pdfPreview.available ? 'Poppler 可用' : 'Poppler 不可用，仍可下载 PDF'
         }
       ],
       queue,
@@ -1585,7 +1873,11 @@ export class ApiRouter {
       logs: this.logger?.status?.() || null,
       backups: getBackups(this.db).slice(0, 20),
       recentErrors,
-      analyzer: getAnalyzerStatus(this.config),
+      analyzer,
+      pdf: {
+        fontAvailable: pdfFont.available,
+        previewAvailable: pdfPreview.available
+      },
       env: {
         os: `${process.platform} ${process.arch}`,
         node: process.version,
@@ -1640,11 +1932,7 @@ export class ApiRouter {
     }
     let readoutTime = record.readouts[index].time;
     if (body.time !== undefined) {
-      const candidate = String(body.time || '').replace('T', ' ');
-      if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(candidate)) {
-        throw new HttpError(400, 'INVALID_READOUT_TIME', '测量时间格式应为 YYYY-MM-DD HH:mm');
-      }
-      readoutTime = candidate;
+      readoutTime = normalizeDateTimeMinute(body.time, '测量时间');
     }
     const before = record.readouts[index].value;
     record.readouts[index] = {
@@ -1665,16 +1953,30 @@ export class ApiRouter {
       reason: reason || '（未填写）',
       stage: record.status
     });
+    const judgedAt = nowDateTime();
+    const judgment = evaluateAndSnapshot(
+      record,
+      device,
+      recordTolerance(record, device),
+      judgedAt
+    );
     withTransaction(this.db, () => {
       this.db.prepare(`
         UPDATE records
-        SET readouts_json = ?, checks_json = ?, modifications_json = ?, updated_at = ?
+        SET readouts_json = ?, checks_json = ?, modifications_json = ?,
+            conclusion = ?, judgment_json = ?, judged_at = ?, rule_version = ?,
+            tolerance_percent = ?, updated_at = ?
         WHERE id = ?
       `).run(
         jsonString(record.readouts),
         jsonString(record.checks),
         jsonString(record.modifications),
-        nowDateTime(),
+        judgment.conclusion,
+        jsonString(judgment),
+        judgment.judgedAt,
+        judgment.ruleVersion,
+        judgment.tol,
+        judgedAt,
         recordId
       );
       audit(this.db, actor, {
@@ -1814,7 +2116,7 @@ export class ApiRouter {
       throw new HttpError(409, 'INVALID_STATE', '仅待提交记录可以提交');
     }
     const device = deviceForRecord(record, getDevice(this.db, record.device));
-    const evaluation = await evaluate(record, device);
+    const evaluation = await evaluate(record, device, { refresh: true });
     const blockers = [];
     if (!record.box) blockers.push('砝码盒编号未填写');
     if (!record.cleanliness) blockers.push('“清洁”未确认');
@@ -1839,9 +2141,21 @@ export class ApiRouter {
       const result = this.db.prepare(`
         UPDATE records
         SET status = '已提交', submitted_by = ?, submitted_at = ?,
-            submitted_from = ?, updated_at = ?
+            submitted_from = ?, conclusion = ?, judgment_json = ?,
+            judged_at = ?, rule_version = ?, tolerance_percent = ?, updated_at = ?
         WHERE id = ? AND status = '待提交'
-      `).run(actor.user.id, time, sourceTerminal(req, actor.ip), time, recordId);
+      `).run(
+        actor.user.id,
+        time,
+        sourceTerminal(req, actor.ip),
+        evaluation.conclusion,
+        jsonString(evaluation),
+        evaluation.judgedAt,
+        evaluation.ruleVersion,
+        evaluation.tol,
+        time,
+        recordId
+      );
       if (!result.changes) {
         throw new HttpError(409, 'INVALID_STATE', '记录状态已变化，请刷新后重试');
       }
@@ -1890,6 +2204,16 @@ export class ApiRouter {
         reason: '电子签名确认，记录锁定',
         result: '成功'
       });
+      createNotification(this.db, {
+        recipientId: record.inspector,
+        type: '记录复核确认',
+        title: `记录 ${record.id} 已复核确认`,
+        body: `${actor.user.name} 已完成电子签名，记录字段已锁定。`,
+        objectType: '校验记录',
+        objectId: record.id,
+        createdBy: actor.user.id,
+        createdAt: time
+      });
     });
     return getRecord(this.db, recordId);
   }
@@ -1921,6 +2245,16 @@ export class ApiRouter {
         reason: text || '未填写退回理由',
         result: '成功'
       });
+      createNotification(this.db, {
+        recipientId: record.inspector,
+        type: '记录退回',
+        title: `记录 ${record.id} 已退回待提交`,
+        body: `${actor.user.name} 退回了记录。退回理由：${text || '未填写'}`,
+        objectType: '校验记录',
+        objectId: record.id,
+        createdBy: actor.user.id,
+        createdAt: time
+      });
     });
     return getRecord(this.db, recordId);
   }
@@ -1947,6 +2281,16 @@ export class ApiRouter {
         after: '已作废',
         reason: text,
         result: '成功'
+      });
+      createNotification(this.db, {
+        recipientId: record.inspector,
+        type: '记录作废',
+        title: `记录 ${record.id} 已作废`,
+        body: `${actor.user.name} 作废了该记录。理由：${text}`,
+        objectType: '校验记录',
+        objectId: record.id,
+        createdBy: actor.user.id,
+        createdAt: time
       });
     });
     return getRecord(this.db, recordId);
@@ -2024,8 +2368,12 @@ export class ApiRouter {
     const before = getWeightBox(this.db, id);
     if (existing && !before) throw new HttpError(404, 'BOX_NOT_FOUND', '砝码盒不存在');
     if (!existing && before) throw new HttpError(409, 'DUPLICATE_BOX', '砝码盒编号已存在');
-    const status = body.status === '停用' ? '停用' : '启用';
-    const remark = String(body.remark || '').slice(0, 1000);
+    const status = body.status === undefined
+      ? (before?.status === '停用' ? '停用' : '启用')
+      : (body.status === '停用' ? '停用' : '启用');
+    const remark = String(
+      body.remark === undefined ? (before?.remark || '') : body.remark
+    ).slice(0, 1000);
     const time = nowDateTime();
     withTransaction(this.db, () => {
       if (before) {
@@ -2068,7 +2416,9 @@ export class ApiRouter {
     }
     const value = requireString(body.value ?? before?.value, '字典值', 100);
     const label = optionalString(body.label ?? before?.label ?? value, '显示名称', 100) || value;
-    const status = body.status === '停用' ? '停用' : '启用';
+    const status = body.status === undefined
+      ? (before?.status === '停用' ? '停用' : '启用')
+      : (body.status === '停用' ? '停用' : '启用');
     const sortOrder = Number(body.sortOrder ?? before?.sortOrder ?? 100);
     if (!Number.isSafeInteger(sortOrder) || sortOrder < -10000 || sortOrder > 10000) {
       throw new HttpError(400, 'INVALID_SORT_ORDER', '排序值必须是 -10000 至 10000 的整数');
@@ -2179,6 +2529,42 @@ export class ApiRouter {
     if (!Array.isArray(config.fields) || !config.fields.length) {
       throw new HttpError(400, 'INVALID_TEMPLATE', '模板字段配置不能为空');
     }
+    const fieldKeys = new Set();
+    config.fields = config.fields.map((field, index) => {
+      if (!field || typeof field !== 'object' || Array.isArray(field)) {
+        throw new HttpError(
+          400,
+          'INVALID_TEMPLATE',
+          `模板字段第 ${index + 1} 项必须是对象`
+        );
+      }
+      const key = String(field.key || '').trim();
+      const label = String(field.label || '').trim();
+      if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(key)) {
+        throw new HttpError(
+          400,
+          'INVALID_TEMPLATE',
+          `模板字段第 ${index + 1} 项缺少有效标识`
+        );
+      }
+      if (!label || label.length > 100) {
+        throw new HttpError(
+          400,
+          'INVALID_TEMPLATE',
+          `模板字段 ${key} 的显示名称不能为空且不能超过 100 个字符`
+        );
+      }
+      if (fieldKeys.has(key)) {
+        throw new HttpError(400, 'INVALID_TEMPLATE', `模板字段标识重复：${key}`);
+      }
+      fieldKeys.add(key);
+      return {
+        key,
+        label,
+        show: field.show !== false,
+        locked: field.locked === true
+      };
+    });
     const version = nextTemplateVersion(this.db);
     config.version = version;
     const summary = String(body.summary || (reset ? '恢复默认模板' : '模板参数调整')).slice(0, 1000);
@@ -2600,22 +2986,26 @@ export class ApiRouter {
 
     if (pathname === '/api/exports/csv') {
       const type = String(body.type || 'records');
+      const csvFilters = {
+        from: body.from ? normalizeDate(body.from, '起始日期') : undefined,
+        to: body.to ? normalizeDate(body.to, '结束日期') : undefined,
+        devices: stringList(body.devices),
+        inspector: body.inspector || undefined,
+        status: body.status || undefined,
+        conclusion: ['通过', '不通过'].includes(body.conclusion)
+          ? body.conclusion
+          : undefined,
+        includeVoided: type === 'readouts' ? false : undefined
+      };
       let headers;
       let rows;
       if (type === 'readouts') {
         headers = ['记录编号', '校验日期', '天平编号', '天平唯一号', '砝码盒编号', '检验人员', '复核确认人', '复核时间', '读数编号', '标称值(g)', '示值(g)', '时间', '是否在限内', '判定结论'];
-        const candidates = getRecords(this.db, {
-          from: body.from,
-          to: body.to,
-          devices: stringList(body.devices),
-          inspector: body.inspector,
-          status: body.status,
-          includeVoided: false
-        });
+        const candidates = getRecords(this.db, csvFilters);
         const records = [];
         for (const record of candidates) {
           const evaluation = await evaluate(record, getDevice(this.db, record.device));
-          if (!body.conclusion || evaluation?.conclusion === body.conclusion) {
+          if (!csvFilters.conclusion || evaluation?.conclusion === csvFilters.conclusion) {
             records.push({ record, evaluation });
           }
         }
@@ -2643,18 +3033,12 @@ export class ApiRouter {
         ]);
       } else {
         headers = ['记录编号', '校验日期', '天平编号', '天平唯一号', '砝码盒编号', '检验人员', '判定结论', '复核状态', '提交时间', '复核确认人', '复核时间', '备注'];
-        const records = getRecords(this.db, {
-          from: body.from,
-          to: body.to,
-          devices: stringList(body.devices),
-          inspector: body.inspector,
-          status: body.status
-        });
+        const records = getRecords(this.db, csvFilters);
         rows = [];
         for (const record of records) {
           const device = getDevice(this.db, record.device);
           const evaluation = await evaluate(record, device);
-          if (body.conclusion && evaluation?.conclusion !== body.conclusion) continue;
+          if (csvFilters.conclusion && evaluation?.conclusion !== csvFilters.conclusion) continue;
           rows.push([
             record.id, record.date, record.device,
             record.deviceSnapshot?.uniqueNo || device?.uniqueNo || '',

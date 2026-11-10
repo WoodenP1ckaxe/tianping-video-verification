@@ -27,6 +27,7 @@ import {
 } from '../db.js';
 import { HttpError } from '../auth.js';
 import { inspectVideoMetadata } from './analyzer.js';
+import { isValidDateTimeMinute } from '../time.js';
 
 const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
 const ALLOWED_EXTENSIONS = new Set(['.mp4', '.mov']);
@@ -57,6 +58,7 @@ function uploadDto(row, extras = {}) {
     sha256: row.sha256,
     status: row.status,
     taskId: row.task_id,
+    expectedDeviceId: row.expected_device_id || null,
     error: row.error_code ? {
       code: row.error_code,
       message: row.error_message
@@ -101,7 +103,7 @@ export class UploadService {
     if (sizeBytes > MAX_UPLOAD_BYTES) {
       throw new HttpError(413, 'VIDEO_TOO_LARGE', '单个视频文件不能超过 500MB');
     }
-    if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(startedAt)) {
+    if (!isValidDateTimeMinute(startedAt)) {
       throw new HttpError(400, 'INVALID_START_TIME', '请确认拍摄开始时间，精确到分钟');
     }
     if (expectedDeviceId) {
@@ -113,13 +115,13 @@ export class UploadService {
     const sameDayRows = this.db.prepare(`
       SELECT device_id, COUNT(*) AS count
       FROM records
-      WHERE inspector_id = ? AND date = ? AND status <> '已作废'
+      WHERE date = ? AND status <> '已作废'
         AND (? = '' OR device_id = ?)
       GROUP BY device_id
       ORDER BY device_id
-    `).all(actor.user.id, startedAt.slice(0, 10), expectedDeviceId, expectedDeviceId);
+    `).all(startedAt.slice(0, 10), expectedDeviceId, expectedDeviceId);
     const duplicateWarning = sameDayRows.length
-      ? `${expectedDeviceId ? `该天平（${expectedDeviceId}）当日已有记录` : '该拍摄日期您已有记录'}：${sameDayRows.map((row) => `${row.device_id} ${row.count} 条`).join('、')}。系统会生成独立的当日记录，不会覆盖已有记录；可继续上传。`
+      ? `${expectedDeviceId ? `该天平（${expectedDeviceId}）当日已有记录` : '该拍摄日期已有记录'}：${sameDayRows.map((row) => `${row.device_id} ${row.count} 条`).join('、')}。系统会生成独立的当日记录，不会覆盖已有记录；可继续上传。`
       : '';
 
     const active = this.db.prepare(`
@@ -176,8 +178,8 @@ export class UploadService {
       this.db.prepare(`
         INSERT INTO uploads (
           id, user_id, original_name, size_bytes, received_bytes, started_at,
-          time_confirmed, temp_path, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, '上传中', ?, ?)
+          time_confirmed, temp_path, status, expected_device_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, '上传中', ?, ?, ?)
       `).run(
         id,
         actor.user.id,
@@ -186,6 +188,7 @@ export class UploadService {
         startedAt,
         payload?.timeConfirmed === true ? 1 : 0,
         tempPath,
+        expectedDeviceId || null,
         time,
         time
       );
@@ -351,7 +354,7 @@ export class UploadService {
       throw new HttpError(409, 'UPLOAD_NOT_TIME_CONFIRMABLE', '仅已完整接收且等待时间的上传可确认拍摄时间');
     }
     const startedAt = String(startedAtValue || '').trim().replace('T', ' ');
-    if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(startedAt)) {
+    if (!isValidDateTimeMinute(startedAt)) {
       throw new HttpError(400, 'INVALID_START_TIME', '拍摄开始时间格式应为 YYYY-MM-DD HH:mm');
     }
     this.db.prepare(`
@@ -426,15 +429,16 @@ export class UploadService {
         this.db.prepare(`
           INSERT INTO tasks (
             id, file_name, file_path, size_bytes, user_id, device_id, status,
-            started_at, queued_at, sha256, source_ip, retry_count, warnings_json,
-            created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, NULL, '排队中', ?, ?, ?, ?, 0, '[]', ?, ?)
+            expected_device_id, started_at, queued_at, sha256, source_ip,
+            retry_count, warnings_json, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, NULL, '排队中', ?, ?, ?, ?, ?, 0, '[]', ?, ?)
         `).run(
           taskId,
           row.original_name,
           finalPath,
           row.size_bytes,
           row.user_id,
+          row.expected_device_id || null,
           effectiveStartTime,
           time,
           sha256,

@@ -19,6 +19,7 @@ import { AnalysisQueue } from './src/services/queue.js';
 import { ApplicationLogger } from './src/services/logs.js';
 import { StorageService } from './src/services/storage.js';
 import { UploadService } from './src/services/uploads.js';
+import { backfillStoredJudgments } from './src/services/judgments.js';
 
 const APP_ROOT = path.dirname(fileURLToPath(import.meta.url));
 
@@ -242,6 +243,11 @@ export async function startServer(overrides = {}) {
     dataDir: config.dataDir,
     initialPassword: config.initialPassword
   });
+  backfillStoredJudgments(db);
+  db.prepare(`
+    DELETE FROM login_rate_limits
+    WHERE updated_at < ?
+  `).run(Date.now() - 24 * 60 * 60 * 1000);
   config.dbPath = dbPath;
 
   const logger = new ApplicationLogger({ config });
