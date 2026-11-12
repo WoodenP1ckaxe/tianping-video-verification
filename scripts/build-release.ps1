@@ -295,10 +295,10 @@ if (-not $WindowsOnly) {
 }
 
 $readmeSource = Join-Path $root "docs\QUICK_START.md"
-Copy-Item -LiteralPath $readmeSource -Destination (Join-Path $releaseRoot "使用说明.md") -Force
+Copy-Item -LiteralPath $readmeSource -Destination (Join-Path $releaseRoot "QUICK_START.md") -Force
 $htmlText = (Get-Content -LiteralPath (Join-Path $root "packaging\assets\使用说明.html") -Raw).Replace("V__TIANPING_VERSION__", "V$Version")
 [System.IO.File]::WriteAllText(
-  (Join-Path $releaseRoot "使用说明.html"),
+  (Join-Path $releaseRoot "QUICK_START.html"),
   $htmlText,
   [System.Text.UTF8Encoding]::new($false)
 )

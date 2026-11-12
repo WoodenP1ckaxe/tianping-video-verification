@@ -8,8 +8,8 @@
 release/vX.Y.Z/
   TianpingVideoVerification-X.Y.Z-Windows-x64-Setup.exe
   TianpingVideoVerification-X.Y.Z-Linux-x64.tar.gz
-  使用说明.html
-  使用说明.md
+  QUICK_START.html
+  QUICK_START.md
   RELEASE_NOTES.md
   SHA256SUMS.txt
 ```
