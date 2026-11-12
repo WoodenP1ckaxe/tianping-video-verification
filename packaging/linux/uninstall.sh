@@ -44,11 +44,12 @@ fi
 
 "$INSTALL_DIR/control/service.sh" stop >/dev/null 2>&1 || true
 
-if [ "$SERVICE_MODE" = "systemd-system" ]; then
+if [ -f "/etc/systemd/system/$SERVICE_NAME.service" ]; then
   systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/$SERVICE_NAME.service"
   systemctl daemon-reload || true
-elif [ "$SERVICE_MODE" = "systemd-user" ]; then
+fi
+if [ -f "$HOME/.config/systemd/user/$SERVICE_NAME.service" ]; then
   systemctl --user disable "$SERVICE_NAME" >/dev/null 2>&1 || true
   rm -f "$HOME/.config/systemd/user/$SERVICE_NAME.service"
   systemctl --user daemon-reload || true

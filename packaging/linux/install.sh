@@ -161,9 +161,15 @@ if [ "$SYSTEM_MODE" -eq 1 ] && command -v systemctl >/dev/null 2>&1 \
   && [ -d /run/systemd/system ]; then
   SERVICE_MODE=systemd-system
 elif [ "$SYSTEM_MODE" -eq 0 ] && command -v systemctl >/dev/null 2>&1 \
-  && [ -d /run/systemd/system ] && systemctl --user show-environment >/dev/null 2>&1; then
+  && [ -d /run/systemd/system ] \
+  && [ -n "${XDG_RUNTIME_DIR:-}" ] \
+  && [ -S "$XDG_RUNTIME_DIR/bus" ] \
+  && systemctl --user show-environment >/dev/null 2>&1; then
   SERVICE_MODE=systemd-user
 fi
+case "$INSTALL_DIR $DATA_DIR" in
+  *[[:space:]]*) SERVICE_MODE=manual ;;
+esac
 
 {
   printf 'INSTALL_DIR=%s\n' "$(sh_quote "$INSTALL_DIR")"
@@ -194,17 +200,17 @@ if [ "$SERVICE_MODE" = "systemd-user" ] || [ "$SERVICE_MODE" = "systemd-system" 
       echo "User=$SERVICE_USER"
       echo "Group=$SERVICE_USER"
     fi
-    echo "WorkingDirectory=\"$INSTALL_DIR/app\""
-    echo 'Environment="NODE_ENV=production"'
-    echo 'Environment="NODE_NO_WARNINGS=1"'
-    echo 'Environment="TZ=Asia/Shanghai"'
-    echo "Environment=\"HOST=$HOST\""
-    echo "Environment=\"PORT=$PORT\""
-    echo "Environment=\"DATA_DIR=$DATA_DIR\""
-    echo "Environment=\"FFMPEG_PATH=$INSTALL_DIR/runtime/bin/ffmpeg\""
-    echo "Environment=\"FFPROBE_PATH=$INSTALL_DIR/runtime/bin/ffprobe\""
-    echo "Environment=\"PDF_FONT_PATH=$INSTALL_DIR/runtime/fonts/NotoSansCJKsc-VF.ttf\""
-    echo "ExecStart=\"$INSTALL_DIR/runtime/node\" \"$INSTALL_DIR/app/server.js\""
+    echo "WorkingDirectory=$INSTALL_DIR/app"
+    echo "Environment=NODE_ENV=production"
+    echo "Environment=NODE_NO_WARNINGS=1"
+    echo "Environment=TZ=Asia/Shanghai"
+    echo "Environment=HOST=$HOST"
+    echo "Environment=PORT=$PORT"
+    echo "Environment=DATA_DIR=$DATA_DIR"
+    echo "Environment=FFMPEG_PATH=$INSTALL_DIR/runtime/bin/ffmpeg"
+    echo "Environment=FFPROBE_PATH=$INSTALL_DIR/runtime/bin/ffprobe"
+    echo "Environment=PDF_FONT_PATH=$INSTALL_DIR/runtime/fonts/NotoSansCJKsc-VF.ttf"
+    echo "ExecStart=$INSTALL_DIR/runtime/node $INSTALL_DIR/app/server.js"
     echo 'Restart=on-failure'
     echo 'RestartSec=3'
     echo 'UMask=0077'

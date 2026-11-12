@@ -118,7 +118,17 @@ systemd_call() {
 
 start_service() {
   case "$SERVICE_MODE" in
-    systemd-user|systemd-system) systemd_call start "$SERVICE_NAME" ;;
+    systemd-user)
+      if ! systemd_call start "$SERVICE_NAME"; then
+        echo "systemd 用户服务不可用，改用内置进程管理。"
+        SERVICE_MODE=manual
+        temp_env="$ENV_FILE.tmp.$$"
+        sed "s/^SERVICE_MODE=.*/SERVICE_MODE='manual'/" "$ENV_FILE" >"$temp_env"
+        mv "$temp_env" "$ENV_FILE"
+        manual_start
+      fi
+      ;;
+    systemd-system) systemd_call start "$SERVICE_NAME" ;;
     *) manual_start ;;
   esac
   wait_for_service
