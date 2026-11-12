@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "24.12.0"
           cache: npm
       - name: Install Linux verification tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk
@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "24.12.0"
           cache: npm
       - name: Read version
         id: version
@@ -52,15 +52,19 @@ jobs:
         shell: pwsh
         run: |
           npm ci
-          choco install innosetup --version=6.7.4 -y --no-progress
+          choco install innosetup -y --no-progress
           choco install ffmpeg -y --no-progress
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) {
             $iscc = (Get-ChildItem "C:\Program Files" -Recurse -Filter ISCC.exe | Select-Object -First 1).FullName
           }
+          $ffmpeg = Get-ChildItem "C:\ProgramData\chocolatey\lib\ffmpeg" -Recurse -File -Filter ffmpeg.exe `
+            | Where-Object Length -gt 20MB | Select-Object -First 1
+          if (-not $iscc -or -not (Test-Path $iscc)) { throw "Inno Setup compiler not found" }
+          if (-not $ffmpeg) { throw "Real FFmpeg binary not found after package installation" }
           "TIANPING_ISCC=$iscc" >> $env:GITHUB_ENV
           "TIANPING_NODE_EXE=$((Get-Command node).Source)" >> $env:GITHUB_ENV
-          "TIANPING_WIN_FFMPEG=$((Get-Command ffmpeg).Source)" >> $env:GITHUB_ENV
+          "TIANPING_WIN_FFMPEG=$($ffmpeg.FullName)" >> $env:GITHUB_ENV
       - name: Fetch pinned offline runtime assets
         run: node scripts/fetch-release-assets.mjs
       - name: Build Windows and Linux packages
@@ -69,7 +73,8 @@ jobs:
       - name: Smoke-test installed Windows package
         shell: pwsh
         run: |
-          $installer = Get-ChildItem "release\v*" -Filter "*Windows-x64-Setup.exe" | Select-Object -First 1
+          $installer = Get-ChildItem "release" -Recurse -File -Filter "*Windows-x64-Setup.exe" | Select-Object -First 1
+          if (-not $installer) { throw "Windows installer artifact not found" }
           .\scripts\smoke-test-windows.ps1 -Installer $installer.FullName -ExpectedVersion "${{ steps.version.outputs.value }}"
       - uses: actions/upload-artifact@v4
         with:

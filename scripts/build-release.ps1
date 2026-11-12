@@ -169,6 +169,10 @@ function Build-Windows([string]$NodeLicense, [string]$FfmpegLicense, [string]$Br
   if (-not (Test-Path -LiteralPath $ffprobeExe)) {
     throw "未找到与 FFmpeg 同目录的 ffprobe.exe：$ffprobeExe"
   }
+  if ((Get-Item -LiteralPath $ffmpegExe).Length -lt 20MB `
+    -or (Get-Item -LiteralPath $ffprobeExe).Length -lt 20MB) {
+    throw "检测到 Chocolatey/包管理器垫片而非真实 FFmpeg 二进制，拒绝生成不完整安装包"
+  }
   Copy-Item -LiteralPath $ffmpegExe -Destination (Join-Path $runtime "ffmpeg.exe") -Force
   Copy-Item -LiteralPath $ffprobeExe -Destination (Join-Path $runtime "ffprobe.exe") -Force
   New-Item -ItemType Directory -Path (Join-Path $runtime "fonts") -Force | Out-Null
