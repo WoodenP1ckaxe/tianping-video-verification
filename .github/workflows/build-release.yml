@@ -23,6 +23,10 @@ jobs:
       - name: Install Linux verification tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk
       - run: npm ci
+      - name: Fetch the release CJK font
+        run: |
+          node scripts/fetch-release-assets.mjs --fonts
+          echo "PDF_FONT_PATH=$GITHUB_WORKSPACE/verification/release-assets/NotoSansCJKsc-VF.ttf" >> "$GITHUB_ENV"
       - run: npm run check
       - run: npm test
 

@@ -43,6 +43,10 @@ const assets = [
     sha256: '6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2'
   }
 ];
+const fontOnly = process.argv.includes('--fonts');
+const selectedAssets = fontOnly
+  ? assets.filter((asset) => ['NotoSansCJKsc-VF.ttf', 'OFL.txt'].includes(asset.name))
+  : assets;
 
 async function digest(path) {
   const { createHash } = await import('node:crypto');
@@ -85,5 +89,5 @@ async function download(asset) {
 }
 
 await mkdir(cache, { recursive: true });
-for (const asset of assets) await download(asset);
+for (const asset of selectedAssets) await download(asset);
 console.log(`构建资源缓存：${cache}`);

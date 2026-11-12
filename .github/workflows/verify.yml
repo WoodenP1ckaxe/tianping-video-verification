@@ -31,6 +31,11 @@ jobs:
       - name: Install offline OCR dependencies
         run: npm ci
 
+      - name: Fetch the same bundled CJK font used by release packages
+        run: |
+          node scripts/fetch-release-assets.mjs --fonts
+          echo "PDF_FONT_PATH=$GITHUB_WORKSPACE/verification/release-assets/NotoSansCJKsc-VF.ttf" >> "$GITHUB_ENV"
+
       - name: Verify implementation
         run: npm run check
 
