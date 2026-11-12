@@ -18,9 +18,29 @@ const assets = [
     sha256: 'bdebee276e58d0ef5448f3d5ac12c67daa963dd5e0a9bb621a53d1cefbc852fd'
   },
   {
-    name: 'ffmpeg-master-latest-linux64-gpl.tar.xz',
-    url: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz',
-    sha256: 'f6f8a35568815b7a99e0c513d7c6593262422986047068db190980c4bc186865'
+    name: 'ffmpeg-win32-x64.gz',
+    url: 'https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-win32-x64.gz',
+    sha256: '8883a3dffbd0a16cf4ef95206ea05283f78908dbfb118f73c83f4951dcc06d77'
+  },
+  {
+    name: 'ffprobe-win32-x64.gz',
+    url: 'https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffprobe-win32-x64.gz',
+    sha256: 'f309e6223ad89d2fe54bccd420a7709b66fd27540674e92309578ed491a43c8d'
+  },
+  {
+    name: 'ffmpeg-linux-x64.gz',
+    url: 'https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-linux-x64.gz',
+    sha256: 'bfe8a8fc511530457b528c48d77b5737527b504a3797a9bc4866aeca69c2dffa'
+  },
+  {
+    name: 'ffprobe-linux-x64.gz',
+    url: 'https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffprobe-linux-x64.gz',
+    sha256: '25d9b6ccb05e3d9de9e04e31e2506d8dd7f9f0418981965ac6df12e8d3afd067'
+  },
+  {
+    name: 'FFMPEG-GPLv3.txt',
+    url: 'https://raw.githubusercontent.com/FFmpeg/FFmpeg/n6.1.1/COPYING.GPLv3',
+    sha256: '8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903'
   },
   {
     name: 'innosetup-6.7.4.exe',

@@ -45,6 +45,24 @@ function Copy-DirectoryContents([string]$Source, [string]$Destination) {
   }
 }
 
+function Expand-GzipFile([string]$Source, [string]$Destination) {
+  $targetDirectory = Split-Path -Parent $Destination
+  New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null
+  $input = [System.IO.File]::OpenRead($Source)
+  $gzip = [System.IO.Compression.GZipStream]::new(
+    $input,
+    [System.IO.Compression.CompressionMode]::Decompress
+  )
+  $output = [System.IO.File]::Create($Destination)
+  try {
+    $gzip.CopyTo($output)
+  } finally {
+    $output.Dispose()
+    $gzip.Dispose()
+    $input.Dispose()
+  }
+}
+
 function Copy-App([string]$Destination) {
   New-Item -ItemType Directory -Path $Destination -Force | Out-Null
   foreach ($file in @("server.js", "package.json", "package-lock.json", "README.md", "LICENSE")) {
@@ -73,7 +91,7 @@ function Copy-DocsAndLicenses(
     Copy-Item -Destination $docs -Force
   $usageSource = Join-Path $root "packaging\assets\使用说明.html"
   $usageText = Get-Content -LiteralPath $usageSource -Raw
-  $usageText = $usageText.Replace("V1.0.5", "V$Version")
+  $usageText = $usageText.Replace("V__TIANPING_VERSION__", "V$Version")
   [System.IO.File]::WriteAllText(
     (Join-Path $docs $UsageFileName),
     $usageText,
@@ -153,28 +171,12 @@ function Build-Windows([string]$NodeLicense, [string]$FfmpegLicense, [string]$Br
   }
   Copy-Item -LiteralPath $nodeExe -Destination (Join-Path $runtime "node.exe") -Force
 
-  $ffmpegExe = $env:TIANPING_WIN_FFMPEG
-  if (-not $ffmpegExe) {
-    $candidate = "D:\ffmpeg\ffmpeg-7.1-full_build\bin\ffmpeg.exe"
-    if (Test-Path -LiteralPath $candidate) { $ffmpegExe = $candidate }
+  Expand-GzipFile (Join-Path $AssetCache "ffmpeg-win32-x64.gz") (Join-Path $runtime "ffmpeg.exe")
+  Expand-GzipFile (Join-Path $AssetCache "ffprobe-win32-x64.gz") (Join-Path $runtime "ffprobe.exe")
+  if ((Get-Item -LiteralPath (Join-Path $runtime "ffmpeg.exe")).Length -lt 20MB `
+    -or (Get-Item -LiteralPath (Join-Path $runtime "ffprobe.exe")).Length -lt 20MB) {
+    throw "固定 FFmpeg 资产解压结果无效"
   }
-  if (-not $ffmpegExe) {
-    $command = Get-Command ffmpeg -ErrorAction SilentlyContinue
-    if ($command) { $ffmpegExe = $command.Source }
-  }
-  if (-not $ffmpegExe -or -not (Test-Path -LiteralPath $ffmpegExe)) {
-    throw "未找到 Windows FFmpeg；请设置 TIANPING_WIN_FFMPEG"
-  }
-  $ffprobeExe = Join-Path (Split-Path -Parent $ffmpegExe) "ffprobe.exe"
-  if (-not (Test-Path -LiteralPath $ffprobeExe)) {
-    throw "未找到与 FFmpeg 同目录的 ffprobe.exe：$ffprobeExe"
-  }
-  if ((Get-Item -LiteralPath $ffmpegExe).Length -lt 20MB `
-    -or (Get-Item -LiteralPath $ffprobeExe).Length -lt 20MB) {
-    throw "检测到 Chocolatey/包管理器垫片而非真实 FFmpeg 二进制，拒绝生成不完整安装包"
-  }
-  Copy-Item -LiteralPath $ffmpegExe -Destination (Join-Path $runtime "ffmpeg.exe") -Force
-  Copy-Item -LiteralPath $ffprobeExe -Destination (Join-Path $runtime "ffprobe.exe") -Force
   New-Item -ItemType Directory -Path (Join-Path $runtime "fonts") -Force | Out-Null
   Copy-Item -LiteralPath (Join-Path $AssetCache "NotoSansCJKsc-VF.ttf") -Destination (Join-Path $runtime "fonts\NotoSansCJKsc-VF.ttf") -Force
 
@@ -227,19 +229,12 @@ function Build-Linux([string]$NodeLicense, [string]$FfmpegLicense, [string]$Bran
   $linuxRoot = Join-Path $buildRoot "linux"
   Reset-ManagedDirectory $linuxRoot
   $extractNode = Join-Path $linuxRoot "extract-node"
-  $extractFfmpeg = Join-Path $linuxRoot "extract-ffmpeg"
   $stage = Join-Path $linuxRoot "TianpingVideoVerification-$Version-linux-x64"
-  New-Item -ItemType Directory -Path $extractNode, $extractFfmpeg, $stage -Force | Out-Null
+  New-Item -ItemType Directory -Path $extractNode, $stage -Force | Out-Null
 
   & tar -xJf (Join-Path $AssetCache "node-v24.12.0-linux-x64.tar.xz") -C $extractNode `
     "node-v24.12.0-linux-x64/bin/node" "node-v24.12.0-linux-x64/LICENSE"
   if ($LASTEXITCODE -ne 0) { throw "Node.js Linux 压缩包解压失败" }
-  & tar -xJf (Join-Path $AssetCache "ffmpeg-master-latest-linux64-gpl.tar.xz") -C $extractFfmpeg `
-    "ffmpeg-master-latest-linux64-gpl/bin/ffmpeg" `
-    "ffmpeg-master-latest-linux64-gpl/bin/ffprobe" `
-    "ffmpeg-master-latest-linux64-gpl/LICENSE.txt"
-  if ($LASTEXITCODE -ne 0) { throw "FFmpeg Linux 压缩包解压失败" }
-
   $app = Join-Path $stage "app"
   $runtime = Join-Path $stage "runtime"
   $runtimeBin = Join-Path $runtime "bin"
@@ -247,16 +242,15 @@ function Build-Linux([string]$NodeLicense, [string]$FfmpegLicense, [string]$Bran
   New-Item -ItemType Directory -Path $runtimeBin, (Join-Path $runtime "fonts"), $control -Force | Out-Null
   Copy-App $app
   $nodeExtract = Get-ChildItem -LiteralPath $extractNode -Directory | Select-Object -First 1
-  $ffmpegExtract = Get-ChildItem -LiteralPath $extractFfmpeg -Directory | Select-Object -First 1
   if (-not $NodeLicense) {
     $NodeLicense = Join-Path $nodeExtract.FullName "LICENSE"
   }
   if (-not $FfmpegLicense) {
-    $FfmpegLicense = Join-Path $ffmpegExtract.FullName "LICENSE.txt"
+    $FfmpegLicense = Join-Path $AssetCache "FFMPEG-GPLv3.txt"
   }
   Copy-Item -LiteralPath (Join-Path $nodeExtract.FullName "bin\node") -Destination (Join-Path $runtime "node") -Force
-  Copy-Item -LiteralPath (Join-Path $ffmpegExtract.FullName "bin\ffmpeg") -Destination (Join-Path $runtimeBin "ffmpeg") -Force
-  Copy-Item -LiteralPath (Join-Path $ffmpegExtract.FullName "bin\ffprobe") -Destination (Join-Path $runtimeBin "ffprobe") -Force
+  Expand-GzipFile (Join-Path $AssetCache "ffmpeg-linux-x64.gz") (Join-Path $runtimeBin "ffmpeg")
+  Expand-GzipFile (Join-Path $AssetCache "ffprobe-linux-x64.gz") (Join-Path $runtimeBin "ffprobe")
   Copy-Item -LiteralPath (Join-Path $AssetCache "NotoSansCJKsc-VF.ttf") -Destination (Join-Path $runtime "fonts\NotoSansCJKsc-VF.ttf") -Force
   Copy-Item -LiteralPath (Join-Path $root "packaging\linux\service.sh") -Destination (Join-Path $control "service.sh") -Force
   Copy-Item -LiteralPath (Join-Path $root "packaging\linux\uninstall.sh") -Destination (Join-Path $control "uninstall.sh") -Force
@@ -292,15 +286,7 @@ if (-not $LinuxOnly) {
   if ($licenseNodeExe) {
     $nodeLicense = Join-Path (Split-Path -Parent $licenseNodeExe) "LICENSE"
   }
-  $ffmpegExe = $env:TIANPING_WIN_FFMPEG
-  if (-not $ffmpegExe) {
-    $candidate = "D:\ffmpeg\ffmpeg-7.1-full_build\bin\ffmpeg.exe"
-    if (Test-Path -LiteralPath $candidate) { $ffmpegExe = $candidate }
-  }
-  if ($ffmpegExe) {
-    $ffmpegRoot = Split-Path -Parent (Split-Path -Parent $ffmpegExe)
-    $ffmpegLicense = Join-Path $ffmpegRoot "LICENSE"
-  }
+  $ffmpegLicense = Join-Path $AssetCache "FFMPEG-GPLv3.txt"
   Build-Windows $nodeLicense $ffmpegLicense $brandingRoot
 }
 
@@ -310,7 +296,7 @@ if (-not $WindowsOnly) {
 
 $readmeSource = Join-Path $root "docs\QUICK_START.md"
 Copy-Item -LiteralPath $readmeSource -Destination (Join-Path $releaseRoot "使用说明.md") -Force
-$htmlText = (Get-Content -LiteralPath (Join-Path $root "packaging\assets\使用说明.html") -Raw).Replace("V1.0.5", "V$Version")
+$htmlText = (Get-Content -LiteralPath (Join-Path $root "packaging\assets\使用说明.html") -Raw).Replace("V__TIANPING_VERSION__", "V$Version")
 [System.IO.File]::WriteAllText(
   (Join-Path $releaseRoot "使用说明.html"),
   $htmlText,

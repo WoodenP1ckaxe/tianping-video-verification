@@ -53,18 +53,13 @@ jobs:
         run: |
           npm ci
           choco install innosetup -y --no-progress
-          choco install ffmpeg -y --no-progress
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) {
             $iscc = (Get-ChildItem "C:\Program Files" -Recurse -Filter ISCC.exe | Select-Object -First 1).FullName
           }
-          $ffmpeg = Get-ChildItem "C:\ProgramData\chocolatey\lib\ffmpeg" -Recurse -File -Filter ffmpeg.exe `
-            | Where-Object Length -gt 20MB | Select-Object -First 1
           if (-not $iscc -or -not (Test-Path $iscc)) { throw "Inno Setup compiler not found" }
-          if (-not $ffmpeg) { throw "Real FFmpeg binary not found after package installation" }
           "TIANPING_ISCC=$iscc" >> $env:GITHUB_ENV
           "TIANPING_NODE_EXE=$((Get-Command node).Source)" >> $env:GITHUB_ENV
-          "TIANPING_WIN_FFMPEG=$($ffmpeg.FullName)" >> $env:GITHUB_ENV
       - name: Fetch pinned offline runtime assets
         run: node scripts/fetch-release-assets.mjs
       - name: Build Windows and Linux packages

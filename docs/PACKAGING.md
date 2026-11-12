@@ -31,9 +31,9 @@ Poppler 或中文字体。
 
 ## 2. Windows 构建
 
-构建机需要 Node.js 24、FFmpeg/FFprobe、PowerShell 和 Inno Setup 6。构建阶段
-允许联网下载固定版本的 Linux Node、Linux FFmpeg、字体和 Inno Setup；生成后的
-安装包完全可离线使用。
+构建机需要 Node.js 24.12.0、PowerShell 7+ 和 Inno Setup 6。构建阶段允许联网
+下载固定版本的 Node、FFmpeg/FFprobe、字体和 Inno Setup；生成后的安装包完全可
+离线使用。
 
 ```powershell
 cd tianping-system
@@ -45,7 +45,6 @@ node scripts/fetch-release-assets.mjs
 可选环境变量：
 
 - `TIANPING_NODE_EXE`：Windows `node.exe` 路径；
-- `TIANPING_WIN_FFMPEG`：Windows `ffmpeg.exe` 路径；
 - `TIANPING_ISCC`：Inno Setup `ISCC.exe` 路径；
 - `TIANPING_ASSET_CACHE`：外部运行时缓存目录。
 
@@ -59,7 +58,8 @@ Windows 安装器默认数据位置：
 
 ## 3. Linux 构建与安装
 
-Linux 包使用官方 Node.js 24 x86_64 运行时、BtbN FFmpeg GPL 静态构建和中文字体。
+两个平台均使用官方 Node.js 24.12.0 运行时和 ffmpeg-static b6.1.1（FFmpeg 6.1.1）
+固定静态构建。下载脚本校验每个资产的 SHA-256，不使用会变化的 `latest` 地址。
 目标系统需要 x86_64、glibc 2.28+、libstdc++ 6.0.26+。
 
 普通用户安装，无需 root：

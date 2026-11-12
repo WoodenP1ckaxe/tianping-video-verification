@@ -6,7 +6,7 @@
 | 组件 | 版本/来源 | 许可 |
 | --- | --- | --- |
 | Node.js | 24.12.0（Windows/Linux 官方发行版） | MIT |
-| FFmpeg / FFprobe | 7.1 full build（Windows）；BtbN linux64 GPL build（Linux） | GPL v3 |
+| FFmpeg / FFprobe | 6.1.1 固定静态构建（ffmpeg-static b6.1.1） | GPL v3 |
 | Noto Sans CJK SC Variable | notofonts/noto-cjk | SIL Open Font License 1.1 |
 | tesseract.js | 7.0.0 | Apache-2.0 |
 | tesseract.js-core | 7.0.0 | Apache-2.0 |
@@ -30,7 +30,7 @@
 
 FFmpeg 以独立程序方式随安装包分发，软件通过命令行调用。FFmpeg 的对应源码、
 构建说明和 GPL 文本可从 <https://ffmpeg.org/download.html> 与
-<https://github.com/BtbN/FFmpeg-Builds> 获取。离线交付方应保留本说明、各组件
+<https://github.com/eugeneware/ffmpeg-static> 获取。离线交付方应保留本说明、各组件
 许可证，并按采购合同完成第三方许可确认。
 
 本系统自身使用 MIT License，完整文本见 `LICENSE`。

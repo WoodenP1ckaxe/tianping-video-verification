@@ -4,7 +4,7 @@ FFmpeg / FFprobe 源码提供说明
 对应版本的完整源码、构建脚本和许可证可从以下公开位置获取：
 
   https://ffmpeg.org/download.html
-  https://github.com/BtbN/FFmpeg-Builds
+  https://github.com/eugeneware/ffmpeg-static/releases/tag/b6.1.1
 
 如需与交付介质配套的源码副本，请向交付方提出书面请求，并注明安装包版本及
 Windows 或 Linux 平台。交付方应在适用许可证要求的期限内提供对应源码。
