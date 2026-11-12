@@ -390,7 +390,7 @@ test('修改口令撤销其他会话但保留当前会话', {
   assert.equal((await first.request('/api/session')).status, 401);
 });
 
-test('健康检查发现媒体和预览工具缺失', {
+test('健康检查发现媒体工具缺失且内置 PDF 预览可用', {
   timeout: 30_000
 }, async (t) => {
   const { baseUrl } = await setupServer(t, {
@@ -403,7 +403,7 @@ test('健康检查发现媒体和预览工具缺失', {
   const body = await response.json();
   assert.equal(body.status, 'error');
   assert.equal(body.analyzer.available, false);
-  assert.equal(body.pdf.previewAvailable, false);
+  assert.equal(body.pdf.previewAvailable, true);
 });
 
 test('关闭服务时在途分析任务得到确定失败状态', {

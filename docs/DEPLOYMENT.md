@@ -26,12 +26,12 @@
 | 内存 | 4 GB；建议 8 GB 以上 |
 | 数据盘 | 320 GB；视频配额默认 200 GB |
 | 显卡 | 不需要 |
-| 系统 | Windows 10/11 + WSL2 + Docker Desktop，或 Linux x86_64 |
+| 系统 | Windows 10 1809+/11 x64，或 Linux x86_64 |
 | 容器 | Docker Engine 20.10+、Compose v2 |
 | 时间 | 可访问内网 NTP；时区 `Asia/Shanghai` |
 
-非容器开发需要 Node.js 24+ 与 FFmpeg 7+。使用 Docker 时无需在宿主机安装
-Node.js 或 FFmpeg。
+正式安装包已内置 Node.js 24、FFmpeg/FFprobe、中文字体和 PDFium。使用原生
+安装包或 Docker 时均无需在宿主机安装 Node.js、FFmpeg 或 Poppler。
 
 ## 3. 首次部署
 
@@ -68,7 +68,8 @@ curl http://127.0.0.1:8080/healthz
 ```
 
 响应中的 `status` 应为 `ok`。健康检查同时验证数据库、FFmpeg/FFprobe、PDF 字体、
-Poppler 预览和串行队列；任一组件缺失时返回 503。镜像内健康检查每 30 秒执行一次。
+内置 PDFium 预览和串行队列；任一组件缺失时返回 503。Docker 镜像内健康检查每
+30 秒执行一次。
 
 ### 3.2 离线部署
 
@@ -99,7 +100,7 @@ sudo chown -R 1000:1000 data backups
 | `FFPROBE_PATH` | 自动查找 | FFprobe 绝对路径 |
 | `FFMPEG_PATH` | 自动查找 | FFmpeg 绝对路径 |
 | `PDF_FONT_PATH` | 自动查找 | 中文 PDF 字体；镜像默认 Noto Sans CJK |
-| `PDFTOPPM_PATH` | `pdftoppm` / 镜像 `/usr/bin/pdftoppm` | 将最终 PDF 逐页渲染为打印预览图片 |
+| `PDFTOPPM_PATH` | 空 | 历史兼容项；当前 PDF 预览使用内置 PDFium，不再调用 Poppler |
 | `SECURE_COOKIE` | `false` | HTTPS 部署时设为 `true` |
 | `INITIAL_PASSWORD` | 无 | 新库初始化口令；Compose 启动时强制要求，不提供固定默认值 |
 | `TRUST_PROXY` | 空 | 可信反向代理 IP 或 IPv4 CIDR，多个用逗号分隔；为空时忽略 `X-Forwarded-For` |
@@ -172,7 +173,7 @@ SECURE_COOKIE=true
 | --- | --- |
 | 页面打不开 | `docker compose ps`；端口是否被占用；宿主机防火墙 |
 | PDF 导出提示字体不可用 | 容器是否安装 `fonts-noto-cjk`；`PDF_FONT_PATH` 是否有效 |
-| PDF 预览提示渲染工具缺失 | 裸机是否安装 Poppler `pdftoppm`；或设置 `PDFTOPPM_PATH` |
+| PDF 预览提示组件缺失 | 重新安装完整安装包；确认 `@hyzyla/pdfium` 与 WASM 文件未被安全软件隔离 |
 | 任务提示媒体工具缺失 | 容器是否安装 `ffmpeg`；`FFPROBE_PATH` 是否有效 |
 | 任务一直排队 | 系统状态页；分析服务是否只有一个消费者；查看运行日志 |
 | 待人工处理 | 显示屏 ROI 不正确、OCR 未得到有效示值、二维码无法匹配或音频模型不可用；不是“判定不通过” |

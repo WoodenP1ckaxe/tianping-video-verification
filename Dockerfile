@@ -14,7 +14,6 @@ RUN apt-get update \
        ca-certificates \
        ffmpeg \
        fonts-noto-cjk \
-       poppler-utils \
        tzdata \
     && ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo "Asia/Shanghai" > /etc/timezone \

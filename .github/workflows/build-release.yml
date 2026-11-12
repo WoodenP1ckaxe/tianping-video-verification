@@ -1,0 +1,120 @@
+name: Build offline installers
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install Linux verification tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+
+  package:
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          "value=$version" >> $env:GITHUB_OUTPUT
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne "v$version") {
+            throw "Tag ${{ github.ref_name }} does not match package version v$version"
+          }
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          npm ci
+          choco install innosetup --version=6.7.4 -y --no-progress
+          choco install ffmpeg -y --no-progress
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = (Get-ChildItem "C:\Program Files" -Recurse -Filter ISCC.exe | Select-Object -First 1).FullName
+          }
+          "TIANPING_ISCC=$iscc" >> $env:GITHUB_ENV
+          "TIANPING_NODE_EXE=$((Get-Command node).Source)" >> $env:GITHUB_ENV
+          "TIANPING_WIN_FFMPEG=$((Get-Command ffmpeg).Source)" >> $env:GITHUB_ENV
+      - name: Fetch pinned offline runtime assets
+        run: node scripts/fetch-release-assets.mjs
+      - name: Build Windows and Linux packages
+        shell: pwsh
+        run: .\scripts\build-release.ps1
+      - name: Smoke-test installed Windows package
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "release\v*" -Filter "*Windows-x64-Setup.exe" | Select-Object -First 1
+          .\scripts\smoke-test-windows.ps1 -Installer $installer.FullName -ExpectedVersion "${{ steps.version.outputs.value }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: offline-installers
+          path: release/
+          if-no-files-found: error
+          compression-level: 0
+
+  linux-smoke:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: offline-installers
+          path: release
+      - name: Smoke-test Linux package
+        shell: bash
+        run: |
+          archive=$(find release -type f -name "*Linux-x64.tar.gz" | head -n 1)
+          test -n "$archive"
+          sh scripts/smoke-test-linux.sh "$archive"
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: linux-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: offline-installers
+          path: release
+      - name: Locate release notes
+        id: notes
+        shell: bash
+        run: |
+          notes=$(find release -type f -name "RELEASE_NOTES.md" | head -n 1)
+          test -n "$notes"
+          echo "path=$notes" >> "$GITHUB_OUTPUT"
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: 天平校验视频分析系统 ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.path }}
+          make_latest: true
+          files: |
+            release/v*/*.exe
+            release/v*/*.tar.gz
+            release/v*/*.md
+            release/v*/*.html
+            release/v*/*.txt

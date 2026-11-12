@@ -9,7 +9,8 @@ Node.js 24 和 SQLite，前端为无 CDN 的离线静态应用。
 
 ## 本地运行
 
-需要 Node.js 24、FFmpeg/FFprobe 与 Poppler `pdftoppm`（用于打印预览）。
+需要 Node.js 24 与 FFmpeg/FFprobe。PDF 打印预览使用随应用安装的 PDFium
+WebAssembly，不需要操作系统预装 Poppler。
 
 ```powershell
 npm ci
@@ -36,6 +37,13 @@ docker compose up -d --build
 ```
 
 也可以使用 `scripts/start.ps1 -Build` 或 `scripts/start.sh --build`。
+
+## 离线安装包
+
+正式客户交付优先使用 `release/` 下的原生安装包：Windows 包提供简体中文图形化
+安装向导和本机控制面板；Linux 包支持普通用户目录安装及 `--system` 系统服务
+安装。两者均内置 Node.js、FFmpeg、FFprobe、中文字体和 PDFium，不要求客户预装
+Docker、Node.js 或媒体工具。构建方法见 [docs/PACKAGING.md](docs/PACKAGING.md)。
 
 ## 源码校验与备份
 

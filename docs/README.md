@@ -5,7 +5,9 @@
 | 文档 | 用途 |
 | --- | --- |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Windows/Linux、Docker、离线安装与升级 |
-| [OFFLINE_DELIVERY.md](OFFLINE_DELIVERY.md) | 离线镜像制作、校验和导入 |
+| [PACKAGING.md](PACKAGING.md) | Windows/Linux 原生离线安装包构建、校验和验收 |
+| [QUICK_START.md](QUICK_START.md) | 最终用户安装后快速使用说明 |
+| [OFFLINE_DELIVERY.md](OFFLINE_DELIVERY.md) | Docker 备选交付方式的镜像制作与导入 |
 | [USER_GUIDE.md](USER_GUIDE.md) | 管理员、检验人员、复核确认人员操作说明；系统内亦可直接下载/打印标准操作流程 PDF |
 | [DATABASE_DICTIONARY.md](DATABASE_DICTIONARY.md) | 数据库表、关键字段与状态约束 |
 | [BACKUP_RESTORE.md](BACKUP_RESTORE.md) | 每日备份、手动备份、恢复演练 |

@@ -53,6 +53,21 @@ const requiredFiles = [
   'samples/manifests',
   'scripts/check.js',
   'scripts/repo-manager.mjs',
+  'scripts/build-release.ps1',
+  'scripts/build-windows-control.ps1',
+  'scripts/build-app-icon.ps1',
+  'scripts/fetch-release-assets.mjs',
+  'scripts/smoke-test-windows.ps1',
+  'scripts/smoke-test-linux.sh',
+  'packaging/windows/TianpingControl.cs',
+  'packaging/windows/installer.iss',
+  'packaging/linux/install.sh',
+  'packaging/linux/service.sh',
+  'packaging/linux/uninstall.sh',
+  'packaging/linux/README.txt',
+  'packaging/assets/使用说明.html',
+  'packaging/common/THIRD_PARTY_NOTICES.md',
+  'packaging/common/SOURCE_OFFER.txt',
   'server.js',
   'src/api.js',
   'src/auth.js',
@@ -66,6 +81,8 @@ const requiredFiles = [
   'docs/TEST_REPORT.md',
   'docs/ACCEPTANCE_TRACE.md',
   'docs/PRODUCT_DECISIONS.md',
+  'docs/PACKAGING.md',
+  'docs/QUICK_START.md',
   'tests',
 ];
 
@@ -268,12 +285,16 @@ function isAllowed(path) {
   const normalized = normalize(path);
   if (allowedExact.has(normalized)) return true;
   if (normalized === '.github/workflows/verify.yml') return true;
+  if (normalized === '.github/workflows/build-release.yml') return true;
   if (/^public\/(?:index\.html|favicon\.svg|assets\/[A-Za-z0-9._-]+\.(?:css|js|svg))$/.test(normalized)) {
     return true;
   }
   if (/^src\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.js$/.test(normalized)) return true;
   if (/^samples\/manifests\/[A-F0-9]{64}\.json$/.test(normalized)) return true;
   if (/^scripts\/[A-Za-z0-9._-]+\.(?:js|mjs|ps1|sh)$/.test(normalized)) return true;
+  if (/^packaging\/windows\/[A-Za-z0-9._-]+\.(?:cs|iss)$/.test(normalized)) return true;
+  if (/^packaging\/linux\/[A-Za-z0-9._-]+\.(?:sh|txt)$/.test(normalized)) return true;
+  if (/^packaging\/(?:assets|common)\/[^/]+\.(?:html|md|txt)$/.test(normalized)) return true;
   if (/^docs\/[A-Za-z0-9._-]+\.md$/.test(normalized)) return true;
   if (/^tests\/[A-Za-z0-9._-]+\.js$/.test(normalized)) return true;
   return false;
@@ -330,7 +351,7 @@ function checkPolicy({ quiet = false } = {}) {
       errors.push(`${path} 超过单文件 ${Math.floor(maxFileBytes / 1024 / 1024)} MiB 限制`);
       continue;
     }
-    const textExtension = /\.(?:js|mjs|json|md|css|html|svg|ya?ml|sh|ps1|example|gitignore|gitattributes|dockerignore)$/i;
+    const textExtension = /\.(?:js|mjs|json|md|css|html|svg|ya?ml|sh|ps1|cs|iss|txt|example|gitignore|gitattributes|dockerignore)$/i;
     if (!textExtension.test(path) && !['Dockerfile', 'LICENSE'].includes(path)) {
       errors.push(`${path} 的文件类型未获发布策略批准`);
       continue;

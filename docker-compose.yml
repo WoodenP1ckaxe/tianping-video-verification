@@ -1,6 +1,6 @@
 services:
   tianping:
-    image: tianping-system:1.0.4
+    image: tianping-system:1.0.5
     build:
       context: .
       dockerfile: Dockerfile
@@ -15,7 +15,6 @@ services:
       HOST: 0.0.0.0
       PORT: 8080
       PDF_FONT_PATH: /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
-      PDFTOPPM_PATH: "${PDFTOPPM_PATH:-/usr/bin/pdftoppm}"
       DISPLAY_REGION: "${DISPLAY_REGION:-}"
       SECURE_COOKIE: "${SECURE_COOKIE:-false}"
       INITIAL_PASSWORD: "${INITIAL_PASSWORD:?首次启动前必须设置 INITIAL_PASSWORD}"

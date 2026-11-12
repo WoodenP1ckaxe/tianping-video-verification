@@ -1557,7 +1557,7 @@ export class ApiRouter {
       if (req.method === 'GET' && pathname === '/api/previews/sop.png') {
         const exporter = await import('./services/exporter.js');
         const { renderPdfPagePng } = await import('./services/pdf-preview.js');
-        const png = renderPdfPagePng(
+        const png = await renderPdfPagePng(
           exporter.generateSopPdf({ exportedAt: new Date() }),
           url.searchParams.get('page'),
           this.config
@@ -1569,7 +1569,7 @@ export class ApiRouter {
       if (req.method === 'GET' && pathname === '/api/previews/blank.png') {
         const exporter = await import('./services/exporter.js');
         const { renderPdfPagePng } = await import('./services/pdf-preview.js');
-        const png = renderPdfPagePng(
+        const png = await renderPdfPagePng(
           exporter.generateBlankFormPdf({ exportedAt: new Date() }),
           url.searchParams.get('page'),
           this.config
@@ -1589,7 +1589,7 @@ export class ApiRouter {
           { preview: true, capture: true }
         );
         const { renderPdfPagePng } = await import('./services/pdf-preview.js');
-        const png = renderPdfPagePng(
+        const png = await renderPdfPagePng(
           generated.buffer,
           url.searchParams.get('page'),
           this.config
@@ -1613,7 +1613,7 @@ export class ApiRouter {
           { preview: true, capture: true }
         );
         const { renderPdfPagePng } = await import('./services/pdf-preview.js');
-        const png = renderPdfPagePng(
+        const png = await renderPdfPagePng(
           generated.buffer,
           url.searchParams.get('page'),
           this.config
@@ -1864,7 +1864,9 @@ export class ApiRouter {
         {
           name: 'PDF 预览',
           status: pdfPreview.available ? '运行中' : '异常',
-          detail: pdfPreview.available ? 'Poppler 可用' : 'Poppler 不可用，仍可下载 PDF'
+          detail: pdfPreview.available
+            ? '内置 PDFium 可用'
+            : 'PDF 预览组件不可用，仍可下载 PDF'
         }
       ],
       queue,

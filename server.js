@@ -71,7 +71,9 @@ export function loadConfig(overrides = {}) {
     trustProxy: overrides.trustProxy ?? process.env.TRUST_PROXY ?? '',
     ffprobePath: overrides.ffprobePath || process.env.FFPROBE_PATH || 'ffprobe',
     ffmpegPath: overrides.ffmpegPath || process.env.FFMPEG_PATH || 'ffmpeg',
-    pdftoppmPath: overrides.pdftoppmPath || process.env.PDFTOPPM_PATH || 'pdftoppm',
+    // Retained for deployment compatibility. Preview rendering is built in
+    // and no longer invokes Poppler or another host-level executable.
+    pdftoppmPath: overrides.pdftoppmPath || process.env.PDFTOPPM_PATH || '',
     displayRegion: overrides.displayRegion
       || envDisplayRegion(process.env.DISPLAY_REGION),
     workerIntervalMs: Number(

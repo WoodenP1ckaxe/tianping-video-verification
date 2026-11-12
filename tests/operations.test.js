@@ -26,7 +26,6 @@ test('Docker 运行配置包含媒体、字体、健康检查和非 root 用户'
   assert.match(dockerfile, /FROM node:24/);
   assert.match(dockerfile, /ffmpeg/);
   assert.match(dockerfile, /fonts-noto-cjk/);
-  assert.match(dockerfile, /poppler-utils/);
   assert.match(dockerfile, /HEALTHCHECK/);
   assert.match(dockerfile, /USER node/);
   assert.match(compose, /read_only: true/);

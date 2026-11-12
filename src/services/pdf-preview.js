@@ -1,96 +1,87 @@
-import {
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { PDFiumLibrary } from '@hyzyla/pdfium';
+import { PNG } from 'pngjs';
 import { HttpError } from '../auth.js';
 
-const previewStatusCache = new Map();
+const PDFIUM_SCALE = 120 / 72;
+let pdfiumLibraryPromise = null;
+let renderTail = Promise.resolve();
 
-function findPdfToPpm(config = {}) {
-  const configured = config.pdftoppmPath || process.env.PDFTOPPM_PATH;
-  const candidates = configured
-    ? [configured]
-    : ['pdftoppm', '/usr/bin/pdftoppm'];
-  for (const candidate of candidates) {
-    const checked = spawnSync(candidate, ['-v'], {
-      encoding: 'utf8',
-      timeout: 5000,
-      windowsHide: true,
-    });
-    if (checked.status === 0 || /pdftoppm version/i.test(`${checked.stdout}${checked.stderr}`)) {
-      return candidate;
-    }
-  }
-  return null;
-}
-
-export function getPdfPreviewStatus(config = {}) {
-  const configured = config.pdftoppmPath || process.env.PDFTOPPM_PATH || '';
-  const cached = previewStatusCache.get(configured);
-  if (cached && Date.now() - cached.checkedAt < 60_000) {
-    return cached.value;
-  }
-  const executable = findPdfToPpm(config);
-  const value = {
-    available: Boolean(executable),
-    executable
-  };
-  previewStatusCache.set(configured, {
-    checkedAt: Date.now(),
-    value
+function withPdfium(action) {
+  const previous = renderTail;
+  let release;
+  renderTail = new Promise((resolve) => {
+    release = resolve;
   });
-  return value;
+
+  return previous
+    .then(async () => {
+      if (!pdfiumLibraryPromise) {
+        pdfiumLibraryPromise = PDFiumLibrary.init().catch((error) => {
+          pdfiumLibraryPromise = null;
+          throw error;
+        });
+      }
+      const library = await pdfiumLibraryPromise;
+      return action(library);
+    })
+    .finally(release);
 }
 
 /**
- * Preview uses a raster of the exact generated PDF, not a second HTML layout.
- * Poppler is an optional runtime tool; the download/print PDF remains available
- * even when image preview support is unavailable.
+ * PDFium is compiled to WebAssembly and shipped with the application. Keeping
+ * preview rendering in-process removes the former host-level Poppler
+ * dependency and gives Windows and Linux the same output path.
  */
-export function renderPdfPagePng(pdfBuffer, page = 1, config = {}) {
-  const status = getPdfPreviewStatus(config);
-  const executable = status.executable;
-  if (!executable) {
+export function getPdfPreviewStatus() {
+  return {
+    available: true,
+    engine: 'pdfium-wasm-3.0.0'
+  };
+}
+
+export function renderPdfPagePng(pdfBuffer, page = 1, _config = {}) {
+  const status = getPdfPreviewStatus();
+  if (!status.available) {
     throw new HttpError(
       501,
       'PDF_PREVIEW_RENDERER_UNAVAILABLE',
-      '当前服务器未安装 PDF 预览渲染工具，请使用“打开 PDF 打印”或下载 PDF'
+      '当前安装未包含 PDF 预览组件，请使用“打开 PDF 打印”或下载 PDF'
     );
   }
-  const pageNumber = Math.max(1, Math.min(50, Number(page) || 1));
-  const workDir = mkdtempSync(join(tmpdir(), 'tianping-pdf-preview-'));
-  const input = join(workDir, 'document.pdf');
-  const prefix = join(workDir, 'page');
-  const output = `${prefix}.png`;
-  try {
-    writeFileSync(input, pdfBuffer);
-    const result = spawnSync(executable, [
-      '-f', String(pageNumber),
-      '-l', String(pageNumber),
-      '-singlefile',
-      '-png',
-      '-r', '120',
-      input,
-      prefix,
-    ], {
-      encoding: 'utf8',
-      timeout: 30_000,
-      windowsHide: true,
-    });
-    if (result.status !== 0) {
+
+  return withPdfium(async (library) => {
+    let document;
+    let pdfPage;
+    try {
+      document = await library.loadDocument(new Uint8Array(pdfBuffer));
+      const pageCount = document.getPageCount();
+      if (!pageCount) throw new Error('PDF 没有可预览页面');
+      const pageNumber = Math.max(1, Math.min(pageCount, Number(page) || 1));
+      pdfPage = document.getPage(pageNumber - 1);
+      const rendered = await pdfPage.render({
+        scale: PDFIUM_SCALE,
+        render: 'bitmap',
+        colorSpace: 'RGBA',
+        renderFormFields: true
+      });
+      return PNG.sync.write({
+        width: rendered.width,
+        height: rendered.height,
+        data: Buffer.from(rendered.data),
+        colorType: 6,
+        inputColorType: 6,
+        inputHasAlpha: true
+      });
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
       throw new HttpError(
         500,
         'PDF_PREVIEW_RENDER_FAILED',
-        `PDF 预览渲染失败：${String(result.stderr || '未知错误').slice(0, 300)}`
+        `PDF 预览渲染失败：${String(error?.message || error).slice(0, 300)}`
       );
+    } finally {
+      pdfPage?.close();
+      document?.destroy();
     }
-    return readFileSync(output);
-  } finally {
-    rmSync(workDir, { recursive: true, force: true });
-  }
+  });
 }

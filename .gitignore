@@ -4,6 +4,7 @@ data-*/
 .browser-data/
 backups/
 dist/
+/release/
 coverage/
 .env
 .env.*
@@ -30,6 +31,9 @@ coverage/
 *.7z
 *.tar
 *.tar.gz
+*.exe
+*.ico
+*.bmp
 
 # Editor and operating-system files
 $null

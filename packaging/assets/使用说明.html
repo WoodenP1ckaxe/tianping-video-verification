@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>天平校验视频分析系统 - 使用说明</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --navy: #193a60;
+      --blue: #1960a9;
+      --teal: #12917a;
+      --ink: #23364b;
+      --muted: #63758a;
+      --paper: #ffffff;
+      --bg: #f3f7fb;
+      --line: #dbe5ef;
+      --warn: #a65c13;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--bg);
+      font: 16px/1.7 "Microsoft YaHei UI", "Noto Sans CJK SC", "PingFang SC", sans-serif;
+    }
+    .hero {
+      color: #fff;
+      background: linear-gradient(125deg, var(--navy), #126f83 62%, var(--teal));
+      padding: 42px max(24px, calc((100vw - 1040px) / 2));
+    }
+    .hero h1 { margin: 0 0 8px; font-size: clamp(28px, 4vw, 42px); line-height: 1.25; }
+    .hero p { margin: 0; color: #d9e8f4; font-size: 17px; }
+    .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+    .badge { border: 1px solid #ffffff55; border-radius: 999px; padding: 5px 13px; background: #ffffff12; }
+    main { width: min(1040px, calc(100% - 36px)); margin: 28px auto 56px; }
+    .notice {
+      border-left: 5px solid var(--teal);
+      background: #e9f7f3;
+      padding: 16px 20px;
+      border-radius: 10px;
+      margin-bottom: 24px;
+    }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+    section {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 24px 26px;
+      box-shadow: 0 6px 24px #193a6010;
+    }
+    section.wide { grid-column: 1 / -1; }
+    h2 { margin: 0 0 14px; font-size: 21px; color: var(--navy); }
+    h3 { margin: 22px 0 8px; font-size: 17px; color: var(--navy); }
+    p { margin: 8px 0; }
+    ol, ul { margin: 8px 0; padding-left: 24px; }
+    li { margin: 7px 0; }
+    code {
+      padding: 2px 6px;
+      border-radius: 5px;
+      background: #edf2f7;
+      color: #174d7c;
+      overflow-wrap: anywhere;
+    }
+    pre {
+      overflow: auto;
+      padding: 16px;
+      border-radius: 10px;
+      background: #14253a;
+      color: #e7f1fa;
+      line-height: 1.55;
+    }
+    pre code { padding: 0; background: none; color: inherit; }
+    .steps { counter-reset: step; list-style: none; padding: 0; }
+    .steps li { position: relative; min-height: 44px; padding: 3px 0 18px 54px; }
+    .steps li::before {
+      counter-increment: step;
+      content: counter(step);
+      position: absolute;
+      left: 0;
+      top: 0;
+      display: grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      color: #fff;
+      background: var(--blue);
+      font-weight: 700;
+    }
+    .accounts { width: 100%; border-collapse: collapse; margin: 10px 0 4px; }
+    .accounts th, .accounts td { text-align: left; border-bottom: 1px solid var(--line); padding: 9px 8px; }
+    .accounts th { color: var(--muted); font-weight: 600; }
+    .warn { color: var(--warn); font-weight: 600; }
+    footer { text-align: center; color: var(--muted); padding: 20px; font-size: 14px; }
+    @media (max-width: 760px) {
+      .grid { grid-template-columns: 1fr; }
+      section.wide { grid-column: auto; }
+      section { padding: 20px; }
+      .hero { padding: 32px 20px; }
+    }
+    @media print {
+      body { background: #fff; font-size: 12pt; }
+      .hero { background: var(--navy); print-color-adjust: exact; padding: 24px; }
+      main { width: 100%; margin: 18px 0; }
+      .grid { display: block; }
+      section { box-shadow: none; break-inside: avoid; margin-bottom: 12px; }
+      footer { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <h1>天平校验视频分析系统</h1>
+    <p>快速使用说明 · V1.0.5</p>
+    <div class="badges">
+      <span class="badge">完全离线运行</span>
+      <span class="badge">浏览器访问</span>
+      <span class="badge">数据保存在本机</span>
+    </div>
+  </header>
+
+  <main>
+    <div class="notice">
+      安装和日常使用都不需要联网。Windows 用户不需要安装 Node.js、Docker、FFmpeg 或字体；
+      Linux 安装包也已包含这些运行时。
+    </div>
+
+    <div class="grid">
+      <section>
+        <h2>第一次使用</h2>
+        <ol class="steps">
+          <li>双击安装包，按向导点击“下一步”。</li>
+          <li>安装完成后，系统会自动打开控制面板和浏览器。</li>
+          <li>在控制面板中查看一次性初始口令。</li>
+          <li>使用管理员账号 <code>U000</code> 登录，并立即修改口令。</li>
+        </ol>
+        <p>关闭控制面板或浏览器不会停止服务。再次使用时，双击桌面上的系统图标即可。</p>
+      </section>
+
+      <section>
+        <h2>初始账号</h2>
+        <table class="accounts">
+          <thead><tr><th>账号</th><th>角色</th></tr></thead>
+          <tbody>
+            <tr><td>U000</td><td>系统管理员</td></tr>
+            <tr><td>U001 / U002</td><td>检验人员</td></tr>
+            <tr><td>U003</td><td>复核确认人员</td></tr>
+          </tbody>
+        </table>
+        <p class="warn">所有初始账号共用一次性口令。每个账号首次登录后都必须修改为私人密码。</p>
+      </section>
+
+      <section class="wide">
+        <h2>一次完整的校验流程</h2>
+        <ol class="steps">
+          <li><strong>准备二维码：</strong>检验人员下载本人二维码；管理员或复核人员打印天平设备二维码。二维码应平整、清晰、无遮挡。</li>
+          <li><strong>拍摄视频：</strong>开头依次展示人员卡和设备卡，各停留至少 2 秒；画面同时拍到显示屏和称重仓；每次稳定读数停留至少 3 秒。</li>
+          <li><strong>上传视频：</strong>在“上传视频”页面选择 MP4 或 MOV，核对拍摄日期后开始上传。网络中断后可重新进入页面继续上传。</li>
+          <li><strong>核对记录：</strong>分析完成后打开任务，核对人员、设备、九个读数、时间以及识别截图；修改识别值必须填写理由。</li>
+          <li><strong>提交与复核：</strong>检验人员提交后，由复核确认人员检查并确认或退回。确认后的记录锁定，不能直接修改。</li>
+          <li><strong>导出与备份：</strong>在查询或打印页面导出 PDF/CSV；管理员定期在“系统运行状态”页面执行备份。</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Windows 日常操作</h2>
+        <ul>
+          <li>双击“天平校验视频分析系统”打开控制面板。</li>
+          <li>点击“打开系统”进入浏览器页面。</li>
+          <li>点击“使用说明”打开本文件。</li>
+          <li>点击“运行诊断”检查内置组件、端口和数据目录。</li>
+          <li>默认仅本机访问，地址为 <code>http://127.0.0.1:8080/</code>。端口冲突时系统会自动选择其他本机端口。</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>Linux 日常操作</h2>
+        <pre><code># 打开系统（含启动服务）
+~/.local/share/tianping-video-verification/installation/control/service.sh open
+
+# 查看、重启或停止
+.../control/service.sh status
+.../control/service.sh restart
+.../control/service.sh stop</code></pre>
+        <p>无 root 用户安装会创建应用菜单项；系统级安装使用 <code>/opt/tianping-video-verification</code>。</p>
+      </section>
+
+      <section>
+        <h2>数据与备份</h2>
+        <p>数据库、视频、识别截图、PDF 和备份都在数据目录中。Windows 卸载程序默认不删除数据；Linux 卸载程序也默认保留数据。</p>
+        <p>升级前应先备份。不要直接移动单个数据库文件；迁移时迁移整个数据目录，并保持目录权限不变。</p>
+      </section>
+
+      <section>
+        <h2>常见问题</h2>
+        <h3>页面打不开</h3>
+        <p>打开控制面板点击“运行诊断”。若显示组件缺失，请重新校验安装包哈希并重新安装。</p>
+        <h3>系统提示组件异常</h3>
+        <p>查看诊断中的 FFmpeg、FFprobe、字体和服务状态。不要从网络临时下载运行库。</p>
+        <h3>上传速度慢或中断</h3>
+        <p>确认数据盘剩余空间充足；重新进入上传页面后系统会从已确认位置继续。</p>
+        <h3>安装包被安全软件拦截</h3>
+        <p>先使用随包 <code>SHA256SUMS.txt</code> 核对文件。生产交付建议由单位对安装包和应用进行代码签名。</p>
+      </section>
+
+      <section class="wide">
+        <h2>安装要求</h2>
+        <p><strong>Windows：</strong>Windows 10 1809 或更高版本、Windows 11，x64 架构，至少 4 核 CPU、4 GB 内存；建议 8 GB 内存和 320 GB 可用数据盘。</p>
+        <p><strong>Linux：</strong>x86_64、glibc 2.28+、libstdc++ 6.0.26+。支持普通用户目录安装；若系统有 systemd，会自动注册服务。没有 systemd 时会使用内置的离线启动/停止脚本。</p>
+        <p>视频分析在单机串行队列中执行，不需要独立显卡。系统时间应同步，时区固定为 Asia/Shanghai。</p>
+      </section>
+    </div>
+  </main>
+
+  <footer>天平校验视频分析系统 · 本说明可离线阅读和打印</footer>
+</body>
+</html>

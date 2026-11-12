@@ -1,6 +1,6 @@
 {
   "name": "tianping-video-verification",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "private": true,
   "type": "module",
   "description": "电子天平日常校验视频分析系统",
@@ -21,9 +21,11 @@
     "make-offline-bundle": "node scripts/make-offline-bundle.js"
   },
   "dependencies": {
+    "@hyzyla/pdfium": "3.0.0",
     "@tesseract.js-data/eng": "^1.0.0",
     "jpeg-js": "^0.4.4",
     "jsqr": "^1.4.0",
+    "pngjs": "7.0.0",
     "qrcode-generator": "1.4.4",
     "tesseract.js": "^7.0.0"
   }
