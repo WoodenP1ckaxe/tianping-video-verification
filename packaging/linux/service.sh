@@ -19,7 +19,7 @@ mkdir -p "$DATA_DIR/logs"
 
 health() {
   "$INSTALL_DIR/runtime/node" -e "
-    fetch('$URLhealthz', { signal: AbortSignal.timeout(1800) })
+    fetch('${URL}healthz', { signal: AbortSignal.timeout(1800) })
       .then(async r => {
         const text = await r.text();
         if (!text.includes('\"service\":\"tianping-video-verification\"')) process.exit(1);
